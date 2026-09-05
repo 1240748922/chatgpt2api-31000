@@ -1,0 +1,412 @@
+import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
+
+from sms_tool import codex_oauth
+
+
+class CodexOauthTests(unittest.TestCase):
+    def test_refresh_skips_terminal_account_without_network(self):
+        with patch("sms_tool.codex_oauth.collect_codex_oauth_tokens") as collect:
+            result = codex_oauth.refresh_codex_oauth_session({
+                "email": "user@example.com",
+                "status": "account_deactivated",
+            })
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["terminal"])
+        collect.assert_not_called()
+
+    def test_refresh_can_collect_without_persisting(self):
+        collected = {"ok": True, "tokens": {"access_token": "at_new", "refresh_token": "rt_new"}}
+        with patch("sms_tool.codex_oauth.collect_codex_oauth_tokens", return_value=collected), \
+             patch("sms_tool.codex_oauth._save_oauth_tokens") as save:
+            result = codex_oauth.refresh_codex_oauth_session(
+                {"email": "user@example.com"},
+                persist=False,
+                force_email_otp_login=True,
+            )
+
+        self.assertIs(result, collected)
+        save.assert_not_called()
+
+    def test_mailbox_from_data_falls_back_to_config_for_gmail(self):
+        fallback = codex_oauth.MailboxAccount(
+            email="liziaicloudxm@gmail.com",
+            provider="gmail",
+            password="abcd efgh ijkl mnop",
+            auth_mode="app_password",
+            source="config",
+        )
+        with patch("sms_tool.codex_oauth.mailbox_has_inbox_credentials", side_effect=[False, True]), \
+             patch("sms_tool.mailbox._mailbox_from_config", return_value=fallback) as from_config:
+            result = codex_oauth._mailbox_from_data({"email": "liziaicloudxm@gmail.com"})
+
+        self.assertIs(result, fallback)
+        from_config.assert_called_once()
+
+    def test_mailbox_from_data_does_not_fallback_to_config_for_non_gmail(self):
+        with patch("sms_tool.codex_oauth.mailbox_has_inbox_credentials", return_value=False), \
+             patch("sms_tool.mailbox._mailbox_from_config") as from_config:
+            result = codex_oauth._mailbox_from_data({"email": "user@example.com"})
+
+        self.assertIsNone(result)
+        from_config.assert_not_called()
+
+    def test_mailbox_from_data_rehydrates_flat_smailr_storage_fields(self):
+        result = codex_oauth._mailbox_from_data({
+            "email": "user@smailr.com",
+            "mailbox_provider": "smailr",
+            "mailbox_source": "purchase",
+            "mailbox_token": "mailbox-id",
+        })
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.provider, "smailr")
+        self.assertEqual(result.source, "purchase")
+        self.assertEqual(result.token, "mailbox-id")
+
+    def test_cfworker_mailbox_does_not_inherit_chatgpt_account_password(self):
+        data = {
+            "email": "target@liziai.cloud",
+            "password": "ChatGPTPassword!A1",
+            "mailbox": {
+                "email": "target@liziai.cloud",
+                "provider": "cfworker",
+                "password": "",
+                "source": "https://worker.example",
+            },
+        }
+        with patch("sms_tool.codex_oauth.mailbox_has_inbox_credentials", return_value=True):
+            result = codex_oauth._mailbox_from_data(data)
+
+        self.assertEqual(result.provider, "cfworker")
+        self.assertEqual(result.password, "")
+
+    def test_account_deactivated_response_is_terminal(self):
+        body = '{"error":{"code":"account_deactivated","message":"You do not have an account because it has been deleted or deactivated."}}'
+
+        self.assertTrue(codex_oauth._is_account_deactivated_response(403, body))
+        self.assertFalse(codex_oauth._is_account_deactivated_response(401, body))
+        self.assertFalse(codex_oauth._is_account_deactivated_response(403, '{"error":"wrong code"}'))
+
+    def test_phone_verification_url_detection(self):
+        self.assertTrue(codex_oauth._needs_phone_verification("https://auth.openai.com/add-phone"))
+        self.assertTrue(codex_oauth._needs_phone_verification("https://auth.openai.com/phone-verification"))
+        self.assertFalse(codex_oauth._needs_phone_verification("https://auth.openai.com/consent"))
+
+    def test_phone_probe_only_does_not_complete_sms(self):
+        with patch("sms_tool.codex_oauth.complete_phone_verification") as complete:
+            result = codex_oauth._finish_authorization(
+                Mock(),
+                {"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                "did",
+                "https://auth.openai.com/add-phone",
+                phone_probe_only=True,
+            )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["phone_verification_required"])
+        self.assertEqual(result["error"], "add_phone_required")
+        complete.assert_not_called()
+
+    def test_protocol_stage_detection_matches_oauth_flow_urls(self):
+        self.assertEqual(
+            codex_oauth._detect_protocol_stage("http://localhost:1455/auth/callback?code=a&state=b"),
+            "callback",
+        )
+        self.assertEqual(codex_oauth._detect_protocol_stage("https://auth.openai.com/consent"), "consent")
+        self.assertEqual(codex_oauth._detect_protocol_stage("https://auth.openai.com/log-in/password"), "password")
+        self.assertEqual(codex_oauth._detect_protocol_stage("https://auth.openai.com/email-verification"), "email_otp")
+        self.assertEqual(codex_oauth._detect_protocol_stage("https://auth.openai.com/add-phone"), "add_phone")
+
+    def test_logged_in_oauth_does_not_force_passwordless_otp(self):
+        session = Mock()
+        session.cookies.set = Mock()
+        response = Mock(status_code=200)
+        session.post.return_value = response
+
+        with patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}), \
+             patch("sms_tool.codex_oauth.attach_sentinel"), \
+             patch("sms_tool.codex_oauth._next_url", return_value="https://auth.openai.com/consent"), \
+             patch("sms_tool.codex_oauth._follow_redirects", return_value=(None, "https://auth.openai.com/consent")), \
+             patch("sms_tool.codex_oauth._passwordless_login_and_exchange") as passwordless, \
+             patch("sms_tool.codex_oauth._finish_authorization", return_value={"ok": True, "tokens": {"access_token": "at", "refresh_token": "rt_1"}}) as finish:
+            result = codex_oauth._login_and_exchange(
+                session=session,
+                oauth={"auth_url": "https://auth.openai.com/oauth/authorize", "state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                email="user@example.com",
+                data={"device_id": "did"},
+                current_url="https://auth.openai.com/authorize",
+                force_email_otp_login=False,
+            )
+
+        self.assertTrue(result["ok"])
+        finish.assert_called_once()
+        passwordless.assert_not_called()
+
+    def test_authorize_invalid_state_restarts_with_fresh_oauth_request(self):
+        session = Mock()
+        session.cookies.set = Mock()
+        session.post.side_effect = [
+            Mock(status_code=409, text='{"error":{"code":"invalid_state"}}'),
+            Mock(status_code=200, text="{}"),
+        ]
+        fresh_oauth = {
+            "auth_url": "https://auth.openai.com/oauth/authorize?fresh=1",
+            "state": "fresh",
+            "code_verifier": "v2",
+            "redirect_uri": "http://localhost",
+        }
+
+        with patch("sms_tool.codex_oauth._new_oauth_request", return_value=fresh_oauth) as new_oauth, \
+             patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}), \
+             patch("sms_tool.codex_oauth.attach_sentinel"), \
+             patch("sms_tool.codex_oauth._next_url", return_value="https://auth.openai.com/consent"), \
+             patch("sms_tool.codex_oauth._follow_redirects", return_value=(None, "https://auth.openai.com/consent")) as follow, \
+             patch("sms_tool.codex_oauth._finish_authorization", return_value={"ok": True, "tokens": {"access_token": "at"}}):
+            result = codex_oauth._login_and_exchange(
+                session=session,
+                oauth={"auth_url": "https://auth.openai.com/oauth/authorize?stale=1", "state": "stale"},
+                email="user@example.com",
+                data={"device_id": "did"},
+                current_url="https://auth.openai.com/authorize",
+            )
+
+        self.assertTrue(result["ok"])
+        new_oauth.assert_called_once()
+        self.assertGreaterEqual(follow.call_count, 1)
+        self.assertEqual(session.post.call_count, 2)
+
+    def test_password_login_uses_password_verify_endpoint(self):
+        session = Mock()
+        response = Mock(status_code=200)
+        session.post.return_value = response
+
+        with patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}), \
+             patch("sms_tool.codex_oauth._next_url", return_value="https://auth.openai.com/consent"), \
+             patch("sms_tool.codex_oauth._follow_redirects", return_value=(None, "https://auth.openai.com/consent")), \
+             patch("sms_tool.codex_oauth._finish_authorization", return_value={"ok": True, "tokens": {"access_token": "at", "refresh_token": "rt_1"}}):
+            result = codex_oauth._password_login_and_exchange(
+                session=session,
+                oauth={"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                data={"password": "Secret!A1"},
+                did="did",
+                current_url="https://auth.openai.com/log-in/password",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["login_method"], "password")
+        self.assertEqual(session.post.call_args.args[0], "https://auth.openai.com/api/accounts/password/verify")
+        self.assertEqual(session.post.call_args.kwargs["json"], {"password": "Secret!A1"})
+
+    def test_forced_password_stage_preserves_passwordless_failure(self):
+        session = Mock()
+
+        with patch("sms_tool.codex_oauth._detect_protocol_stage", return_value="password"), \
+             patch("sms_tool.codex_oauth._password_login_and_exchange", return_value={"ok": False, "error": "password_verify_failed:400"}), \
+             patch("sms_tool.codex_oauth._passwordless_login_and_exchange", return_value={"ok": False, "error": "passwordless_email_otp_poll_timeout"}):
+            result = codex_oauth._run_protocol_login_stages(
+                session=session,
+                oauth={"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                email="user@example.com",
+                data={"email": "user@example.com"},
+                did="did",
+                current_url="https://auth.openai.com/log-in/password",
+                force_email_otp_login=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "passwordless_email_otp_poll_timeout")
+        self.assertEqual(result["protocol_stage"], "email_otp")
+        self.assertEqual(result["fallback_from"], "email_otp_forced")
+
+    def test_forced_email_otp_preserves_passwordless_failure(self):
+        session = Mock()
+        phone_attempt = {
+            "ok": False,
+            "error": "phone_pool_exhausted",
+            "message": "all phones exhausted; total remaining capacity=0",
+        }
+
+        with patch("sms_tool.codex_oauth._detect_protocol_stage", return_value="password"), \
+             patch("sms_tool.codex_oauth._passwordless_login_and_exchange", return_value={
+                 "ok": False,
+                 "error": "phone_pool_exhausted",
+                 "phone_attempt": phone_attempt,
+             }):
+            result = codex_oauth._run_protocol_login_stages(
+                session=session,
+                oauth={"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                email="user@example.com",
+                data={"email": "user@example.com"},
+                did="did",
+                current_url="https://auth.openai.com/log-in/password",
+                force_email_otp_login=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "phone_pool_exhausted")
+        self.assertEqual(result["protocol_stage"], "email_otp")
+        self.assertEqual(result["phone_attempt"], phone_attempt)
+
+    def test_passwordless_send_409_continues_to_mailbox_polling(self):
+        response = Mock(status_code=409, text='{"error":"already pending"}')
+        session = Mock()
+        session.post.return_value = response
+
+        with patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}):
+            result = codex_oauth._send_passwordless_otp(session, "did", "https://auth.openai.com/email-verification")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status_code"], 409)
+
+    def test_resend_409_keeps_existing_otp_search_window(self):
+        send = Mock(status_code=200, text="{}")
+        validate1 = Mock(status_code=400, text='{"error":"bad_code"}')
+        resend = Mock(status_code=409, text='{"error":"already pending"}')
+        validate2 = Mock(status_code=400, text='{"error":"bad_code"}')
+        session = Mock()
+        session.post.side_effect = [send, validate1, resend, validate2]
+        issued_after_values = []
+
+        def poll(*args, **kwargs):
+            issued_after_values.append(kwargs.get("issued_after_unix"))
+            return "123456"
+
+        # ``time.time`` is patched on the shared ``time`` module, so any incidental
+        # caller (e.g. auth-header/sentinel fingerprint building) also sees it.
+        # Anchor the first read (the initial OTP window) to 1000 and every later
+        # read to 1005 so the assertion still proves a 409 resend keeps the
+        # original window without depending on the exact number of time reads.
+        def fake_time():
+            fake_time.calls += 1
+            return 1000 if fake_time.calls == 1 else 1005
+        fake_time.calls = 0
+
+        with patch.dict(codex_oauth.CFG, {"email_registration": {"max_otp_retries": 2}}, clear=False), \
+             patch("sms_tool.codex_oauth.time.time", side_effect=fake_time), \
+             patch("sms_tool.codex_oauth._poll_email_otp", side_effect=poll), \
+             patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}):
+            result = codex_oauth._passwordless_login_and_exchange(
+                session=session,
+                oauth={"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                data={"email": "user@example.com", "mailbox": {"email": "user@example.com", "refresh_token": "rt", "token": "cid"}},
+                did="did",
+                current_url="https://auth.openai.com/email-verification",
+                timeout=30,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(issued_after_values, [1000, 1000])
+
+    def test_passwordless_oauth_excludes_registration_and_rejected_otps(self):
+        send = Mock(status_code=200, text="{}")
+        validate1 = Mock(status_code=401, text='{"error":{"code":"login_failed"}}')
+        resend = Mock(status_code=200, text="{}")
+        validate2 = Mock(status_code=200, text="{}")
+        session = Mock()
+        session.post.side_effect = [send, validate1, resend, validate2]
+        excluded_values = []
+
+        def poll(*args, **kwargs):
+            excluded_values.append(set(kwargs.get("excluded_otps") or ()))
+            return "111111" if len(excluded_values) == 1 else "222222"
+
+        with patch.dict(codex_oauth.CFG, {"email_registration": {"max_otp_retries": 2}}, clear=False), \
+             patch("sms_tool.codex_oauth._poll_email_otp", side_effect=poll), \
+             patch("sms_tool.codex_oauth.load_cached_sentinel", return_value={}), \
+             patch("sms_tool.codex_oauth._next_url", return_value="https://auth.openai.com/consent"), \
+             patch("sms_tool.codex_oauth._follow_redirects", return_value=(None, "https://auth.openai.com/consent")), \
+             patch("sms_tool.codex_oauth._finish_authorization", return_value={"ok": True, "tokens": {"access_token": "at", "refresh_token": "rt"}}):
+            result = codex_oauth._passwordless_login_and_exchange(
+                session=session,
+                oauth={"state": "s", "code_verifier": "v", "redirect_uri": "http://localhost"},
+                data={
+                    "email": "user@example.com",
+                    "registration_email_otp": "000000",
+                    "mailbox": {"email": "user@example.com", "refresh_token": "mail-rt", "token": "cid"},
+                },
+                did="did",
+                current_url="https://auth.openai.com/email-verification",
+                timeout=30,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(excluded_values[0], {"000000"})
+        self.assertEqual(excluded_values[1], {"000000", "111111"})
+
+    def test_single_phone_oauth_lane_stays_locked_until_token_exchange(self):
+        class TrackingLock:
+            def __init__(self):
+                self.acquired = False
+
+            def __enter__(self):
+                self.acquired = True
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.acquired = False
+
+        phone_pool = Mock()
+        phone_pool.lock = TrackingLock()
+
+        def follow_redirects(*args, **kwargs):
+            self.assertTrue(phone_pool.lock.acquired)
+            return None, "http://localhost:1455/auth/callback?code=abc&state=s"
+
+        def exchange_callback(*args, **kwargs):
+            self.assertTrue(phone_pool.lock.acquired)
+            return {"access_token": "at", "refresh_token": "rt"}
+
+        with patch("sms_tool.codex_oauth.complete_phone_verification", return_value={"ok": True, "next_url": "https://auth.openai.com/continue"}), \
+             patch("sms_tool.codex_oauth._follow_redirects", side_effect=follow_redirects), \
+             patch("sms_tool.codex_oauth._exchange_callback", side_effect=exchange_callback):
+            result = codex_oauth._finish_authorization(
+                session=Mock(),
+                oauth={"state": "s"},
+                did="did",
+                current_url="https://auth.openai.com/add-phone",
+                phone_pool=phone_pool,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tokens"]["refresh_token"], "rt")
+
+    def test_phone_verified_redirect_failure_preserves_phone_attempt(self):
+        phone_attempt = {"ok": True, "phone": "+233555123456", "next_url": "https://auth.openai.com/continue"}
+        with patch("sms_tool.codex_oauth.complete_phone_verification", return_value=phone_attempt), \
+             patch("sms_tool.codex_oauth._follow_redirects", side_effect=RuntimeError("curl52")):
+            result = codex_oauth._finish_phone_authorization_locked(
+                session=Mock(),
+                oauth={"state": "s"},
+                did="did",
+                current_url="https://auth.openai.com/add-phone",
+                phone_pool=Mock(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["phone_attempt"], phone_attempt)
+        self.assertIn("phone_verified_oauth_redirect_failed", result["error"])
+
+    def test_saved_oauth_result_exposes_phone_for_batch_mapping(self):
+        phone_attempt = {"ok": True, "phone": "+233555123456", "provider": "smsbower"}
+        with TemporaryDirectory() as tmp, \
+             patch("sms_tool.codex_oauth.upsert_account") as upsert:
+            json_path = f"{tmp}/session.json"
+            result = codex_oauth._save_oauth_tokens(
+                {"email": "user@example.com"},
+                json_path,
+                {"access_token": "at", "refresh_token": "rt"},
+                "user@example.com",
+                "codex_oauth_pkce",
+                result={"phone_attempt": phone_attempt},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["phone"], "+233555123456")
+        self.assertEqual(result["phone_attempt"], phone_attempt)
+        upsert.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

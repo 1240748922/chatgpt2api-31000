@@ -1,0 +1,43 @@
+# Runtime secrets and local configuration
+.env
+config.json
+data/
+src_extract/data/
+
+# Local logs, temporary files, caches, and build output
+*.log
+*.err
+*.out
+*.bak
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.runtime/
+node_modules/
+
+# Docker/image exports
+*.tar
+*.tar.gz
+
+# Registration tool runtime data and secrets
+GPT-Register-Tool-main/config.json
+GPT-Register-Tool-main/config.json.*
+GPT-Register-Tool-main/sessions/
+GPT-Register-Tool-main/runtime/
+GPT-Register-Tool-main/.venv/
+GPT-Register-Tool-main/.chromium.zip
+GPT-Register-Tool-main/**/*.bak
+GPT-Register-Tool-main/**/bin/
+GPT-Register-Tool-main/**/obj/
+GPT-Register-Tool-main/**/logs/
+GPT-Register-Tool-main/**/removed_proxies.jsonl
+
+# IDE and OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# Local scratch files
+tmp_block.js
+src_extract/web_dist/assets/_tmp_*

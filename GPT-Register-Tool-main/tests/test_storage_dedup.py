@@ -1,0 +1,316 @@
+import base64
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from sms_tool import storage
+
+
+class StorageDedupTests(unittest.TestCase):
+    @staticmethod
+    def _access_token(plan_type):
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "https://api.openai.com/auth": {"chatgpt_plan_type": plan_type},
+        }).encode()).decode().rstrip("=")
+        return "header." + payload + ".signature"
+
+    def test_registration_failure_is_audited_without_entering_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.record_registration_audit({
+                    "email": "failed@example.com",
+                    "success": False,
+                    "error": "access_token_probe_http_401",
+                    "response": {"access_token_probe": {"status_code": 401}},
+                    "access_token_telemetry": {"token_hash": "hash", "iat": 1, "exp": 2},
+                }, batch_id="batch-1", state="failed"))
+                conn = storage._connect()
+                try:
+                    accounts = conn.execute("SELECT count(*) FROM accounts").fetchone()[0]
+                    audit = conn.execute("SELECT state,at_status_code,token_hash FROM registration_audit").fetchone()
+                finally:
+                    conn.close()
+        self.assertEqual(accounts, 0)
+        self.assertEqual(audit["state"], "failed")
+        self.assertEqual(audit["at_status_code"], 401)
+        self.assertEqual(audit["token_hash"], "hash")
+
+    def test_deactivated_remail_account_is_added_to_dead_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path), \
+                 patch("sms_tool.mailbox_remail.record_dead_remail_account") as record:
+                self.assertTrue(storage.upsert_account({
+                    "email": "dead@example.com",
+                    "success": False,
+                    "error": "account_deactivated",
+                    "oauth_refresh_token": "rt_TEST",
+                    "mailbox": {"provider": "remail", "email": "dead@example.com", "order_no": "R-DEAD"},
+                }))
+                conn = storage._connect()
+                try:
+                    row = conn.execute("SELECT status,error FROM accounts WHERE email=?", ("dead@example.com",)).fetchone()
+                finally:
+                    conn.close()
+
+        record.assert_called_once()
+        self.assertEqual(row["status"], "account_deactivated")
+        self.assertEqual(row["error"], "account_deactivated")
+
+    def test_upsert_reuses_existing_email_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({"email": "User@Example.com", "success": False, "error": "first"}))
+                self.assertTrue(storage.upsert_account({"email": "user@example.com", "success": True, "access_token": "tok"}))
+
+                conn = storage._connect()
+                try:
+                    rows = conn.execute("SELECT email,success,access_token,error FROM accounts").fetchall()
+                finally:
+                    conn.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["email"], "user@example.com")
+        self.assertEqual(rows[0]["success"], 1)
+        self.assertEqual(rows[0]["access_token"], "tok")
+        self.assertEqual(rows[0]["error"], "")
+
+    def test_upsert_clears_failed_error_when_refresh_token_is_acquired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "rt@example.com",
+                    "success": False,
+                    "error": "passwordless_email_otp_poll_timeout",
+                }))
+                self.assertTrue(storage.upsert_account({
+                    "email": "rt@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "oauth_refresh_token": "rt_TEST",
+                    "refresh_token_status": "oauth_present",
+                    "error": "passwordless_email_otp_poll_timeout",
+                    "paypal": {"ok": True, "url": "https://example.com/pay"},
+                }))
+
+                conn = storage._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT status,error,refresh_token_status,oauth_refresh_token,paypal_status,raw_json FROM accounts WHERE email=?",
+                        ("rt@example.com",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["status"], "paypal_ready")
+        self.assertEqual(row["error"], "")
+        self.assertEqual(row["refresh_token_status"], "oauth_present")
+        self.assertEqual(row["oauth_refresh_token"], "rt_TEST")
+        self.assertEqual(row["paypal_status"], "link_ready")
+        self.assertNotIn("passwordless_email_otp_poll_timeout", row["raw_json"])
+
+    def test_upsert_does_not_treat_mailbox_refresh_token_as_codex_rt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "mailbox-rt@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "oauth_refresh_token": "M.C_FAKE_MAILBOX_TOKEN",
+                    "refresh_token": "M.C_FAKE_MAILBOX_TOKEN",
+                    "refresh_token_status": "oauth_present",
+                }))
+
+                conn = storage._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT refresh_token_status,oauth_refresh_token,refresh_token FROM accounts WHERE email=?",
+                        ("mailbox-rt@example.com",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["refresh_token_status"], "no_rt")
+        self.assertEqual(row["oauth_refresh_token"], "")
+        self.assertEqual(row["refresh_token"], "M.C_FAKE_MAILBOX_TOKEN")
+
+    def test_upsert_persists_opaque_oauth_refresh_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            opaque = "ab." + "A" * 96 + "." + "B" * 96
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "opaque-rt@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "oauth_refresh_token": opaque,
+                    "refresh_token_status": "oauth_present",
+                }))
+                conn = storage._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT refresh_token_status,oauth_refresh_token,refresh_token FROM accounts WHERE email=?",
+                        ("opaque-rt@example.com",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["refresh_token_status"], "oauth_present")
+        self.assertEqual(row["oauth_refresh_token"], opaque)
+        self.assertEqual(row["refresh_token"], opaque)
+
+    def test_upsert_derives_account_type_from_auth_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "plan@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "auth_session": {"account": {"planType": "plus"}},
+                }))
+                conn = storage._connect()
+                try:
+                    row = conn.execute("SELECT account_type FROM accounts WHERE email=?", ("plan@example.com",)).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["account_type"], "plus")
+
+    def test_upsert_prefers_refreshed_token_plan_over_stale_auth_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "upgraded@example.com",
+                    "success": True,
+                    "access_token": self._access_token("plus"),
+                    "auth_session": {"account": {"planType": "free"}},
+                }))
+                conn = storage._connect()
+                try:
+                    row = conn.execute("SELECT account_type FROM accounts WHERE email=?", ("upgraded@example.com",)).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["account_type"], "plus")
+
+    def test_upsert_repairs_misplaced_alias_plus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({"email": "CierraRiste7566@+oai01hotmail.com", "success": False}))
+
+                conn = storage._connect()
+                try:
+                    row = conn.execute("SELECT email FROM accounts").fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["email"], "cierrariste7566+oai01@hotmail.com")
+
+    def test_upsert_reuses_preexisting_misplaced_alias_plus_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                storage.init_database()
+                conn = storage._connect()
+                try:
+                    now = 1779115200
+                    conn.execute(
+                        """
+                        INSERT INTO accounts (email, success, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        ("cierrariste7566@+oai01hotmail.com", 0, now, now),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                self.assertTrue(storage.upsert_account({
+                    "email": "cierrariste7566+oai01@hotmail.com",
+                    "success": True,
+                    "access_token": "tok",
+                }))
+
+                conn = storage._connect()
+                try:
+                    rows = conn.execute("SELECT email,success,access_token FROM accounts").fetchall()
+                finally:
+                    conn.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["email"], "cierrariste7566+oai01@hotmail.com")
+        self.assertEqual(rows[0]["success"], 1)
+        self.assertEqual(rows[0]["access_token"], "tok")
+
+    def test_upsert_marks_pm_created_state_without_paypal_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "pm@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "paypal": {
+                        "ok": True,
+                        "link_type": "pm_created",
+                        "pm_id": "pm_TESTPAYPAL",
+                        "url": "",
+                    },
+                }))
+
+                conn = storage._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT status,paypal_status,paypal_ok,paypal_url,paypal_pm_id FROM accounts WHERE email=?",
+                        ("pm@example.com",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["status"], "paypal_pm_created")
+        self.assertEqual(row["paypal_status"], "pm_created")
+        self.assertEqual(row["paypal_ok"], 1)
+        self.assertEqual(row["paypal_url"], "")
+        self.assertEqual(row["paypal_pm_id"], "pm_TESTPAYPAL")
+
+    def test_upsert_detects_upi_payment_method_from_currency_and_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.sqlite3"
+            with patch.object(storage, "database_path", return_value=db_path):
+                self.assertTrue(storage.upsert_account({
+                    "email": "upi@example.com",
+                    "success": True,
+                    "access_token": "at",
+                    "paypal": {
+                        "ok": True,
+                        "url": "https://pay.openai.com/c/pay/cs_live_UPI",
+                        "currency": "inr",
+                        "payment_method_types": ["card", "upi"],
+                    },
+                }))
+
+                conn = storage._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT payment_method,paypal_status,paypal_url FROM accounts WHERE email=?",
+                        ("upi@example.com",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+        self.assertEqual(row["payment_method"], "upi")
+        self.assertEqual(row["paypal_status"], "link_ready")
+        self.assertIn("cs_live_UPI", row["paypal_url"])
+
+
+if __name__ == "__main__":
+    unittest.main()

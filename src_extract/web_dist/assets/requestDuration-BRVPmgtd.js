@@ -1,0 +1,1 @@
+function e(t,r){return Number(t.toFixed(r)).toString()}function n(t){if(t===""||t===null||t===void 0)return"";const r=Number(t);return!Number.isFinite(r)||r<0?"":r<1e3?`${Math.round(r)}ms`:r<1e4?`${e(r/1e3,2)}s`:r<6e4?`${e(r/1e3,1)}s`:`${e(r/6e4,1)}m`}export{n as f};

@@ -38,7 +38,9 @@ def _configured_registration_proxy() -> str:
         pool = re.split(r"[\r\n,;]+", pool)
     if any(str(item or "").strip() for item in pool):
         return ""
-    return str(proxy_cfg.get("default") or "http://127.0.0.1:7897").strip()
+    # An empty fixed address and empty pool mean direct routing. Do not inject
+    # the old desktop-only 127.0.0.1 proxy into a server/container run.
+    return str(proxy_cfg.get("default") or "").strip()
 
 
 def _apply_registration_proxy_defaults(args) -> None:

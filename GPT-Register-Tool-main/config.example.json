@@ -4,10 +4,10 @@
     "chat_base_url": "https://chatgpt.com",
     "chat_web_client_id": "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
   },
-  "mailbox_proxy": "http://127.0.0.1:7897",
+  "mailbox_proxy": "",
   "proxy": {
-    "registration": "http://127.0.0.1:7897",
-    "default": "http://127.0.0.1:7897",
+    "registration": "",
+    "default": "",
     "pool": [
       "us.ipwo.net:7878:YOUR_USER_custom_zone_US:YOUR_PASSWORD",
       "as.ipwo.net:7878:YOUR_USER_custom_zone_JP:YOUR_PASSWORD",

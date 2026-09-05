@@ -381,6 +381,17 @@ class AccountReplenishmentService:
                 for raw_item in re.split(r"[\r\n,]+", proxy_pool)
                 if (item := _text(raw_item))
             ]
+        # The UI intentionally exposes only the fixed proxy and pool. When
+        # both are explicitly cleared, clear the legacy hidden default too;
+        # otherwise the provider config can silently fall back to the local
+        # desktop proxy (127.0.0.1:7897) inside a Docker container.
+        if (
+            "registration_proxy" in updates
+            and "registration_proxy_pool" in updates
+            and not _text(updates.get("registration_proxy"))
+            and not _text(updates.get("registration_proxy_pool"))
+        ):
+            proxy["default"] = ""
 
         email["remail"] = remail
         email["smailr"] = smailr

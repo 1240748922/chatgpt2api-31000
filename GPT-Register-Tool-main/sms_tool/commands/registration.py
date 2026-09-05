@@ -65,6 +65,11 @@ def preflight_registration_before_mailbox(args: Any, ctx: RegistrationCommandCon
     raise RuntimeError(
         "registration_preflight_failed:no_healthy_route:"
         + (type(last_error).__name__ if last_error is not None else "unknown")
+        + (":" + re.sub(
+            r"(?i)((?:https?|socks5h?|socks4a?)://)[^\s/@]+@",
+            r"\1***@",
+            str(last_error),
+        )[:240] if last_error is not None else "")
     )
 
 

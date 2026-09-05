@@ -363,7 +363,7 @@
     const credentials = document.createElement("div");
     credentials.className = "register-card";
     credentials.setAttribute("data-register-provider-credentials", "true");
-    credentials.innerHTML = `<div class="register-card-header"><div><div class="register-card-title">邮箱 / 短信服务配置</div><p class="register-card-help">密钥直接在这里配置并写入注册工具。已配置的密钥不会回显；注册代理地址和代理池支持清空。</p></div></div><div class="register-form-grid">${providerInput("ReMail API Key", "remail_api_key", "ReMail 服务密钥。", "password")} ${providerInput("ReMail 服务地址", "remail_base_url", "默认使用注册工具配置的地址。", "text")} ${providerInput("Smailr API Key", "smailr_api_key", "Smailr 服务密钥。", "password")} ${providerInput("Smailr 服务地址", "smailr_base_url", "默认 https://smailr.com。", "text")} ${providerInput("CFWorker 地址", "cfworker_url", "CFWorker 邮箱服务地址。", "text")} ${providerInput("CFWorker Admin Token", "cfworker_admin_token", "管理接口令牌。", "password")} ${providerInput("CFWorker API Token", "cfworker_api_token", "邮箱接口令牌。", "password")} ${providerInput("SMSBower API Key", "smsbower_api_key", "手机号注册服务密钥。", "password")} ${providerInput("SMSBower 国家代码", "smsbower_country", "例如 38。", "text")} ${providerInput("注册代理地址", "registration_proxy", "固定代理优先级最高；留空后将使用注册代理池。", "text")} ${providerTextarea("注册代理池", "registration_proxy_pool", "每行一个代理，也支持逗号分隔；固定代理地址为空时按池轮换。")}</div><div class="register-save-row"><span class="register-save-state" data-provider-save-state>配置读取中...</span><button class="register-button primary" data-provider-action="save">保存服务配置</button></div>`;
+    credentials.innerHTML = `<div class="register-card-header"><div><div class="register-card-title">邮箱 / 短信服务配置</div><p class="register-card-help">密钥直接在这里配置并写入注册工具。已配置的密钥不会回显；注册代理地址和代理池支持清空。</p></div></div><div class="register-form-grid">${providerInput("ReMail API Key", "remail_api_key", "ReMail 服务密钥。", "password")} ${providerInput("ReMail 服务地址", "remail_base_url", "默认使用注册工具配置的地址。", "text")} ${providerInput("Smailr API Key", "smailr_api_key", "Smailr 服务密钥。", "password")} ${providerInput("Smailr 服务地址", "smailr_base_url", "默认 https://smailr.com。", "text")} ${providerInput("CFWorker 地址", "cfworker_url", "CFWorker 邮箱服务地址。", "text")} ${providerInput("CFWorker Admin Token", "cfworker_admin_token", "管理接口令牌。", "password")} ${providerInput("CFWorker API Token", "cfworker_api_token", "邮箱接口令牌。", "password")} ${providerInput("SMSBower API Key", "smsbower_api_key", "手机号注册服务密钥。", "password")} ${providerInput("SMSBower 国家代码", "smsbower_country", "例如 38。", "text")} ${providerInput("注册代理地址", "registration_proxy", "固定代理优先级最高；留空后将使用注册代理池。", "text")} ${providerTextarea("注册代理池", "registration_proxy_pool", "每行一个代理，也支持逗号分隔；固定代理地址为空时按池轮换。")}</div><div class="register-save-row"><span class="register-save-state" data-provider-save-state>配置读取中...</span><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="register-button" data-provider-action="test-proxy">测试注册代理</button><button class="register-button primary" data-provider-action="save">保存服务配置</button></div></div><div class="register-save-state" data-proxy-test-state></div>`;
     const credentialFields = {
       remail_api_key: "remail_target",
       remail_base_url: "remail_target",
@@ -446,11 +446,34 @@
         button.disabled = false;
       }
     }
+    async function testRegistrationProxy() {
+      const button = credentials.querySelector('[data-provider-action="test-proxy"]');
+      const state = credentials.querySelector("[data-proxy-test-state]");
+      const payload = {
+        registration_proxy: credentials.querySelector('[data-provider-key="registration_proxy"]')?.value.trim() || "",
+        registration_proxy_pool: credentials.querySelector('[data-provider-key="registration_proxy_pool"]')?.value.trim() || "",
+      };
+      button.disabled = true;
+      state.className = "register-save-state";
+      state.textContent = "测试中，请等待网络请求完成...";
+      try {
+        const result = await providerRequest("/api/accounts/replenishment/proxy-test", { method: "POST", body: JSON.stringify(payload) });
+        const lines = (result.results || []).map((item) => `${item.label}：${item.ok ? "成功" : "失败"}${item.status ? `，HTTP ${item.status}` : ""}${item.latency_ms ? `，${item.latency_ms} ms` : ""}${item.error ? `，${item.error}` : ""}`);
+        state.className = `register-save-state${result.ok ? "" : " error"}`;
+        state.textContent = result.tested ? lines.join("；") : (result.error || "没有可测试的代理");
+      } catch (error) {
+        state.className = "register-save-state error";
+        state.textContent = error.message || "代理测试失败";
+      } finally {
+        button.disabled = false;
+      }
+    }
     runtime.before(card);
     runtime.before(credentials);
     const source = card.querySelector('[data-register-key="registration_source"]');
     source.addEventListener("change", () => updateVisibility(page));
     credentials.querySelector('[data-provider-action="save"]').addEventListener("click", saveCredentials);
+    credentials.querySelector('[data-provider-action="test-proxy"]').addEventListener("click", testRegistrationProxy);
     hydrate(page);
     loadCredentials();
     updateVisibility(page);

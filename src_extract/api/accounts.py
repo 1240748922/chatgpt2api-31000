@@ -94,6 +94,11 @@ class RegistrationProviderConfigPatch(BaseModel):
     smsbower_country: str | None = None
 
 
+class RegistrationProxyTestRequest(BaseModel):
+    registration_proxy: str = ""
+    registration_proxy_pool: str = ""
+
+
 class MailboxFileImportRequest(BaseModel):
     filename: str = "mailboxes.txt"
     content: str = ""
@@ -1260,6 +1265,18 @@ def create_router() -> APIRouter:
     async def get_account_replenishment_provider_config(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return await run_in_threadpool(account_replenishment_service.provider_config)
+
+    @router.post("/api/accounts/replenishment/proxy-test")
+    async def test_account_replenishment_proxy(
+        body: RegistrationProxyTestRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        return await run_in_threadpool(
+            account_replenishment_service.test_registration_proxy,
+            body.registration_proxy,
+            body.registration_proxy_pool,
+        )
 
     @router.patch("/api/accounts/replenishment/provider-config")
     async def update_account_replenishment_provider_config(

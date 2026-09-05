@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from services.account_service import account_service
 from services.config import config
+from services.proxy_service import test_proxy
 from services.storage.coordination_repository import AccountReplenishmentRepository
 from services.json_file import read_json_object, write_json_file
 from utils.log import logger
@@ -482,6 +483,50 @@ class AccountReplenishmentService:
         raw["proxy"] = proxy
         write_json_file(path, raw)
         return self.provider_config()
+
+    def test_registration_proxy(
+        self,
+        registration_proxy: str = "",
+        registration_proxy_pool: str = "",
+    ) -> dict[str, Any]:
+        """Test the proxy that registration would select without starting a batch."""
+        fixed = _text(registration_proxy)
+        pool = [
+            _text(item)
+            for raw_item in re.split(r"[\r\n,]+", _text(registration_proxy_pool))
+            if (item := _text(raw_item))
+        ]
+        candidates = [("固定代理", fixed)] if fixed else [
+            (f"代理池第 {index} 条", item)
+            for index, item in enumerate(pool, start=1)
+        ]
+        if not candidates:
+            return {
+                "ok": False,
+                "mode": "none",
+                "tested": 0,
+                "results": [],
+                "error": "请先填写注册代理地址，或填写注册代理池。",
+            }
+
+        results: list[dict[str, Any]] = []
+        for label, candidate in candidates:
+            try:
+                result = test_proxy(candidate)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "status": 0,
+                    "latency_ms": 0,
+                    "error": _tail(str(exc) or exc.__class__.__name__, 500),
+                }
+            results.append({"label": label, **result})
+        return {
+            "ok": all(bool(item.get("ok")) for item in results),
+            "mode": "fixed" if fixed else "pool",
+            "tested": len(results),
+            "results": results,
+        }
 
     def _registration_configuration_error(self, settings: Mapping[str, Any]) -> str | None:
         source = _text(settings.get("registration_source"), "configured").lower()

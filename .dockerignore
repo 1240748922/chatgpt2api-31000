@@ -16,5 +16,15 @@ GPT-Register-Tool-main/sessions
 GPT-Register-Tool-main/runtime
 GPT-Register-Tool-main/.venv
 GPT-Register-Tool-main/.chromium.zip
+GPT-Register-Tool-main/.github
+GPT-Register-Tool-main/docs
+GPT-Register-Tool-main/tests
+GPT-Register-Tool-main/SmsWorkbench
+GPT-Register-Tool-main/scripts/installer
+GPT-Register-Tool-main/*.slnx
+GPT-Register-Tool-main/Directory.*
+GPT-Register-Tool-main/global.json
+GPT-Register-Tool-main/pytest.ini
+GPT-Register-Tool-main/*.zip
 *.tar
 *.tar.gz

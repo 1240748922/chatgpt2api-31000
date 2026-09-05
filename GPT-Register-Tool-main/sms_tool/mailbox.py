@@ -272,7 +272,14 @@ def _configured_mailbox_proxy(runtime_config: ConfigInput = None):
         or proxy_cfg.get("mailbox_proxy")
         or proxy_cfg.get("mailbox")
     )
-    if _is_legacy_local_mailbox_proxy(configured):
+    registration_pool = proxy_cfg.get("pool") or []
+    if isinstance(registration_pool, str):
+        registration_pool = [item for item in registration_pool.splitlines() if str(item).strip()]
+    has_registration_route = bool(
+        str(proxy_cfg.get("registration") or "").strip()
+        or any(str(item or "").strip() for item in registration_pool)
+    )
+    if has_registration_route and _is_legacy_local_mailbox_proxy(configured):
         return ""
     return _normalize_mailbox_proxy(configured)
 

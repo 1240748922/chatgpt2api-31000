@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from curl_cffi import requests as curl_requests
 
@@ -248,17 +249,32 @@ def _normalize_mailbox_proxy(value):
     return proxy
 
 
+def _is_legacy_local_mailbox_proxy(value):
+    """Ignore the desktop-only localhost mailbox proxy in server runs."""
+    candidate = _normalize_mailbox_proxy(value)
+    if not candidate:
+        return False
+    try:
+        parsed = urlsplit(candidate)
+        return parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port == 7897
+    except ValueError:
+        return False
+
+
 def _configured_mailbox_proxy(runtime_config: ConfigInput = None):
     config = _config_data(runtime_config)
     email_cfg = _email_cfg(runtime_config)
     proxy_value = config.get("proxy")
     proxy_cfg = proxy_value if isinstance(proxy_value, Mapping) else {}
-    return _normalize_mailbox_proxy(
+    configured = (
         config.get("mailbox_proxy")
         or email_cfg.get("mailbox_proxy")
         or proxy_cfg.get("mailbox_proxy")
         or proxy_cfg.get("mailbox")
     )
+    if _is_legacy_local_mailbox_proxy(configured):
+        return ""
+    return _normalize_mailbox_proxy(configured)
 
 
 def _resolve_mailbox_proxy(proxy=None, runtime_config: ConfigInput = None):

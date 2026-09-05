@@ -445,8 +445,12 @@ class AccountReplenishmentService:
 
         update(remail, "base_url", updates.get("remail_base_url"))
         update(remail, "api_key", updates.get("remail_api_key"))
+        if _text(remail.get("api_key")):
+            remail["enabled"] = True
         update(smailr, "base_url", updates.get("smailr_base_url"))
         update(smailr, "api_key", updates.get("smailr_api_key"))
+        if _text(smailr.get("api_key")):
+            smailr["enabled"] = True
         update(email, "cfworker_url", updates.get("cfworker_url"))
         update(email, "cfworker_admin_token", updates.get("cfworker_admin_token"))
         update(email, "cfworker_api_token", updates.get("cfworker_api_token"))
@@ -540,12 +544,24 @@ class AccountReplenishmentService:
         email = raw.get("email_registration") if isinstance(raw.get("email_registration"), dict) else {}
         if source == "remail_target":
             remail = email.get("remail") if isinstance(email.get("remail"), dict) else {}
-            if not (_text(os.environ.get("REMAIL_API_KEY")) or _text(remail.get("api_key"))):
+            remail_key = _text(os.environ.get("REMAIL_API_KEY")) or _text(remail.get("api_key"))
+            if not remail_key:
                 return "未配置 ReMail API Key，请在注册机页面填写后保存邮箱与代理配置。"
+            if remail.get("enabled") is False:
+                remail["enabled"] = True
+                email["remail"] = remail
+                raw["email_registration"] = email
+                write_json_file(self._provider_config_path(), raw)
         elif source == "smailr":
             smailr = email.get("smailr") if isinstance(email.get("smailr"), dict) else {}
-            if not (_text(os.environ.get("SMAILR_API_KEY")) or _text(smailr.get("api_key"))):
+            smailr_key = _text(os.environ.get("SMAILR_API_KEY")) or _text(smailr.get("api_key"))
+            if not smailr_key:
                 return "未配置 Smailr API Key，请在注册机页面填写后保存邮箱与代理配置。"
+            if smailr.get("enabled") is False:
+                smailr["enabled"] = True
+                email["smailr"] = smailr
+                raw["email_registration"] = email
+                write_json_file(self._provider_config_path(), raw)
         elif source == "phone":
             phone = raw.get("phone_reuse") if isinstance(raw.get("phone_reuse"), dict) else {}
             smsbower = phone.get("smsbower") if isinstance(phone.get("smsbower"), dict) else {}

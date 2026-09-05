@@ -47,6 +47,39 @@ echo "$GHCR_READ_TOKEN" | docker login ghcr.io -u 1240748922 --password-stdin
 
 GHCR Token 只保存在服务器，不放进 `.env`、GitHub 仓库或 Docker Compose 文件。
 
+## GitHub 私有仓库认证
+
+Git 克隆私有仓库和拉取 GHCR 镜像是两套权限：
+
+- GitHub 仓库 Token：用于 `git clone`、`git pull`，需要该仓库的只读 `Contents` 权限。
+- GHCR Token：用于 `docker login ghcr.io`、`docker pull`，需要 `read:packages` 权限。
+
+创建 GitHub 仓库 Token 时，推荐使用 Fine-grained personal access token：
+
+```text
+GitHub Settings
+→ Developer settings
+→ Personal access tokens
+→ Fine-grained tokens
+→ Generate new token
+```
+
+选择资源所有者 `1240748922`，只授权仓库 `chatgpt2api-31000`，并将
+`Repository permissions → Contents` 设置为 ` read`。
+
+服务器克隆时必须使用纯 HTTPS 地址，不能粘贴 Markdown 链接：
+
+```bash
+git clone https://github.com/1240748922/chatgpt2api-31000.git
+```
+
+出现提示时：
+
+```text
+Username: 1240748922
+Password: 粘贴 GitHub 仓库 Token，不是 GitHub 登录密码
+```
+
 ## 首次启动
 
 ```bash

@@ -21,6 +21,7 @@ from utils.log import logger
 
 
 _SAVED_SESSION_RE = re.compile(r"Saved session:\s*(.+)$")
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def _text(value: object, default: str = "") -> str:
@@ -61,6 +62,63 @@ def _resolve_path(raw: str, base_dir: Path) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return path
+
+
+def _effective_workdir(settings: Mapping[str, Any]) -> Path:
+    """Resolve a registration workdir across Windows host and Linux container runs."""
+    raw = _text(settings.get("workdir"))
+    default = _default_workdir()
+    if not raw or _WINDOWS_ABSOLUTE_PATH_RE.match(raw):
+        return default
+    return _resolve_path(raw, Path.cwd())
+
+
+def _map_saved_path(raw: object, workdir: Path) -> str:
+    """Map paths persisted by a Windows desktop instance to the current runtime."""
+    value = _text(raw)
+    if not value or not _WINDOWS_ABSOLUTE_PATH_RE.match(value):
+        return value
+
+    normalized = value.replace("\\", "/")
+    lowered = normalized.lower()
+    marker = "/gpt-register-tool-main/"
+    marker_index = lowered.find(marker)
+    if marker_index >= 0:
+        return (workdir / Path(normalized[marker_index + len(marker):])).as_posix()
+
+    for directory in ("runtime", "sessions"):
+        marker = f"/{directory}/"
+        marker_index = lowered.rfind(marker)
+        if marker_index >= 0:
+            return (workdir / directory / Path(normalized[marker_index + len(marker):])).as_posix()
+
+    return (workdir / Path(normalized).name).as_posix()
+
+
+def _normalize_result_paths(result: Mapping[str, Any], workdir: Path) -> dict[str, Any]:
+    """Keep persisted status payloads portable after a host OS change."""
+    normalized = dict(result)
+    for key in ("log_path", "workdir", "entrypoint", "output_dir", "mailbox_file"):
+        if key in normalized:
+            normalized[key] = _map_saved_path(normalized[key], workdir)
+
+    command = normalized.get("command")
+    if isinstance(command, list):
+        normalized["command"] = [
+            _map_saved_path(item, workdir) if isinstance(item, str) else item
+            for item in command
+        ]
+
+    imported = normalized.get("import")
+    if isinstance(imported, Mapping) and isinstance(imported.get("paths"), list):
+        normalized["import"] = {
+            **imported,
+            "paths": [
+                _map_saved_path(item, workdir) if isinstance(item, str) else item
+                for item in imported["paths"]
+            ],
+        }
+    return normalized
 
 
 def _split_args(raw: str) -> list[str]:
@@ -241,6 +299,7 @@ class AccountReplenishmentService:
             metrics = account_service.evaluate_account_pool(refresh_stale=False)
         except Exception as exc:
             metrics = {"error": str(exc)}
+        workdir = _effective_workdir(dict(config.account_replenishment))
 
         if self._repository is not None:
             with self._shared_state() as state:
@@ -253,6 +312,13 @@ class AccountReplenishmentService:
                         status[field] = dict(state[field])
                 if isinstance(state.get("log_history"), list):
                     status["log_history"] = list(state["log_history"])[-50:]
+                if isinstance(status.get("last_result"), dict):
+                    status["last_result"] = _normalize_result_paths(status["last_result"], workdir)
+                status["log_history"] = [
+                    _normalize_result_paths(item, workdir)
+                    for item in status["log_history"]
+                    if isinstance(item, Mapping)
+                ]
                 status["config"] = self._config_snapshot()
                 status["current_metrics"] = metrics
                 return status
@@ -266,32 +332,47 @@ class AccountReplenishmentService:
                 "last_checked_at": self._last_checked_at,
                 "last_triggered_at": self._last_triggered_at,
                 "last_error": self._last_error,
-                "last_result": dict(self._last_result),
+                "last_result": _normalize_result_paths(self._last_result, workdir),
                 "last_metrics": dict(self._last_metrics),
-                "log_history": list(self._log_history)[-50:],
+                "log_history": [
+                    _normalize_result_paths(item, workdir)
+                    for item in list(self._log_history)[-50:]
+                    if isinstance(item, Mapping)
+                ],
                 "config": self._config_snapshot(),
                 "current_metrics": metrics,
             }
 
     def _config_snapshot(self) -> dict[str, Any]:
         settings = dict(config.account_replenishment)
-        settings["workdir"] = _text(settings.get("workdir")) or str(_default_workdir())
+        workdir = _effective_workdir(settings)
+        settings["workdir"] = str(workdir)
+        raw_output_dir = _text(settings.get("output_dir"))
+        if _WINDOWS_ABSOLUTE_PATH_RE.match(raw_output_dir):
+            settings["output_dir"] = str(workdir / "sessions")
+        for key in ("entrypoint", "mailbox_file"):
+            if key in settings:
+                settings[key] = _map_saved_path(settings[key], workdir)
+        if _WINDOWS_ABSOLUTE_PATH_RE.match(_text(settings.get("python_executable"))):
+            settings["python_executable"] = str(Path(sys.executable))
         return settings
 
     def _resolve_tool_paths(self, settings: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
-        workdir = _resolve_path(_text(settings.get("workdir")) or str(_default_workdir()), Path.cwd())
+        workdir = _effective_workdir(settings)
         if not workdir.exists():
             raise FileNotFoundError(f"registration workdir not found: {workdir}")
         entrypoint = _resolve_path(_text(settings.get("entrypoint"), "chatgpt_phone_reg.py"), workdir)
         if not entrypoint.exists():
             raise FileNotFoundError(f"registration entrypoint not found: {entrypoint}")
-        output_dir = _resolve_path(
-            _text(settings.get("output_dir")) or "sessions",
-            workdir,
+        raw_output_dir = _text(settings.get("output_dir"))
+        output_dir = (
+            workdir / "sessions"
+            if not raw_output_dir or _WINDOWS_ABSOLUTE_PATH_RE.match(raw_output_dir)
+            else _resolve_path(raw_output_dir, workdir)
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         python_executable = _text(settings.get("python_executable"))
-        if python_executable:
+        if python_executable and not _WINDOWS_ABSOLUTE_PATH_RE.match(python_executable):
             python_path = _resolve_path(python_executable, workdir)
         else:
             candidates = [
@@ -303,7 +384,7 @@ class AccountReplenishmentService:
 
     def _provider_config_path(self) -> Path:
         settings = dict(config.account_replenishment)
-        workdir = _resolve_path(_text(settings.get("workdir")) or str(_default_workdir()), Path.cwd())
+        workdir = _effective_workdir(settings)
         if not workdir.exists():
             raise FileNotFoundError(f"registration workdir not found: {workdir}")
         path = workdir / "config.json"
@@ -437,7 +518,7 @@ class AccountReplenishmentService:
         if len(text.encode("utf-8")) > 10 * 1024 * 1024:
             raise ValueError("mailbox file is larger than 10 MB")
         settings = dict(config.account_replenishment)
-        workdir = _resolve_path(_text(settings.get("workdir")) or str(_default_workdir()), Path.cwd())
+        workdir = _effective_workdir(settings)
         workdir.mkdir(parents=True, exist_ok=True)
         safe_name = Path(str(filename or "mailboxes.txt")).name or "mailboxes.txt"
         if Path(safe_name).suffix.lower() not in {".txt", ".json", ".csv"}:
@@ -482,7 +563,11 @@ class AccountReplenishmentService:
                 mailbox_raw = _text(settings.get("mailbox_file"))
                 if not mailbox_raw:
                     raise ValueError("mailbox_file is required when registration_source is mailbox_file")
-                mailbox_file = _resolve_path(mailbox_raw, entrypoint.parent)
+                mailbox_file = (
+                    Path(_map_saved_path(mailbox_raw, entrypoint.parent))
+                    if _WINDOWS_ABSOLUTE_PATH_RE.match(mailbox_raw)
+                    else _resolve_path(mailbox_raw, entrypoint.parent)
+                )
                 command.extend(["--mailbox-file", str(mailbox_file), "--registration-at-only"])
             elif source == "cfworker":
                 command.extend([
@@ -599,6 +684,7 @@ class AccountReplenishmentService:
         except TimeoutError:
             with self._status_lock:
                 result = dict(self._last_result)
+            result = _normalize_result_paths(result, _effective_workdir(dict(config.account_replenishment)))
             return {
                 "ok": None,
                 "triggered": False,
@@ -615,6 +701,7 @@ class AccountReplenishmentService:
         if not self._run_lock.acquire(blocking=False):
             with self._status_lock:
                 result = dict(self._last_result)
+            result = _normalize_result_paths(result, _effective_workdir(dict(config.account_replenishment)))
             return {
                 "ok": None,
                 "triggered": False,

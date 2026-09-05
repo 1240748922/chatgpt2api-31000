@@ -2,6 +2,12 @@
 
 本包对应服务器上的 31000 服务：8 个 API 实例（app0-app7）+ Nginx 网关 + PostgreSQL。`data/` 和服务器 PostgreSQL 数据卷均未导出，首次启动会使用全新的空数据库。
 
+## 云服务器部署教程
+
+完整的 GitHub、GHCR、Docker、注册机配置和服务器更新步骤请查看：
+
+[DEPLOYMENT.md](./DEPLOYMENT.md)
+
 ## 在本地电脑启动
 
 1. 安装 Docker Desktop（或 Docker Engine + Compose v2）。

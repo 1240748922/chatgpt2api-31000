@@ -42,7 +42,10 @@ ghcr.io/1240748922/chatgpt2api-31000:latest
 只读 GHCR Token，并登录：
 
 ```bash
-echo "$GHCR_READ_TOKEN" | docker login ghcr.io -u 1240748922 --password-stdin
+read -rsp "GHCR Token: " GHCR_READ_TOKEN
+echo
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u 1240748922 --password-stdin
+unset GHCR_READ_TOKEN
 ```
 
 GHCR Token 只保存在服务器，不放进 `.env`、GitHub 仓库或 Docker Compose 文件。

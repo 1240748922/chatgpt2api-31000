@@ -1,45 +1,112 @@
-# Git 与 Docker 部署
+# GitHub + GHCR + Docker 部署教程
 
-## 上传前
+本文用于将 `chatgpt2api-31000` 部署到 Linux 云服务器，方便以后在 GitHub 页面直接查看。
 
-仓库只保存源码和部署文件，不提交以下内容：
+当前部署结构为：8 个 API 实例（`app0` 到 `app7`）+ Nginx 网关 + PostgreSQL + 注册工具。
 
-- `.env`、`config.json`
-- `data/`、数据库文件、图片和调用记录
-- 账号 session、注册工具运行目录
-- ReMail、代理池和其他 API 密钥
-- Docker 镜像导出包
+## 0. 先理解两个 Token
 
-首次准备配置（Linux 服务器）：
+部署时通常需要两套不同的 GitHub Token：
 
-```bash
-cp .env.example .env
-cp config.example.json config.json
-cp GPT-Register-Tool-main/config.example.json GPT-Register-Tool-main/config.json
-```
+| Token | 用途 | 主要权限 |
+| --- | --- | --- |
+| GitHub 仓库 Token | `git clone`、`git pull` 源码 | 私有仓库的 `Contents: Read` |
+| GHCR Token | `docker login`、`docker pull` 镜像 | `read:packages` |
 
-然后只在服务器上的 `.env`、`config.json` 和
-`GPT-Register-Tool-main/config.json` 中填写真实配置。三个文件都已经被
-`.gitignore` 排除，不会上传到 GitHub。
+GitHub 仓库 Token 用于下载源码，GHCR Token 用于下载 Docker 镜像。遇到认证错误时，先确认使用的 Token 是否对应正确的操作。
 
-## GHCR 自动发布
+不要把任何 Token、API Key、代理密码、邮箱密码、账号 session 或真实配置写入 GitHub。
 
-仓库包含 `Dockerfile` 和 GitHub Actions 工作流：
+## 一、先确认 GitHub 镜像构建成功
+
+打开仓库：
+
+[chatgpt2api-31000](https://github.com/1240748922/chatgpt2api-31000)
+
+进入：
 
 ```text
-.github/workflows/build-image.yml
+Actions
 ```
 
-每次向 `main` 推送代码后，GitHub Actions 会自动构建并发布：
+找到：
+
+```text
+Build and publish container image
+```
+
+等待状态变成绿色的 `Success`。
+
+它成功后，镜像地址就是：
 
 ```text
 ghcr.io/1240748922/chatgpt2api-31000:latest
 ```
 
-工作流使用 GitHub 自动生成的 `GITHUB_TOKEN`，不需要把 Docker 密钥写入仓库。
+首次构建可能需要较长时间，因为会安装 Python 依赖、Playwright 和 Chromium。
 
-首次使用时，在 GitHub 仓库的 `Actions` 页面确认工作流成功，然后在服务器创建一个
-只读 GHCR Token，并登录：
+## 二、准备云服务器
+
+以下以 Ubuntu 22.04/24.04 为例。先通过 SSH 登录服务器：
+
+```bash
+ssh root@你的服务器IP
+```
+
+安装 Git、Docker：
+
+```bash
+apt update
+apt install -y git ca-certificates curl
+curl -fsSL https://get.docker.com | sh
+systemctl enable docker
+systemctl start docker
+```
+
+验证：
+
+```bash
+docker --version
+docker compose version
+git --version
+```
+
+如果云服务器有安全组或防火墙，需要放行端口：
+
+```bash
+ufw allow 22/tcp
+ufw allow 31000/tcp
+ufw enable
+```
+
+如果你使用云厂商控制台，还需要在云厂商的安全组中放行：
+
+```text
+TCP 31000
+```
+
+## 三、创建 GHCR 读取令牌
+
+在 GitHub 网页中：
+
+```text
+头像
+→ Settings
+→ Developer settings
+→ Personal access tokens
+→ Tokens (classic)
+→ Generate new token
+```
+
+勾选：
+
+```text
+read:packages
+```
+
+生成 Token 后只保存到服务器，不要上传到仓库，也不要发给别人。
+
+在服务器登录 GHCR：
 
 ```bash
 read -rsp "GHCR Token: " GHCR_READ_TOKEN
@@ -48,16 +115,38 @@ printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u 1240748922 --password-s
 unset GHCR_READ_TOKEN
 ```
 
-GHCR Token 只保存在服务器，不放进 `.env`、GitHub 仓库或 Docker Compose 文件。
+看到以下内容说明成功：
 
-## GitHub 私有仓库认证
+```text
+Login Succeeded
+```
 
-Git 克隆私有仓库和拉取 GHCR 镜像是两套权限：
+如果出现 `denied`，确认输入的是 GHCR Token 而不是 GitHub 登录密码，Token 包含 `read:packages`，用户名是 GitHub 用户名 `1240748922`，并且该账号有权访问这个镜像包。
 
-- GitHub 仓库 Token：用于 `git clone`、`git pull`，需要该仓库的只读 `Contents` 权限。
-- GHCR Token：用于 `docker login ghcr.io`、`docker pull`，需要 `read:packages` 权限。
+## 四、下载项目
 
-创建 GitHub 仓库 Token 时，推荐使用 Fine-grained personal access token：
+在服务器执行：
+
+```bash
+cd /opt
+git clone https://github.com/1240748922/chatgpt2api-31000.git
+cd chatgpt2api-31000
+```
+
+命令中必须使用纯文本 HTTPS 地址，不能把网页上的 Markdown 链接直接粘贴到终端。例如可用的地址是：
+
+```text
+https://github.com/1240748922/chatgpt2api-31000.git
+```
+
+如果仓库是私有的，Git 提示输入账号时填写：
+
+```text
+Username: 你的 GitHub 用户名
+Password: 粘贴 GitHub 仓库 Token，不是 GitHub 登录密码
+```
+
+GitHub 已经不支持用账号登录密码进行 Git HTTPS 操作。GitHub 仓库 Token 可在以下位置创建：
 
 ```text
 GitHub Settings
@@ -67,64 +156,351 @@ GitHub Settings
 → Generate new token
 ```
 
-选择资源所有者 `1240748922`，只授权仓库 `chatgpt2api-31000`，并将
-`Repository permissions → Contents` 设置为 ` read`。
+选择仓库 `chatgpt2api-31000`，将 `Repository permissions → Contents` 设置为 `Read-only`。
 
-服务器克隆时必须使用纯 HTTPS 地址，不能粘贴 Markdown 链接：
-
-```bash
-git clone https://github.com/1240748922/chatgpt2api-31000.git
-```
-
-出现提示时：
+以后建议项目固定放在：
 
 ```text
-Username: 1240748922
-Password: 粘贴 GitHub 仓库 Token，不是 GitHub 登录密码
+/opt/chatgpt2api-31000
 ```
 
-## 首次启动
+## 五、创建服务器配置文件
+
+复制主项目配置：
 
 ```bash
-git clone https://github.com/1240748922/chatgpt2api-31000.git
-cd chatgpt2api-31000
 cp .env.example .env
 cp config.example.json config.json
+```
+
+复制注册机配置：
+
+```bash
 cp GPT-Register-Tool-main/config.example.json GPT-Register-Tool-main/config.json
+```
+
+创建数据目录：
+
+```bash
+mkdir -p data
+mkdir -p GPT-Register-Tool-main/sessions
+mkdir -p GPT-Register-Tool-main/runtime
+```
+
+这几个文件和目录已被 `.gitignore` 排除，不会上传到 GitHub；Compose 也会把它们挂载到容器中，所以拉取新镜像不会覆盖服务器上的真实配置和运行数据。
+
+当前需要保留在服务器上的配置和数据如下：
+
+```text
+.env
+config.json
+data/
+GPT-Register-Tool-main/config.json
+GPT-Register-Tool-main/sessions/
+GPT-Register-Tool-main/runtime/
+```
+
+这些内容不会通过 Git 上传，也不会被新的 Docker 镜像覆盖。
+
+8 个 API 实例和 Nginx 网关必须使用同一个服务器 `data/` 目录。当前
+`docker-compose.yml` 会将该目录以读写方式挂载到 `app0` 到 `app7`，以只读方式挂载到
+`gateway`；网关会直接提供本地图片，避免图片 URL 再经过 `least_conn` 随机分流。
+
+## 六、编辑主项目配置
+
+打开 `.env`：
+
+```bash
+nano .env
+```
+
+至少修改这些内容：
+
+```env
+POSTGRES_PASSWORD=改成一个长密码
+CHATGPT2API_AUTH_KEY=改成你的API访问密钥
+CHATGPT2API_MONITOR_CLUSTER_SECRET=改成一个随机字符串
+CHATGPT2API_DATA_DIR=./data
+CHATGPT2API_CONFIG_FILE=./config.json
+REGISTER_TOOL_CONFIG_FILE=./GPT-Register-Tool-main/config.json
+REGISTER_TOOL_SESSIONS_DIR=./GPT-Register-Tool-main/sessions
+REGISTER_TOOL_RUNTIME_DIR=./GPT-Register-Tool-main/runtime
+```
+
+保存 nano：
+
+```text
+Ctrl + O
+回车
+Ctrl + X
+```
+
+`CHATGPT2API_AUTH_KEY` 是你的 API 客户端调用接口时使用的密钥，不是 GitHub 密钥。
+
+## 七、编辑注册机配置
+
+打开：
+
+```bash
+nano GPT-Register-Tool-main/config.json
+```
+
+填写你实际使用的：
+
+- ReMail 配置
+- Outlook 或其他邮箱配置
+- 代理地址
+- 代理池
+- 注册模式
+- 邮箱服务密钥
+- 其他注册机参数
+
+不要把真实配置写入：
+
+```text
+config.example.json
+```
+
+只写入：
+
+```text
+GPT-Register-Tool-main/config.json
+```
+
+## 八、检查 Compose 配置
+
+先确认三个真实配置文件存在：
+
+```bash
+test -f .env && test -f config.json && test -f GPT-Register-Tool-main/config.json
+```
+
+执行：
+
+```bash
+docker compose --env-file .env config -q
+```
+
+没有输出就表示 Compose 配置格式正确。
+
+如果出现配置错误，先不要启动，把错误信息保留。
+
+不要把 `docker compose config` 的完整输出公开，因为其中可能包含配置值。
+
+## 九、拉取镜像并启动
+
+先拉取 GHCR 镜像：
+
+```bash
 docker compose --env-file .env pull
+```
+
+然后启动：
+
+```bash
 docker compose --env-file .env up -d
+```
+
+查看容器状态：
+
+```bash
 docker compose --env-file .env ps
 ```
 
-## 更新服务
-
-代码推送并等待 GitHub Actions 成功后，在服务器执行：
+确认挂载一致：
 
 ```bash
-cd chatgpt2api-31000
+for c in $(docker compose ps -q app0 app6 gateway); do
+  echo "===== $c ====="
+  docker inspect "$c" --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+done
+```
+
+`app0`、`app6` 和 `gateway` 都应该能看到同一个宿主机 `data` 路径对应
+`/app/data`。其中 `gateway` 显示为只读是正常的。
+
+正常情况下应该包含：
+
+```text
+postgres
+app0
+app1
+app2
+app3
+app4
+app5
+app6
+app7
+gateway
+```
+
+查看日志：
+
+```bash
+docker compose --env-file .env logs -f --tail=100
+```
+
+退出日志查看：
+
+```text
+Ctrl + C
+```
+
+注意，`Ctrl + C` 只退出日志，不会停止容器。
+
+## 十、访问系统
+
+浏览器打开：
+
+```text
+http://你的服务器IP:31000
+```
+
+接口测试：
+
+```bash
+curl http://127.0.0.1:31000/version
+```
+
+如果服务器外部访问不到，检查：
+
+```bash
+docker compose ps
+ufw status
+```
+
+并确认云厂商安全组已经放行 TCP `31000`。
+
+## 十一、以后更新项目
+
+本地修改代码后，在 GitHub Desktop 中：
+
+```text
+Commit to main
+Push origin
+```
+
+然后打开 GitHub 的 `Actions` 页面，等待：
+
+```text
+Build and publish container image
+```
+
+变成绿色成功。
+
+回到服务器执行：
+
+```bash
+cd /opt/chatgpt2api-31000
+git pull --ff-only
+docker compose --env-file .env pull
+docker compose --env-file .env up -d --force-recreate
+docker compose --env-file .env ps
+```
+
+本次图片分发修复还需要重新创建网关，使新的共享目录挂载和 Nginx 路由生效：
+
+```bash
+docker compose --env-file .env up -d --force-recreate
+```
+
+不需要删除容器或数据库卷。
+
+以后不需要：
+
+```text
+手动上传 tar.gz
+docker load
+重新安装 Python
+重新安装注册机依赖
+```
+
+因为这些内容已经由 GitHub Actions 构建进 Docker 镜像。
+
+## 十二、重要注意事项
+
+更新时不要执行：
+
+```bash
+docker compose down -v
+```
+
+这个命令会删除 PostgreSQL 数据卷，可能导致账号、调用记录等数据丢失。
+
+普通停止使用：
+
+```bash
+docker compose down
+```
+
+重新启动使用：
+
+```bash
+docker compose up -d
+```
+
+服务器上的这些文件不要删除：
+
+```text
+.env
+config.json
+data/
+GPT-Register-Tool-main/config.json
+GPT-Register-Tool-main/sessions/
+GPT-Register-Tool-main/runtime/
+```
+
+最终结构大致是：
+
+```text
+/opt/chatgpt2api-31000/
+├── .env
+├── config.json
+├── docker-compose.yml
+├── Dockerfile
+├── data/
+├── src_extract/
+├── GPT-Register-Tool-main/
+│   ├── config.json
+│   ├── sessions/
+│   └── runtime/
+└── .github/
+    └── workflows/
+        └── build-image.yml
+```
+
+日常更新只需要：
+
+```bash
 git pull --ff-only
 docker compose pull
 docker compose up -d --force-recreate
-docker compose ps
 ```
 
-镜像采用 Docker layer cache，只有发生变化的层会重新传输。当前 Compose 使用 `latest`，
-适合你的单服务器部署；需要严格回滚时，可以把 Compose 中的标签改为 Actions 发布的
-SHA 标签。
+如果 GitHub Actions 首次构建失败，进入对应的工作流查看具体错误日志即可。
 
-## 注册工具
+## 十三、常见问题
 
-注册工具源码可以放在同一私有仓库的 `GPT-Register-Tool-main/` 目录，也可以作为单独私有仓库在构建阶段取入。其 `config.json`、`sessions/`、`runtime/` 和 `.venv/` 必须留在服务器或运行卷中，不提交到 Git。
+### `git clone` 报 `Authentication failed`
 
-当前镜像会包含注册工具源码，Compose 另外挂载服务器上的 `config.json`、`sessions/`
-和 `runtime/`，所以重新拉取镜像不会覆盖注册机配置和运行数据。
+GitHub 不接受账号登录密码进行 Git HTTPS 操作。用户名填写 GitHub 用户名，Password 位置粘贴具有仓库读取权限的 GitHub Token。不要粘贴只用于 GHCR 的 Token。
 
-## 发布前检查
+### `docker login ghcr.io` 报 `denied`
+
+检查 GHCR Token 是否包含 `read:packages`，用户名是否正确，以及镜像包是否属于当前账号或当前账号有权访问。
+
+### `docker compose pull` 报 `pull access denied`
+
+重新登录 GHCR 后再拉取：
 
 ```bash
-python -m compileall -q src_extract GPT-Register-Tool-main/sms_tool
-docker compose --env-file .env config
-docker compose ps
+docker logout ghcr.io
+docker login ghcr.io -u 1240748922
+docker compose --env-file .env pull
 ```
 
-确认 8 个 `app` 实例、网关和 PostgreSQL 均为 healthy 后，再开始生产流量切换。
+Password 提示处粘贴 GHCR Token，不要粘贴 GitHub 登录密码。
+
+### 更新后配置似乎消失
+
+确认操作目录是服务器上的 `/opt/chatgpt2api-31000`，并确认修改的是 `.env`、`config.json` 和 `GPT-Register-Tool-main/config.json`，而不是 `*.example` 示例文件。

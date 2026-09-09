@@ -13,7 +13,7 @@ from contracts.models import (
 )
 from services.account_service import account_service
 from services.config import config
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
 
 
 FALLBACK_CHAT_MODELS = [
@@ -27,9 +27,7 @@ FALLBACK_CHAT_MODELS = [
     "gpt-5-mini",
 ]
 
-FALLBACK_IMAGE_MODELS = [
-    "gpt-image-2",
-]
+FALLBACK_IMAGE_MODELS = list(WEB_IMAGE_MODELS)
 
 
 def _normalize_list(raw: object) -> list[str]:
@@ -87,7 +85,7 @@ def _image_models_from_accounts(accounts: list[dict[str, Any]]) -> list[str]:
     if not available_accounts:
         return []
 
-    models: list[str] = ["gpt-image-2"]
+    models = list(WEB_IMAGE_MODELS)
     codex_types = {
         normalized
         for account in available_accounts

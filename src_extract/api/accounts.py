@@ -1119,22 +1119,34 @@ def _accounts_page(
         status: str,
         group_id: str,
 ) -> dict[str, Any]:
-    items = account_service.list_accounts()
-    filtered = _filtered_accounts(
-        items,
-        keyword=keyword,
-        status=status,
-        group_id=group_id,
+    has_filters = bool(
+        keyword.strip()
+        or (status.strip().lower() not in {"", "all"})
+        or (group_id.strip().lower() not in {"", "all"})
+    )
+    page_items, filtered_count, all_count = account_service.list_accounts_page(
+        page=page,
+        page_size=page_size,
+        predicate=(
+            (
+                lambda account: _account_matches_filters(
+                    account,
+                    keyword=keyword,
+                    status=status,
+                    group_id=group_id,
+                )
+            )
+            if has_filters
+            else None
+        ),
     )
     safe_page = max(1, page)
     safe_page_size = max(1, min(page_size, 500))
-    start = (safe_page - 1) * safe_page_size
-    end = start + safe_page_size
     group_names = _account_group_names()
     return {
-        "items": [_account_for_api(item, group_names) for item in filtered[start:end]],
-        "total": len(filtered),
-        "all_total": len(items),
+        "items": [_account_for_api(item, group_names) for item in page_items],
+        "total": filtered_count,
+        "all_total": all_count,
         "page": safe_page,
         "page_size": safe_page_size,
     }
@@ -1240,7 +1252,8 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return _accounts_page(
+        return await run_in_threadpool(
+            _accounts_page,
             page=page,
             page_size=page_size,
             keyword=keyword,

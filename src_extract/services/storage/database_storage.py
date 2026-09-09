@@ -156,6 +156,19 @@ class DatabaseStorageBackend(StorageBackend):
     def load_accounts_snapshot(self) -> StorageSnapshot:
         return self._load_snapshot("accounts")
 
+    def get_collection_revision(self, collection: StorageCollection) -> str:
+        """Read a collection revision without loading and decoding its rows."""
+        session = self.Session()
+        try:
+            version = session.execute(
+                select(StorageRevisionModel.version).where(
+                    StorageRevisionModel.collection == collection
+                )
+            ).scalar_one()
+            return self._revision_value(collection, version)
+        finally:
+            session.close()
+
     def load_auth_keys_snapshot(self) -> StorageSnapshot:
         return self._load_snapshot("auth_keys")
 

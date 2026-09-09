@@ -162,6 +162,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._account_snapshot_checked_at = time.monotonic()
         self._image_inflight: dict[str, int] = {}
+        self._image_index = 0
         self._image_shard_count, self._image_shard_index = account_shard_settings()
         self._image_failure_refresh_lock = Lock()
         self._image_failure_refresh_active: set[str] = set()
@@ -448,6 +449,21 @@ class AccountService:
                 ):
                     return False
                 expected_revision = self._accounts_revision
+
+            # Database-backed replicas can check the revision row without
+            # deserializing all account payloads.  The full snapshot is only
+            # loaded when another process actually changed the pool.
+            revision_getter = getattr(self.storage, "get_collection_revision", None)
+            if callable(revision_getter):
+                try:
+                    current_revision = revision_getter("accounts")
+                except Exception:
+                    current_revision = None
+                if current_revision is not None and current_revision == expected_revision:
+                    with self._lock:
+                        if self._accounts_revision == expected_revision:
+                            self._account_snapshot_checked_at = time.monotonic()
+                    return False
 
             try:
                 loaded, revision, _ = self._read_accounts_snapshot()
@@ -1960,28 +1976,28 @@ class AccountService:
                     for token in (excluded_tokens or set())
                     if token
                 }
-                if not self._list_ready_candidate_tokens(
-                    resolved_excluded_tokens,
-                    plan_type,
-                    source_type,
-                    plan_types,
-                ):
-                    raise self._no_ready_candidate_error(
+                access_token, ready_count, matched_count, limited_count = (
+                    self._find_available_image_token_locked(
+                        resolved_excluded_tokens,
                         plan_type,
                         source_type,
                         plan_types,
-                        resolved_excluded_tokens,
                     )
-                tokens = self._list_available_candidate_tokens(
-                    resolved_excluded_tokens,
-                    plan_type,
-                    source_type,
-                    plan_types,
                 )
-                if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
-                    self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
+                if ready_count == 0:
+                    if matched_count > 0 and limited_count == matched_count:
+                        raise ImageAccountSelectionError(
+                            "quota_exhausted",
+                            "all matched image accounts are remote-confirmed quota exhausted",
+                        )
+                    raise ImageAccountSelectionError(
+                        "unavailable",
+                        "no image account is ready for current model/status filters",
+                    )
+                if access_token:
+                    self._image_inflight[access_token] = int(
+                        self._image_inflight.get(access_token, 0)
+                    ) + 1
                     return access_token
                 self._image_slot_condition.wait(
                     timeout=min(1.0, remaining) if remaining is not None else 1.0
@@ -1990,6 +2006,70 @@ class AccountService:
             # account lock before considering another candidate so a remote delete
             # or disable cannot be leased from the stale in-memory view.
             self._refresh_accounts_snapshot_if_stale(wait_for_refresh=True)
+
+    def _find_available_image_token_locked(
+            self,
+            excluded_tokens: set[str],
+            plan_type: str | None,
+            source_type: str | None,
+            plan_types: set[str] | tuple[str, ...] | None,
+    ) -> tuple[str | None, int, int, int]:
+        """Find one image token without allocating a full candidate list.
+
+        The caller holds ``_image_slot_condition``.  The old implementation built
+        a ready-token list and then a second available-token list on every image
+        request.  With a large pool that created unnecessary allocations and
+        temporary references on the hot path.
+        """
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        account_count = len(self._accounts)
+        if account_count == 0:
+            return None, 0, 0, 0
+
+        cursor = self._image_index % account_count
+        selected_token: str | None = None
+        selected_ordinal: int | None = None
+        first_available_token: str | None = None
+        first_available_ordinal: int | None = None
+        ready_count = 0
+        matched_count = 0
+        limited_count = 0
+
+        for ordinal, item in enumerate(self._accounts.values()):
+            token = item.get("access_token") or ""
+            if not token or token in excluded_tokens:
+                continue
+            if not self._image_account_belongs_to_instance(item):
+                continue
+            if not (
+                self._account_matches_plan_type(item, plan_type)
+                and self._account_matches_any_plan_type(item, plan_types)
+                and self._account_matches_source_type(item, source_type)
+            ):
+                continue
+
+            matched_count += 1
+            if str(item.get("status") or "") == "限流":
+                limited_count += 1
+            if not self._is_image_account_available(item):
+                continue
+            ready_count += 1
+            if int(self._image_inflight.get(token, 0)) >= max_concurrency:
+                continue
+
+            if first_available_token is None:
+                first_available_token = token
+                first_available_ordinal = ordinal
+            if selected_token is None and ordinal >= cursor:
+                selected_token = token
+                selected_ordinal = ordinal
+
+        if selected_token is None:
+            selected_token = first_available_token
+            selected_ordinal = first_available_ordinal
+        if selected_token is not None and selected_ordinal is not None:
+            self._image_index = (selected_ordinal + 1) % account_count
+        return selected_token, ready_count, matched_count, limited_count
 
     def _no_ready_candidate_error(
             self,
@@ -2270,6 +2350,56 @@ class AccountService:
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
             return result
+
+    def list_accounts_page(
+            self,
+            *,
+            page: int,
+            page_size: int,
+            predicate: Callable[[dict], bool] | None = None,
+    ) -> tuple[list[dict], int, int]:
+        """Return only one account page while keeping the full pool in memory.
+
+        Account management is paginated in the UI, so copying every credential
+        for every page request is unnecessary and becomes noticeable with large
+        pools.  Filtering still scans the in-memory snapshot, but only matching
+        rows on the requested page are copied and serialized.
+        """
+        self._refresh_accounts_snapshot_if_stale()
+        safe_page = max(1, int(page))
+        safe_page_size = max(1, min(int(page_size), 500))
+        start = (safe_page - 1) * safe_page_size
+        end = start + safe_page_size
+        page_items: list[dict] = []
+        matched_count = 0
+        with self._lock:
+            all_count = len(self._accounts)
+            if predicate is None:
+                for ordinal, item in enumerate(self._accounts.values()):
+                    if ordinal >= end:
+                        break
+                    if ordinal < start:
+                        continue
+                    account = dict(item)
+                    token = account.get("access_token") or ""
+                    account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                    page_items.append(account)
+                return page_items, all_count, all_count
+            # Keep the lock hold short.  Status filtering can decode credential
+            # metadata for many rows, so do that work on stable references after
+            # taking a shallow snapshot instead of blocking image selection.
+            snapshot = tuple(self._accounts.values())
+            inflight = dict(self._image_inflight)
+        for item in snapshot:
+            if predicate is not None and not predicate(item):
+                continue
+            if start <= matched_count < end:
+                account = dict(item)
+                token = account.get("access_token") or ""
+                account["image_inflight"] = int(inflight.get(token, 0))
+                page_items.append(account)
+            matched_count += 1
+        return page_items, matched_count, all_count
 
     def list_limited_tokens(self) -> list[str]:
         self._refresh_accounts_snapshot_if_stale()

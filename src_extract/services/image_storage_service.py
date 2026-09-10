@@ -479,9 +479,45 @@ class ImageStorageService:
         # File paths are not an authorization boundary: only assets registered
         # in the Gallery index may be read through this service.
         with self._index_guard():
-            item = self._load_clean_index().get(safe_rel)
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=404, detail="image not found")
+            items = self._load_clean_index()
+            item = items.get(safe_rel)
+
+            # Auto-register unindexed files that exist on disk
+            if not isinstance(item, dict):
+                path = image_local_path(safe_rel)
+                if path.is_file():
+                    try:
+                        stat = path.stat()
+                        payload = path.read_bytes()
+                        dimensions = _image_dimensions(payload)
+                        path_parts = safe_rel.split('/')
+                        date_str = '-'.join(path_parts[:3]) if len(path_parts) >= 3 else _mtime_date(path)
+
+                        item = {
+                            "rel": safe_rel,
+                            "path": safe_rel,
+                            "name": path.name,
+                            "date": date_str,
+                            "size": len(payload),
+                            "created_at": _mtime_datetime(path),
+                            "storage": "local",
+                            "local": True,
+                            "webdav": False,
+                            "generation": self._new_generation(),
+                        }
+                        if dimensions:
+                            item["width"], item["height"] = dimensions
+
+                        items[safe_rel] = item
+                        self._save_index(items)
+
+                        # Return immediately after auto-registration
+                        return payload
+                    except Exception:
+                        pass
+
+                raise HTTPException(status_code=404, detail="image not found")
+
         path = image_local_path(safe_rel)
         if bool(item.get("local")) and path.is_file():
             return path.read_bytes()

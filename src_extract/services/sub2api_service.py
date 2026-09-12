@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 from curl_cffi.requests import Session
@@ -22,8 +22,9 @@ from services.account_import_job import (
     normalize_import_job as _normalize_import_job,
 )
 from services.account_processing import (
-    account_processing_slot,
-    account_processing_worker_count,
+    account_import_slot,
+    account_import_worker_count,
+    bounded_future_results,
 )
 from services.config import config
 from services.remote_import_job_status import import_job_is_active
@@ -986,7 +987,7 @@ class Sub2APIImportService:
         batch_errors: dict[str, str] = {}
         batch_error = ""
         try:
-            with account_processing_slot():
+            with account_import_slot():
                 batch_results, batch_errors = _fetch_access_tokens_for_accounts(
                     server,
                     account_ids,
@@ -1045,18 +1046,18 @@ class Sub2APIImportService:
                     return
 
         def fetch_fallback(account_id: str) -> tuple[str, dict]:
-            with account_processing_slot():
+            with account_import_slot():
                 return _fetch_access_token_for_account(server, account_id)
 
-        max_workers = account_processing_worker_count(len(fallback_ids))
+        max_workers = account_import_worker_count(len(fallback_ids))
         if max_workers:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {
-                    executor.submit(fetch_fallback, account_id): account_id
-                    for account_id in fallback_ids
-                }
-                for future in as_completed(future_map):
-                    account_id = future_map[future]
+                for future, account_id in bounded_future_results(
+                    executor,
+                    fetch_fallback,
+                    fallback_ids,
+                    max_in_flight=max_workers * 2,
+                ):
                     try:
                         token, meta = future.result()
                         append_payload(account_id, token, meta)

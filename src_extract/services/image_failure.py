@@ -452,6 +452,24 @@ def structured_upstream_codes(value: Any) -> set[str]:
     return _structured_codes(value)
 
 
+_IMAGE_QUOTA_MESSAGE_MARKERS = (
+    "图像生成请求上限",
+    "image generation request limit",
+    "image generation quota",
+    "quota exhausted",
+    "insufficient quota",
+)
+
+
+def _looks_like_image_quota_message(value: Any) -> bool:
+    """Recognize quota exhaustion when upstream omits a structured error code."""
+    text = value if isinstance(value, str) else _message_text(value)
+    normalized = str(text or "").strip().casefold()
+    return bool(normalized) and any(
+        marker.casefold() in normalized for marker in _IMAGE_QUOTA_MESSAGE_MARKERS
+    )
+
+
 QUOTA_CODES = {"insufficient_quota", "quota_exhausted", "image_quota_exhausted"}
 AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}
 POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
@@ -1064,6 +1082,8 @@ def classify_message_facts(
     )
     if structured_failure is not None:
         return structured_failure
+    if _looks_like_image_quota_message(raw_detail):
+        return image_failure("image_quota_exhausted", raw_detail=raw_detail)
 
     if normalized_role == "assistant" and normalized_content_type == "text" and (
         end_turn or is_terminal_message_status(normalized_status)

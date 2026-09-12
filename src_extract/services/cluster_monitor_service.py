@@ -38,7 +38,7 @@ def _authorize(provided: str) -> None:
 
 def local_internal_snapshot(provided: str) -> dict[str, Any]:
     _authorize(provided)
-    return realtime_monitor_service.snapshot(record_limit=500, recent_limit=500, slow_limit=200, event_limit=500)
+    return realtime_monitor_service.snapshot()
 
 
 def local_internal_call_detail(call_id: str, provided: str) -> dict[str, Any] | None:

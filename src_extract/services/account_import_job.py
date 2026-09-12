@@ -547,6 +547,83 @@ class RemoteAccountImportJob:
                 error="remote import worker failed",
             )
 
+    def _sync_and_complete(
+        self,
+        sync_payloads: list[dict],
+        add_result: dict,
+    ) -> None:
+        """Refresh imported accounts after they are already usable locally."""
+        tokens = [_clean(payload.get("access_token")) for payload in sync_payloads]
+        try:
+            sync_result = (
+                account_service.sync_accounts_and_quota(tokens)
+                if tokens
+                else {"synced": 0, "errors": []}
+            )
+            raw_sync_errors = list(sync_result.get("errors") or [])
+            sync_errors = [
+                normalize_import_error(
+                    item,
+                    default_stage="sync",
+                    default_name="account sync",
+                    **self._context(sync_payloads),
+                )
+                for item in raw_sync_errors
+            ]
+        except Exception as exc:
+            sync_result = {"synced": 0}
+            raw_sync_errors = [{
+                "stage": "sync",
+                "name": "account sync",
+                "error": str(exc) or "sync failed",
+            }]
+            sync_errors = [
+                normalize_import_error(
+                    raw_sync_errors[0],
+                    default_stage="sync",
+                    default_name="account sync",
+                    **self._context(sync_payloads),
+                )
+            ]
+
+        self._failures.extend(sync_errors)
+        sync_event_identities = [
+            import_error_event_identity(raw_error, sync_error)
+            for raw_error, sync_error in zip(raw_sync_errors, sync_errors)
+        ]
+        self._events = append_account_operation_events(
+            self._events,
+            [
+                {
+                    "account_id": identity[0],
+                    "account_label": identity[1],
+                    "action": "import_account",
+                    "status": "failed",
+                    "message": sync_error.get("error"),
+                }
+                for sync_error, identity in zip(
+                    sync_errors,
+                    sync_event_identities,
+                )
+            ],
+            existing_events_normalized=True,
+            **self._context(),
+        )
+        self.update(
+            expected_job_id=self._job_id,
+            status="completed",
+            stage="completed",
+            stage_total=self._total,
+            stage_completed=self._total,
+            completed=self._total,
+            added=int(add_result.get("added") or 0),
+            skipped=int(add_result.get("skipped") or 0),
+            synced=int(sync_result.get("synced") or 0),
+            failed_total=self._failures.total,
+            errors=self._failures.details,
+            events=self._events,
+        )
+
     def finish(self, fetched_accounts: list[RemoteImportAccount]) -> bool:
         if not fetched_accounts:
             events = append_account_operation_event(
@@ -711,75 +788,15 @@ class RemoteAccountImportJob:
         ) is None:
             return False
 
-        try:
-            sync_result = (
-                account_service.sync_accounts_and_quota(tokens)
-                if tokens
-                else {"synced": 0, "errors": []}
-            )
-            raw_sync_errors = list(sync_result.get("errors") or [])
-            sync_errors = [
-                normalize_import_error(
-                    item,
-                    default_stage="sync",
-                    default_name="account sync",
-                    **self._context(sync_payloads),
-                )
-                for item in raw_sync_errors
-            ]
-        except Exception as exc:
-            sync_result = {"synced": 0}
-            raw_sync_errors = [{
-                "stage": "sync",
-                "name": "account sync",
-                "error": str(exc) or "sync failed",
-            }]
-            sync_errors = [
-                normalize_import_error(
-                    raw_sync_errors[0],
-                    default_stage="sync",
-                    default_name="account sync",
-                    **self._context(sync_payloads),
-                )
-            ]
-
-        self._failures.extend(sync_errors)
-        sync_event_identities = [
-            import_error_event_identity(raw_error, sync_error)
-            for raw_error, sync_error in zip(raw_sync_errors, sync_errors)
-        ]
-        self._events = append_account_operation_events(
-            self._events,
-            [
-                {
-                    "account_id": identity[0],
-                    "account_label": identity[1],
-                    "action": "import_account",
-                    "status": "failed",
-                    "message": sync_error.get("error"),
-                }
-                for sync_error, identity in zip(
-                    sync_errors,
-                    sync_event_identities,
-                )
-            ],
-            existing_events_normalized=True,
-            **self._context(),
+        self.start_worker(
+            target=self._sync_and_complete,
+            args=(sync_payloads, add_result),
+            name=f"{self._worker_label}-quota-sync",
         )
-        return self.update(
-            expected_job_id=self._job_id,
-            status="completed",
-            stage="completed",
-            stage_total=self._total,
-            stage_completed=self._total,
-            completed=self._total,
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            synced=int(sync_result.get("synced") or 0),
-            failed_total=self._failures.total,
-            errors=self._failures.details,
-            events=self._events,
-        ) is not None
+        # The accounts have been persisted and can be selected immediately.
+        # Quota metadata continues in the background so a large import does not
+        # hold the import worker open for every upstream account check.
+        return True
 
 
 def normalize_import_job(

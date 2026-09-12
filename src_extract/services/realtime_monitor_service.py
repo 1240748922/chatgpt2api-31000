@@ -749,6 +749,14 @@ class RealtimeMonitorService:
             "active_by_stage": dict(active_stages.most_common(10)),
         }
 
+    def summary_for_records(
+        self,
+        active: list[dict[str, Any]],
+        completed: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the public summary for records merged from multiple replicas."""
+        return self._summary(active, completed)
+
     def _metric_values(self, records: list[dict[str, Any]], key: str) -> list[int]:
         return [value for value in (self._metric_value(item, key) for item in records) if value > 0]
 

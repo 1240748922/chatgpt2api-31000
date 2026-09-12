@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from curl_cffi.requests import Session
 
@@ -18,8 +18,9 @@ from services.account_import_job import (
     normalize_import_job as _normalize_import_job,
 )
 from services.account_processing import (
-    account_processing_slot,
-    account_processing_worker_count,
+    account_import_slot,
+    account_import_worker_count,
+    bounded_future_results,
 )
 from services.proxy_service import proxy_settings
 from services.remote_import_job_status import import_job_is_active
@@ -363,16 +364,19 @@ class CPAImportService:
             return
 
         fetched_accounts: list[tuple[str, dict]] = []
-        max_workers = max(1, account_processing_worker_count(len(names)))
+        max_workers = max(1, account_import_worker_count(len(names)))
 
         def fetch(file_name: str) -> tuple[dict | None, str | None]:
-            with account_processing_slot():
+            with account_import_slot():
                 return fetch_remote_account_payload(pool, file_name)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(fetch, name): name for name in names}
-            for future in as_completed(future_map):
-                file_name = future_map[future]
+            for future, file_name in bounded_future_results(
+                executor,
+                fetch,
+                names,
+                max_in_flight=max_workers * 2,
+            ):
                 try:
                     payload, error = future.result()
                 except Exception as exc:

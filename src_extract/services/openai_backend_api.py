@@ -231,7 +231,13 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
-        self.account = account_service.get_account(self.access_token) if self.access_token else {}
+        # Image account selection already resolved the local shard snapshot.
+        # Reloading the full account collection here adds a large synchronous
+        # cost when another replica updates one account during a load test.
+        self.account = (
+            account_service.get_account(self.access_token, refresh_snapshot=False)
+            if self.access_token else {}
+        )
         self.account = self.account if isinstance(self.account, dict) else {}
         self._credential_access_token = str(self.access_token or "").strip()
         self._credential_refresh_token = str(self.account.get("refresh_token") or "").strip()
@@ -2919,6 +2925,13 @@ class OpenAIBackendAPI:
             if settle_for > 0:
                 self._sleep_for_image_poll(settle_for)
         elif initial_wait > 0:
+            # A stream with no file IDs is usually an account-level tool error.
+            # Probe it quickly instead of spending the full normal image commit
+            # delay before the task endpoint can expose that error. Successful
+            # generations that need polling still back off normally after this
+            # first probe.
+            if not has_initial_ids:
+                initial_wait = min(initial_wait, 1.0)
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
             sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
             if sleep_for > 0:

@@ -445,6 +445,18 @@ def _get_account_by_token_identity(access_token: str) -> dict[str, Any] | None:
     return account_service.get_account(access_token)
 
 
+def _get_accounts_by_tokens(tokens: list[str]) -> dict[str, dict[str, Any]]:
+    getter = getattr(account_service, "get_accounts_by_tokens", None)
+    if callable(getter):
+        result = getter(tokens)
+        return result if isinstance(result, dict) else {}
+    return {
+        token: account
+        for token in _unique_tokens(tokens)
+        if (account := _get_account_by_token_identity(token)) is not None
+    }
+
+
 def _accounts_by_id() -> dict[str, dict[str, Any]]:
     return {
         account_id: account
@@ -516,8 +528,9 @@ def _account_targets(
     tokens, _resolved_ids, missing_ids = _resolve_account_targets(account_ids, legacy_tokens)
     targets: list[tuple[str, str]] = []
     seen_ids: set[str] = set()
+    accounts_by_token = _get_accounts_by_tokens(tokens)
     for token in tokens:
-        account = account_service.get_account(token)
+        account = accounts_by_token.get(token)
         account_id = _clean_text((account or {}).get("management_id"))
         current_token = _clean_text((account or {}).get("access_token")) or token
         if not account_id or account_id in seen_ids:
@@ -568,8 +581,9 @@ def _selected_refresh_context(
     id_by_token_hint = _refresh_error_id_map(targets)
     sensitive_values = list(access_tokens)
     proxy_values: list[str] = []
+    accounts_by_token = _get_accounts_by_tokens(access_tokens)
     for token, _account_id in targets:
-        account = account_service.get_account(token) or {}
+        account = accounts_by_token.get(token) or {}
         for key in ("refresh_token", "id_token"):
             value = _clean_text(account.get(key))
             if value:
@@ -1504,6 +1518,10 @@ def create_router() -> APIRouter:
                         )
                     result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
                     result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+                    result["account_targets"] = [
+                        *(result.get("account_targets") or []),
+                        *(extra_result.get("account_targets") or []),
+                    ]
             else:
                 if target_group_id is None:
                     result = await run_in_threadpool(
@@ -1523,22 +1541,56 @@ def create_router() -> APIRouter:
                 detail={"error": str(exc)},
             ) from exc
 
-        targets: list[tuple[str, str]] = []
         sensitive_values = list(tokens)
         proxy_values: list[str] = []
-        for token in tokens:
-            account = _get_account_by_token_identity(token)
-            account_id = _clean_text((account or {}).get("management_id"))
-            active_token = _clean_text((account or {}).get("access_token")) or token
-            if account_id:
-                targets.append((active_token, account_id))
+        projected_targets = [
+            item for item in (result.get("account_targets") or [])
+            if isinstance(item, dict)
+            and _clean_text(item.get("active_token"))
+            and _clean_text(item.get("account_id"))
+        ]
+        targets = [
+            (
+                _clean_text(item.get("active_token")),
+                _clean_text(item.get("account_id")),
+            )
+            for item in projected_targets
+        ]
+        target_labels = {
+            _clean_text(item.get("account_id")): (
+                _clean_text(item.get("account_label"))
+                or _clean_text(item.get("account_id"))
+            )
+            for item in projected_targets
+            if _clean_text(item.get("account_id"))
+        }
+        for item in projected_targets:
             for key in ("refresh_token", "id_token"):
-                value = _clean_text((account or {}).get(key))
+                value = _clean_text(item.get(key))
                 if value:
                     sensitive_values.append(value)
-            proxy = _clean_text((account or {}).get("proxy"))
+            proxy = _clean_text(item.get("proxy"))
             if proxy:
                 proxy_values.append(proxy)
+        # Keep compatibility with alternate account stores that do not yet
+        # return the batch target projection.
+        if not targets:
+            targets = []
+            for token in tokens:
+                account = _get_account_by_token_identity(token)
+                account_id = _clean_text((account or {}).get("management_id"))
+                active_token = _clean_text((account or {}).get("access_token")) or token
+                if account_id:
+                    targets.append((active_token, account_id))
+                for key in ("refresh_token", "id_token"):
+                    value = _clean_text((account or {}).get(key))
+                    if value:
+                        sensitive_values.append(value)
+                proxy = _clean_text((account or {}).get("proxy"))
+                if proxy:
+                    proxy_values.append(proxy)
+            target_labels = {}
+        result.pop("account_targets", None)
 
         sync_after_import = (
             bool(body.sync_after_import)
@@ -1549,7 +1601,7 @@ def create_router() -> APIRouter:
         )
         if not sync_after_import:
             updated_ids = [account_id for _token, account_id in targets]
-            labels = _account_operation_labels(targets)
+            labels = target_labels or _account_operation_labels(targets)
             payload = _account_mutation_response(
                 added=max(0, int(result.get("added") or 0)),
                 skipped=max(0, int(result.get("skipped") or 0)),
@@ -1580,7 +1632,7 @@ def create_router() -> APIRouter:
             sensitive_values=sensitive_values,
             proxy_values=proxy_values,
         )
-        labels = _account_operation_labels(targets)
+        labels = target_labels or _account_operation_labels(targets)
         payload = _account_mutation_response(
             added=max(0, int(result.get("added") or 0)),
             skipped=max(0, int(result.get("skipped") or 0)),

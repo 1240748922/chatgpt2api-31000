@@ -626,6 +626,22 @@ class ConfigStore:
         )
 
     @property
+    def account_import_concurrency(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "account_import_concurrency",
+            self.data.get("account_import_concurrency"),
+        )
+
+    @property
+    def account_quota_sync_concurrency(self) -> int:
+        self.reload_if_changed()
+        return normalize_integer_setting(
+            "account_quota_sync_concurrency",
+            self.data.get("account_quota_sync_concurrency"),
+        )
+
+    @property
     def image_max_account_attempts(self) -> int:
         self.reload_if_changed()
         return normalize_integer_setting(
@@ -753,6 +769,8 @@ class ConfigStore:
             data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
             data["image_account_concurrency"] = self.image_account_concurrency
             data["account_processing_concurrency"] = self.account_processing_concurrency
+            data["account_import_concurrency"] = self.account_import_concurrency
+            data["account_quota_sync_concurrency"] = self.account_quota_sync_concurrency
             data["image_account_retry_enabled"] = self.image_account_retry_enabled
             data["image_upscale_enabled"] = self.image_upscale_enabled
             data["image_upscale_engine"] = self.image_upscale_engine

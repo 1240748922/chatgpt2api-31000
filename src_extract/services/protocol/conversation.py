@@ -507,11 +507,11 @@ def format_image_result(
         )
         if stored_url:
             image_urls.append(stored_url)
-        asset: dict[str, Any] = {"revised_prompt": revised_prompt}
+        # Keep the local URL alongside the requested representation so clients
+        # can display the result without decoding a multi-megabyte base64 body.
+        asset: dict[str, Any] = {"revised_prompt": revised_prompt, "url": stored_url}
         if response_format == "b64_json":
             asset["b64_json"] = base64.b64encode(image_bytes).decode("ascii")
-        else:
-            asset["url"] = stored_url
         dimensions = image_size_from_bytes(image_bytes)
         if dimensions:
             asset["width"], asset["height"] = dimensions
@@ -2069,6 +2069,11 @@ def _generate_single_image(
         error: ImageGenerationError | None = None,
     ) -> bool:
         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
+        attempt_limit = (
+            min(max_account_attempts, 2)
+            if failure.code == "image_quota_exhausted"
+            else max_account_attempts
+        )
         if (
             failure.code == "task_interrupted"
             or (
@@ -2076,7 +2081,7 @@ def _generate_single_image(
                 and time.monotonic() >= request.deadline_monotonic
             )
             or not failure.switch_account
-            or len(image_attempts) >= max_account_attempts
+            or len(image_attempts) >= attempt_limit
         ):
             return False
         retry_token = ""
@@ -2192,6 +2197,7 @@ def _generate_single_image(
                         expected_access_token=attempt_access_token,
                         expected_refresh_token=attempt_refresh_token,
                         expected_last_token_refresh_at=attempt_last_token_refresh_at,
+                        defer_persistence=True,
                     )
             except Exception as exc:
                 logger.warning({
@@ -2278,7 +2284,9 @@ def _generate_single_image(
                 )
 
         account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
-        account = account_service.get_account(token) or {}
+        # Account selection already owns the local shard snapshot. Avoid a
+        # synchronous full-pool reload here while other replicas write results.
+        account = account_service.get_account(token, refresh_snapshot=False) or {}
         attempt_refresh_token = str(account.get("refresh_token") or "").strip()
         attempt_last_token_refresh_at = account.get("last_token_refresh_at")
         account_email = str(account.get("email") or "").strip()
@@ -2293,6 +2301,11 @@ def _generate_single_image(
                 "next_account_email": account_email,
                 "attempted_account_count": len(image_attempts) + 1,
                 "max_account_attempts": max_account_attempts,
+                "failure_attempt_limit": (
+                    min(max_account_attempts, 2)
+                    if previous_attempt.get("failure_code") == "image_quota_exhausted"
+                    else max_account_attempts
+                ),
                 "index": index,
             })
             if request.trace_image_perf:

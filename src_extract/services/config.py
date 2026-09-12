@@ -740,11 +740,11 @@ class ConfigStore:
 
     @property
     def base_url(self) -> str:
-        return str(
-            os.getenv("CHATGPT2API_BASE_URL")
-            or self.data.get("base_url")
-            or ""
-        ).strip().rstrip("/")
+        # A value saved from the admin page takes precedence. The environment
+        # variable remains a deployment default when no saved value exists.
+        if "base_url" in self.data:
+            return str(self.data.get("base_url") or "").strip().rstrip("/")
+        return str(os.getenv("CHATGPT2API_BASE_URL") or "").strip().rstrip("/")
 
     @property
     def app_version(self) -> str:

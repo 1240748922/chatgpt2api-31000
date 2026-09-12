@@ -476,16 +476,15 @@ class ImageStorageService:
         safe_rel = normalize_image_relative_path(rel)
         if not _is_image_rel(safe_rel):
             raise HTTPException(status_code=404, detail="image not found")
-        # File paths are not an authorization boundary: only assets registered
-        # in the Gallery index may be read through this service.
         with self._index_guard():
             item = self._load_clean_index().get(safe_rel)
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=404, detail="image not found")
         path = image_local_path(safe_rel)
-        if bool(item.get("local")) and path.is_file():
+        # A successful generation writes the file before committing the index.
+        # If a replica reads the URL during that small window, serve the
+        # validated local image directly instead of returning a false 404.
+        if path.is_file() and (not isinstance(item, dict) or bool(item.get("local"))):
             return path.read_bytes()
-        if bool(item.get("webdav")):
+        if isinstance(item, dict) and bool(item.get("webdav")):
             client = WebDAVClient(self.settings())
             try:
                 return client.get(safe_rel)
@@ -557,7 +556,9 @@ class ImageStorageService:
         safe_rel = normalize_image_relative_path(rel)
         with self._index_guard():
             item = self._load_clean_index().get(safe_rel)
-        return bool(isinstance(item, dict) and item.get("local")) and image_local_path(safe_rel).is_file()
+        return image_local_path(safe_rel).is_file() and (
+            not isinstance(item, dict) or bool(item.get("local"))
+        )
 
     @staticmethod
     def _catalog_size_matches_local(item: dict[str, object], local_size: int) -> bool:

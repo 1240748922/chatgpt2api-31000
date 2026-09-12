@@ -370,9 +370,6 @@ class SettingsManagementService:
             if expected_revision != current_revision:
                 raise SettingsRevisionConflictError("settings revision does not match current configuration")
 
-            if "base_url" in values and self._environment_base_url():
-                raise ValueError("base_url is read-only while CHATGPT2API_BASE_URL is configured")
-
             updates = self._storage_updates(values, effective, stored)
             if clear_genbox_push:
                 genbox_updates = updates.get("genbox_push")
@@ -448,10 +445,11 @@ class SettingsManagementService:
         raw = getattr(self._config, "data", None)
         stored = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else copy.deepcopy(effective)
 
-        environment_base_url = self._environment_base_url()
         effective_base_url = _url(getattr(self._config, "base_url", ""))
-        stored_base_url = _url(stored.get("base_url", effective.get("base_url")))
-        effective["base_url"] = environment_base_url or effective_base_url or stored_base_url
+        if "base_url" in stored:
+            effective["base_url"] = _url(stored.get("base_url"))
+        else:
+            effective["base_url"] = effective_base_url
         return effective, stored
 
     def _build_view(self, effective: dict[str, Any], stored: dict[str, Any]) -> SettingsView:
@@ -715,15 +713,13 @@ class SettingsManagementService:
         )
 
     def _metadata(self, stored: dict[str, Any]) -> dict[str, SettingsFieldMetadata]:
-        environment_base_url = self._environment_base_url()
         fields: dict[str, SettingsFieldMetadata] = {}
         for dotted_path, spec in _FIELD_SPECS.items():
             path = tuple(dotted_path.split("."))
             source = "configured" if _path_exists(stored, path) else "default"
             values = dict(spec)
-            if dotted_path == "base_url" and environment_base_url:
+            if dotted_path == "base_url" and self._environment_base_url() and not _path_exists(stored, path):
                 source = "environment"
-                values["read_only"] = True
             fields[dotted_path] = SettingsFieldMetadata(source=source, **values)
         return fields
 

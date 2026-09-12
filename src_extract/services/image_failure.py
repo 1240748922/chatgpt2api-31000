@@ -326,6 +326,10 @@ def public_image_error_message(
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
     if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
+    # Do not expose the upstream plan/quota wording or reset duration. Keep
+    # this response stable for API clients and avoid leaking account details.
+    if failure.code in {"image_quota_exhausted", "insufficient_quota"}:
+        return IMAGE_QUOTA_PUBLIC_MESSAGE
 
     upstream_text = _public_upstream_text(failure, error)
     if upstream_text:
@@ -333,8 +337,6 @@ def public_image_error_message(
 
     if failure.code in _TOOL_ERROR_PUBLIC_CODES:
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
-    if failure.code in {"image_quota_exhausted", "insufficient_quota"}:
-        return IMAGE_QUOTA_PUBLIC_MESSAGE
     return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
 
 

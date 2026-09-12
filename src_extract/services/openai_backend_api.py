@@ -1366,12 +1366,15 @@ class OpenAIBackendAPI:
         }
         path = "/backend-api/f/conversation"
         timeout_secs = self._image_request_timeout(config.image_stream_timeout_secs)
-        # Keep the transport/curl deadline slightly above the logical SSE
-        # deadline.  Otherwise curl_cffi can raise curl(28) first and bypass
-        # the stream-timeout recovery probe that fetches conversation/task
-        # diagnostics.
+        # Keep the transport/curl deadline only a little above the logical SSE
+        # deadline. The SSE iterator has its own timer and closes the response
+        # when that deadline is reached. A large transport grace period keeps
+        # an interrupted image request occupied for another 30 seconds before
+        # the recovery probe can run, which compounds badly under concurrency.
+        # Five seconds is enough to let the iterator raise its logical timeout
+        # while bounding the extra time consumed by a broken upstream stream.
         transport_timeout_secs = self._image_request_timeout(
-            max(timeout_secs + 30, timeout_secs * 1.1)
+            max(timeout_secs + 5, timeout_secs * 1.05)
         )
         curl_options = getattr(self.session, "curl_options", None)
         previous_total_timeout = None

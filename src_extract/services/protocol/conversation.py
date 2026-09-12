@@ -2084,6 +2084,21 @@ def _generate_single_image(
             or len(image_attempts) >= attempt_limit
         ):
             return False
+        # Do not start another full upstream attempt when the request has only
+        # a small tail of its total deadline left. A retry needs enough time for
+        # token maintenance, SSE and result polling; otherwise it only keeps an
+        # account slot occupied and turns a recoverable failure into a very
+        # long tail latency. The bound scales with the configured stream
+        # timeout but is capped so normal 30-60s image generations still get a
+        # retry opportunity.
+        if request.deadline_monotonic > 0:
+            remaining = request.deadline_monotonic - time.monotonic()
+            minimum_retry_window = max(
+                30.0,
+                min(60.0, float(config.image_stream_timeout_secs) * 0.75),
+            )
+            if remaining < minimum_retry_window:
+                return False
         retry_token = ""
         fallback_retry_pending = False
         retry_error = attach_attempts(error or ImageGenerationError(

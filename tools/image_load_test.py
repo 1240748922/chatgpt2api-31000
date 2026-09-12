@@ -25,6 +25,8 @@ from typing import Any
 class Result:
     index: int
     elapsed_s: float
+    api_elapsed_s: float = 0.0
+    image_elapsed_s: float = 0.0
     status: int | None = None
     image_status: int | None = None
     image_bytes: int = 0
@@ -87,6 +89,7 @@ def run_one(index: int, args: argparse.Namespace, headers: dict[str, str]) -> Re
     ).encode("utf-8")
     try:
         result.status, raw = request_json(args.url, headers, body, args.request_timeout)
+        result.api_elapsed_s = time.perf_counter() - started
         if result.status < 200 or result.status >= 300:
             result.error = raw.decode("utf-8", errors="replace")[:500]
         else:
@@ -95,6 +98,7 @@ def run_one(index: int, args: argparse.Namespace, headers: dict[str, str]) -> Re
             if not image_url:
                 result.error = "response does not contain data[].url"
             else:
+                image_started = time.perf_counter()
                 try:
                     result.image_status, result.image_bytes = fetch_image(
                         image_url, args.image_timeout, args.max_image_bytes
@@ -103,12 +107,16 @@ def run_one(index: int, args: argparse.Namespace, headers: dict[str, str]) -> Re
                         result.error = f"image URL returned HTTP {result.image_status}"
                 except Exception as exc:  # URL validation failure belongs to this request.
                     result.error = f"image URL check failed: {exc}"
+                finally:
+                    result.image_elapsed_s = time.perf_counter() - image_started
     except urllib.error.HTTPError as exc:
         result.status = exc.code
         result.error = exc.read(500).decode("utf-8", errors="replace")
     except Exception as exc:
         result.error = f"request failed: {exc}"
     finally:
+        if result.api_elapsed_s == 0.0:
+            result.api_elapsed_s = time.perf_counter() - started
         result.elapsed_s = time.perf_counter() - started
     return result
 
@@ -141,6 +149,7 @@ def main() -> int:
         results = list(executor.map(lambda i: run_one(i, args, headers), range(1, args.requests + 1)))
     wall = time.perf_counter() - started
     values = [item.elapsed_s for item in results]
+    api_values = [item.api_elapsed_s for item in results]
     http_ok = sum(item.status is not None and 200 <= item.status < 300 for item in results)
     image_ok = sum(item.image_status is not None and 200 <= item.image_status < 300 for item in results)
     summary = {
@@ -156,6 +165,11 @@ def main() -> int:
         "p50_s": round(percentile(values, 0.50), 3),
         "p95_s": round(percentile(values, 0.95), 3),
         "max_s": round(max(values), 3),
+        "api_avg_s": round(statistics.mean(api_values), 3),
+        "api_p50_s": round(percentile(api_values, 0.50), 3),
+        "api_p95_s": round(percentile(api_values, 0.95), 3),
+        "api_max_s": round(max(api_values), 3),
+        "over_60s": sum(value > 60 for value in values),
         "over_140s": sum(value > 140 for value in values),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -78,10 +78,17 @@ class LoadTestGui(tk.Tk):
 
         table_frame = ttk.Frame(self, padding=(10, 0))
         table_frame.pack(fill="both", expand=True)
-        columns = ("id", "status", "image", "elapsed", "bytes", "error")
+        columns = ("id", "status", "api_elapsed", "image", "image_elapsed", "elapsed", "bytes", "error")
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings")
-        headings = {"id": "编号", "status": "接口状态", "image": "图片 URL", "elapsed": "耗时(s)", "bytes": "图片大小", "error": "错误"}
-        widths = {"id": 55, "status": 90, "image": 100, "elapsed": 85, "bytes": 95, "error": 470}
+        headings = {
+            "id": "编号", "status": "接口状态", "api_elapsed": "接口耗时(s)",
+            "image": "图片 URL 状态", "image_elapsed": "图片校验耗时(s)",
+            "elapsed": "总耗时(s)", "bytes": "图片大小", "error": "错误",
+        }
+        widths = {
+            "id": 55, "status": 80, "api_elapsed": 95, "image": 110,
+            "image_elapsed": 115, "elapsed": 90, "bytes": 95, "error": 390,
+        }
         for key in columns:
             self.table.heading(key, text=headings[key], command=lambda column=key: self._sort_table(column, False))
             self.table.column(key, width=widths[key], anchor="w")
@@ -175,6 +182,9 @@ class LoadTestGui(tk.Tk):
         values = sorted(r.elapsed_s for r in self.results)
         p50 = values[min(len(values) - 1, int((len(values) - 1) * 0.50))]
         p95 = values[min(len(values) - 1, int((len(values) - 1) * 0.95))]
+        api_values = sorted(r.api_elapsed_s for r in self.results)
+        api_p50 = api_values[min(len(api_values) - 1, int((len(api_values) - 1) * 0.50))]
+        api_p95 = api_values[min(len(api_values) - 1, int((len(api_values) - 1) * 0.95))]
         http_ok = sum(r.status is not None and 200 <= r.status < 300 for r in self.results)
         image_ok = sum(r.image_status is not None and 200 <= r.image_status < 300 for r in self.results)
         slow60 = sum(r.elapsed_s > 60 for r in self.results)
@@ -186,8 +196,10 @@ class LoadTestGui(tk.Tk):
                 categories[category] = categories.get(category, 0) + 1
         errors = "，".join(f"{key} {value}" for key, value in categories.items()) or "无"
         self.details.configure(
-            text=(f"统计：平均 {statistics.mean(values):.1f}s | P50 {p50:.1f}s | P95 {p95:.1f}s | "
-                  f"最大 {max(values):.1f}s | >60s {slow60} | >140s {slow140} | "
+            text=(f"接口：平均 {statistics.mean(api_values):.1f}s | P50 {api_p50:.1f}s | "
+                  f"P95 {api_p95:.1f}s | 最大 {max(api_values):.1f}s\n"
+                  f"总耗时：平均 {statistics.mean(values):.1f}s | P50 {p50:.1f}s | "
+                  f"P95 {p95:.1f}s | 最大 {max(values):.1f}s | >60s {slow60} | >140s {slow140}\n"
                   f"HTTP 成功率 {http_ok}/{len(self.results)} | 图片有效率 {image_ok}/{len(self.results)}\n"
                   f"失败分类：{errors}")
         )
@@ -217,7 +229,15 @@ class LoadTestGui(tk.Tk):
                     self.progress.configure(value=len(self.results))
                     image = f"HTTP {result.image_status}" if result.image_status else "失败"
                     status = str(result.status or "失败")
-                    self.table.insert("", "end", values=(result.index, status, image, f"{result.elapsed_s:.1f}", result.image_bytes, (self._error_category(result) + (": " + result.error[:180] if result.error else ""))))
+                    self.table.insert(
+                        "", "end",
+                        values=(
+                            result.index, status, f"{result.api_elapsed_s:.1f}", image,
+                            f"{result.image_elapsed_s:.1f}", f"{result.elapsed_s:.1f}",
+                            result.image_bytes,
+                            self._error_category(result) + (": " + result.error[:180] if result.error else ""),
+                        ),
+                    )
                     self.summary.configure(text=f"已完成 {len(self.results)} 个请求")
                     self._update_stats()
                 elif kind == "done":

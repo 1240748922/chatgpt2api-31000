@@ -790,7 +790,11 @@ def _poll_email_otp(
             )
 
     issued_after_unix = _provider_otp_issued_after(mailbox, issued_after_unix, runtime_config)
-    proxy = _resolve_mailbox_proxy(proxy, runtime_config)
+    # Mailbox polling has its own egress setting.  The proxy passed by the
+    # registration workflow is for the ChatGPT auth flow and must not be
+    # silently reused for ReMail/Graph/IMAP requests when mailbox_proxy is
+    # empty (especially inside a Linux container).
+    proxy = _configured_mailbox_proxy(runtime_config)
 
     # Try registered OTP pollers in order (cfworker -> remail -> Graph API fallback graph_otp_poll)
     poller = mailbox_strategies.resolve_otp_poller(mailbox, cfg, registry=registry)

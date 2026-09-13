@@ -37,13 +37,17 @@ Build and publish container image
 
 等待状态变成绿色的 `Success`。
 
-它成功后，镜像地址就是：
+每次成功构建都会发布 `latest` 和 `sha-提交号前7位` 两种标签。
+当前稳定应用的构建已成功，镜像地址是：
 
 ```text
-ghcr.io/1240748922/chatgpt2api-31000:latest
+ghcr.io/1240748922/chatgpt2api-31000:sha-16e7193
 ```
 
 首次构建可能需要较长时间，因为会安装 Python 依赖、Playwright 和 Chromium。
+
+Compose 默认锁定这版应用，避免拉取镜像时意外切换到新版。
+完整版本说明和回退步骤见 [VERSIONING.md](./VERSIONING.md)。
 
 ## 二、准备云服务器
 
@@ -202,6 +206,24 @@ GPT-Register-Tool-main/runtime/
 
 这些内容不会通过 Git 上传，也不会被新的 Docker 镜像覆盖。
 
+## 六点一、新维护方案（仅测试版）
+
+默认稳定镜像 `sha-16e7193` 不包含以下新方案。只有主动选择 `sha-f1648e6` 或后续包含该方案的镜像时，这些负载门控才会生效。普通稳定版不需要配置以下三项变量。
+
+后台账号同步、自动清理和自动补号会读取 8 个实例的实时生图负载。默认只有在生图活动数不超过 2 且没有等待队列时才执行维护，因此不会为了维护任务降低生图线程池并发。
+
+当已确认可用账号低于“最低可用”值时，自动补号作为紧急任务放行；注册机仍在独立后台线程和子进程中运行，成功账号会逐个导入并同步额度。手动注册也会绕过低负载等待，但不会修改生图并发配置。
+
+如需调整门槛，在服务器 `.env` 中设置：
+
+```env
+CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX=2
+CHATGPT2API_MAINTENANCE_IMAGE_WAITING_MAX=0
+CHATGPT2API_MAINTENANCE_RETRY_SECONDS=30
+```
+
+修改后执行 `docker compose --env-file .env up -d --force-recreate` 使配置生效。
+
 8 个 API 实例和 Nginx 网关必须使用同一个服务器 `data/` 目录。当前
 `docker-compose.yml` 会将该目录以读写方式挂载到 `app0` 到 `app7`，以只读方式挂载到
 `gateway`；网关会直接提供本地图片，避免图片 URL 再经过 `least_conn` 随机分流。
@@ -217,6 +239,7 @@ nano .env
 至少修改这些内容：
 
 ```env
+CHATGPT2API_IMAGE_TAG=sha-16e7193
 POSTGRES_PASSWORD=改成一个长密码
 CHATGPT2API_AUTH_KEY=改成你的API访问密钥
 CHATGPT2API_MONITOR_CLUSTER_SECRET=改成一个随机字符串
@@ -317,7 +340,7 @@ done
 ```
 
 `app0`、`app6` 和 `gateway` 都应该能看到同一个宿主机 `data` 路径对应
-`/app/data`。其中 `gateway` 显示为只读是正常的。
+`/app/src_extract/data`。其中 `gateway` 显示为只读是正常的。
 
 正常情况下应该包含：
 
@@ -388,21 +411,26 @@ Build and publish container image
 
 变成绿色成功。
 
+升级前按 [VERSIONING.md](./VERSIONING.md) 备份配置和数据库，并记录当前镜像。
 回到服务器执行：
 
 ```bash
 cd /opt/chatgpt2api-31000
 git pull --ff-only
+```
+
+编辑 `.env` 的 `CHATGPT2API_IMAGE_TAG`，填入这次成功构建的 `sha-提交号前7位`。
+例如 `sha-16e7193` 表示新维护方案之前的稳定应用，`sha-f1648e6` 表示新方案测试版。然后执行：
+
+```bash
+docker compose --env-file .env config -q
 docker compose --env-file .env pull
 docker compose --env-file .env up -d --force-recreate
 docker compose --env-file .env ps
 ```
 
-本次图片分发修复还需要重新创建网关，使新的共享目录挂载和 Nginx 路由生效：
-
-```bash
-docker compose --env-file .env up -d --force-recreate
-```
+没有修改镜像版本时，`pull` 和 `up` 会继续使用锁定的应用镜像。
+`git pull` 仍会更新 Compose、Nginx 等部署文件，因此它也应当视为一次部署变更。
 
 不需要删除容器或数据库卷。
 
@@ -469,13 +497,7 @@ GPT-Register-Tool-main/runtime/
         └── build-image.yml
 ```
 
-日常更新只需要：
-
-```bash
-git pull --ff-only
-docker compose pull
-docker compose up -d --force-recreate
-```
+日常更新按第十一节操作；新版异常时按 [VERSIONING.md](./VERSIONING.md) 切回稳定版。
 
 如果 GitHub Actions 首次构建失败，进入对应的工作流查看具体错误日志即可。
 

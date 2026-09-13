@@ -6,6 +6,7 @@ from threading import Event, Thread
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
+from services.maintenance_load import maintenance_is_allowed
 from services.account_replenishment_service import account_replenishment_service
 from services.auth_service import auth_service
 from services.config import config
@@ -77,6 +78,15 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                allowed, load = maintenance_is_allowed()
+                if not allowed:
+                    print(
+                        "[account-watcher] maintenance deferred: "
+                        f"image_active={load.get('image_active')} "
+                        f"image_waiting={load.get('image_waiting')}"
+                    )
+                    stop_event.wait(config.refresh_account_interval_minute * 60)
+                    continue
                 pending_auth = account_service.list_pending_auth_verification_tokens()
                 if pending_auth:
                     account_service.resume_pending_auth_verifications()

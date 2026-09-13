@@ -202,6 +202,22 @@ GPT-Register-Tool-main/runtime/
 
 这些内容不会通过 Git 上传，也不会被新的 Docker 镜像覆盖。
 
+## 六点一、后台维护与生图并发
+
+后台账号同步、自动清理和自动补号会读取 8 个实例的实时生图负载。默认只有在生图活动数不超过 2 且没有等待队列时才执行维护，因此不会为了维护任务降低生图线程池并发。
+
+当已确认可用账号低于“最低可用”值时，自动补号作为紧急任务放行；注册机仍在独立后台线程和子进程中运行，成功账号会逐个导入并同步额度。手动注册也会绕过低负载等待，但不会修改生图并发配置。
+
+如需调整门槛，在服务器 `.env` 中设置：
+
+```env
+CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX=2
+CHATGPT2API_MAINTENANCE_IMAGE_WAITING_MAX=0
+CHATGPT2API_MAINTENANCE_RETRY_SECONDS=30
+```
+
+修改后执行 `docker compose --env-file .env up -d --force-recreate` 使配置生效。
+
 8 个 API 实例和 Nginx 网关必须使用同一个服务器 `data/` 目录。当前
 `docker-compose.yml` 会将该目录以读写方式挂载到 `app0` 到 `app7`，以只读方式挂载到
 `gateway`；网关会直接提供本地图片，避免图片 URL 再经过 `least_conn` 随机分流。

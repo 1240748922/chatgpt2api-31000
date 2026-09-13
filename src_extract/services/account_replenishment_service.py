@@ -18,6 +18,7 @@ from services.config import config
 from services.proxy_service import test_proxy
 from services.storage.coordination_repository import AccountReplenishmentRepository
 from services.json_file import read_json_object, write_json_file
+from services.maintenance_load import maintenance_is_allowed
 from utils.log import logger
 
 
@@ -875,6 +876,23 @@ class AccountReplenishmentService:
             self._set_next_run(time.time() + interval_seconds)
             self._mark_finished(result=result)
             return result
+
+        emergency = minimum_available > 0 and int(metrics.get("current_available") or 0) < minimum_available
+        if not force:
+            allowed, load = maintenance_is_allowed(emergency=emergency)
+            if not allowed:
+                metrics["maintenance_load"] = load
+                result = {
+                    "ok": True,
+                    "triggered": False,
+                    "reason": "deferred_high_image_load" if load.get("ok") else "deferred_load_unknown",
+                    "metrics": metrics,
+                    "maintenance_load": load,
+                }
+                self._touch_check(metrics)
+                self._set_next_run(time.time() + max(1, int(load.get("retry_seconds") or 30)))
+                self._mark_finished(result=result)
+                return result
 
         configuration_error = self._registration_configuration_error(settings)
         if configuration_error:

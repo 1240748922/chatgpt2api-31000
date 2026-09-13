@@ -11,6 +11,7 @@ from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.image_service import cleanup_image_retention, delete_to_target, preview_image_retention_cleanup
 from services.log_service import log_service
+from services.maintenance_load import maintenance_is_allowed
 from services.storage.coordination_repository import RetentionCleanupRepository
 from utils.log import logger
 from utils.timezone import beijing_from_timestamp
@@ -337,10 +338,19 @@ class RetentionCleanupCoordinator:
         *,
         enforce_image_free_space: bool,
         stop_event: threading.Event | None = None,
+        respect_image_load: bool = False,
     ) -> dict[str, Any]:
         with self._run_owner():
             if stop_event is not None and stop_event.is_set():
                 return self._empty_automatic_result()
+            if respect_image_load:
+                allowed, load = maintenance_is_allowed()
+                if not allowed:
+                    return {
+                        **self._empty_automatic_result(),
+                        "deferred": True,
+                        "maintenance_load": load,
+                    }
             return self._run_automatic_owned(
                 enforce_image_free_space=enforce_image_free_space,
                 stop_event=stop_event,
@@ -439,9 +449,21 @@ class RetentionCleanupCoordinator:
                 result = self.run_automatic(
                     enforce_image_free_space=True,
                     stop_event=stop_event,
+                    respect_image_load=True,
                 )
                 if stop_event.is_set():
                     break
+                if result.get("deferred"):
+                    load = result.get("maintenance_load") or {}
+                    retry_seconds = max(5, int(load.get("retry_seconds") or 30))
+                    logger.info({
+                        "event": "retention_cleanup_deferred_high_image_load",
+                        "image_active": load.get("image_active"),
+                        "image_waiting": load.get("image_waiting"),
+                        "retry_seconds": retry_seconds,
+                    })
+                    deadline = time.monotonic() + retry_seconds
+                    continue
                 logs = result.get("logs") or {}
                 if int(logs.get("removed") or 0) > 0:
                     logger.info({"event": "log_auto_cleanup_done", **logs})

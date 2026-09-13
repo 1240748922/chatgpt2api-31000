@@ -8,6 +8,10 @@
 
 [DEPLOYMENT.md](./DEPLOYMENT.md)
 
+当前稳定基线为 `stable-20260913`，应用镜像为 `sha-f1648e6`。
+Compose 默认锁定这版应用；升级时需要在 `.env` 中明确选择镜像版本。
+版本选择、升级前备份和恢复步骤请查看 [VERSIONING.md](./VERSIONING.md)。
+
 ## 在本地电脑启动
 
 1. 安装 Docker Desktop（或 Docker Engine + Compose v2）。

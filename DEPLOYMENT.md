@@ -37,13 +37,17 @@ Build and publish container image
 
 等待状态变成绿色的 `Success`。
 
-它成功后，镜像地址就是：
+每次成功构建都会发布 `latest` 和 `sha-提交号前7位` 两种标签。
+当前稳定应用的构建已成功，镜像地址是：
 
 ```text
-ghcr.io/1240748922/chatgpt2api-31000:latest
+ghcr.io/1240748922/chatgpt2api-31000:sha-f1648e6
 ```
 
 首次构建可能需要较长时间，因为会安装 Python 依赖、Playwright 和 Chromium。
+
+Compose 默认锁定这版应用，避免拉取镜像时意外切换到新版。
+完整版本说明和回退步骤见 [VERSIONING.md](./VERSIONING.md)。
 
 ## 二、准备云服务器
 
@@ -233,6 +237,7 @@ nano .env
 至少修改这些内容：
 
 ```env
+CHATGPT2API_IMAGE_TAG=sha-f1648e6
 POSTGRES_PASSWORD=改成一个长密码
 CHATGPT2API_AUTH_KEY=改成你的API访问密钥
 CHATGPT2API_MONITOR_CLUSTER_SECRET=改成一个随机字符串
@@ -333,7 +338,7 @@ done
 ```
 
 `app0`、`app6` 和 `gateway` 都应该能看到同一个宿主机 `data` 路径对应
-`/app/data`。其中 `gateway` 显示为只读是正常的。
+`/app/src_extract/data`。其中 `gateway` 显示为只读是正常的。
 
 正常情况下应该包含：
 
@@ -404,21 +409,26 @@ Build and publish container image
 
 变成绿色成功。
 
+升级前按 [VERSIONING.md](./VERSIONING.md) 备份配置和数据库，并记录当前镜像。
 回到服务器执行：
 
 ```bash
 cd /opt/chatgpt2api-31000
 git pull --ff-only
+```
+
+编辑 `.env` 的 `CHATGPT2API_IMAGE_TAG`，填入这次成功构建的 `sha-提交号前7位`。
+例如 `sha-f1648e6` 表示当前稳定应用。然后执行：
+
+```bash
+docker compose --env-file .env config -q
 docker compose --env-file .env pull
 docker compose --env-file .env up -d --force-recreate
 docker compose --env-file .env ps
 ```
 
-本次图片分发修复还需要重新创建网关，使新的共享目录挂载和 Nginx 路由生效：
-
-```bash
-docker compose --env-file .env up -d --force-recreate
-```
+没有修改镜像版本时，`pull` 和 `up` 会继续使用锁定的应用镜像。
+`git pull` 仍会更新 Compose、Nginx 等部署文件，因此它也应当视为一次部署变更。
 
 不需要删除容器或数据库卷。
 
@@ -485,13 +495,7 @@ GPT-Register-Tool-main/runtime/
         └── build-image.yml
 ```
 
-日常更新只需要：
-
-```bash
-git pull --ff-only
-docker compose pull
-docker compose up -d --force-recreate
-```
+日常更新按第十一节操作；新版异常时按 [VERSIONING.md](./VERSIONING.md) 切回稳定版。
 
 如果 GitHub Actions 首次构建失败，进入对应的工作流查看具体错误日志即可。
 

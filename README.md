@@ -8,9 +8,9 @@
 
 [DEPLOYMENT.md](./DEPLOYMENT.md)
 
-当前稳定基线为 `stable-before-maintenance-sharp-20260914`，应用镜像为 `sha-f6a3f02`。
-这是新维护调度方案之前的版本，并已补齐 Sharp 运行依赖；新方案测试镜像为 `sha-f1648e6`。
-Compose 默认锁定这版应用；升级时需要在 `.env` 中明确选择镜像版本。
+当前 `main` 默认使用新方案修复镜像 `sha-ca72dea`，包含低负载维护调度和 Sharp 运行依赖修复。
+之前认可的旧稳定版仍保留为 `stable-before-maintenance-sharp-20260914`，镜像为 `sha-f6a3f02`。
+Compose 默认锁定 `sha-ca72dea`；升级时需要在 `.env` 中明确选择镜像版本。
 版本选择、升级前备份和恢复步骤请查看 [VERSIONING.md](./VERSIONING.md)。
 
 ## 在本地电脑启动

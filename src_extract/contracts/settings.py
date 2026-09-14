@@ -8,7 +8,7 @@ from contracts.settings_specification import numeric_setting_spec
 
 
 LogLevel = Literal["debug", "info", "warning", "error"]
-ImageUpscaleEngine = Literal["sharp_lanczos3", "pillow_lanczos"]
+ImageUpscaleEngine = Literal["sharp_lanczos3", "pillow_lanczos", "fsrcnn_x2"]
 ImageStorageMode = Literal["local", "webdav", "both"]
 ProxyRuntimeClearanceMode = Literal["none", "manual", "flaresolverr"]
 SettingsFieldSource = Literal["default", "configured", "environment"]

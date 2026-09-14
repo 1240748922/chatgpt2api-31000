@@ -615,7 +615,7 @@ class ConfigStore:
     def image_upscale_engine(self) -> str:
         self.reload_if_changed()
         value = str(self.data.get("image_upscale_engine") or "sharp_lanczos3").strip().lower()
-        return value if value in {"sharp_lanczos3", "pillow_lanczos"} else "sharp_lanczos3"
+        return value if value in {"sharp_lanczos3", "pillow_lanczos", "fsrcnn_x2"} else "sharp_lanczos3"
 
     @property
     def account_processing_concurrency(self) -> int:

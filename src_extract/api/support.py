@@ -110,6 +110,19 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
                         f"recovering {len(pending_auth)} pending auth accounts)"
                     )
                     account_service.sync_accounts_and_quota(limited_tokens)
+
+                # Large imports can leave many normal accounts with unknown
+                # image quota. Verify only a bounded batch per cycle; the
+                # existing sync path applies the configured auto-remove rules.
+                unknown_tokens = account_service.list_unknown_quota_tokens()
+                if unknown_tokens:
+                    print(
+                        "[account-watcher] syncing "
+                        f"{len(unknown_tokens)} unknown-quota accounts"
+                    )
+                    result = account_service.sync_accounts_and_quota(unknown_tokens)
+                    if result.get("errors"):
+                        print(f"[account-watcher] unknown-quota sync errors: {result['errors']}")
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
             stop_event.wait(config.refresh_account_interval_minute * 60)

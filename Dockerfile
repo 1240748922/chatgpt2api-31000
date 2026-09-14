@@ -38,6 +38,7 @@ RUN /app/.venv/bin/pip install --no-cache-dir \
         "curl-cffi>=0.16.0,<0.17" \
         "fastapi>=0.136.0" \
         "pillow>=12.2.0" \
+        "opencv-contrib-python-headless>=4.10.0,<5" \
         "pybase64>=1.4.3" \
         "python-multipart>=0.0.26" \
         "tiktoken>=0.12.0" \

@@ -18,8 +18,13 @@ from utils.log import logger
 
 
 _SHARP_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "image_upscale" / "upscale.mjs"
+_FSRCNN_MODEL = Path(__file__).resolve().parents[1] / "models" / "FSRCNN_x2.pb"
 _UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 4, 1, 96)
 _UPSCALE_SLOTS = threading.BoundedSemaphore(_UPSCALE_CONCURRENCY)
+_FSRCNN_CONCURRENCY = env_int("CHATGPT2API_FSRCNN_CONCURRENCY", 1, 1, 4)
+_FSRCNN_SLOTS = threading.BoundedSemaphore(_FSRCNN_CONCURRENCY)
+_FSRCNN_MODEL_LOCK = threading.Lock()
+_FSRCNN_MODEL_INSTANCE = None
 _UPSCALE_STATE_LOCK = threading.Lock()
 _UPSCALE_ACTIVE = 0
 _UPSCALE_WAITING = 0
@@ -32,12 +37,15 @@ def image_upscale_snapshot() -> dict[str, int]:
 
 
 class _UpscaleSlot:
+    def __init__(self, slots: threading.BoundedSemaphore = _UPSCALE_SLOTS) -> None:
+        self._slots = slots
+
     def __enter__(self) -> int:
         global _UPSCALE_ACTIVE, _UPSCALE_WAITING
         started = time.perf_counter()
         with _UPSCALE_STATE_LOCK:
             _UPSCALE_WAITING += 1
-        _UPSCALE_SLOTS.acquire()
+        self._slots.acquire()
         with _UPSCALE_STATE_LOCK:
             _UPSCALE_WAITING -= 1
             _UPSCALE_ACTIVE += 1
@@ -47,7 +55,7 @@ class _UpscaleSlot:
         global _UPSCALE_ACTIVE
         with _UPSCALE_STATE_LOCK:
             _UPSCALE_ACTIVE -= 1
-        _UPSCALE_SLOTS.release()
+        self._slots.release()
 
 
 def _target_size(value: object) -> tuple[int, int] | None:
@@ -101,6 +109,62 @@ def _sharp_lanczos3(image_data: bytes, target: tuple[int, int]) -> bytes:
     return completed.stdout
 
 
+def _fsrcnn_x2(image_data: bytes, target: tuple[int, int]) -> bytes:
+    """Run the small CPU FSRCNN x2 model, then fit the exact requested size."""
+
+    if not _FSRCNN_MODEL.is_file():
+        raise RuntimeError("FSRCNN model is unavailable")
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("OpenCV contrib runtime is unavailable") from exc
+
+    encoded = np.frombuffer(image_data, dtype=np.uint8)
+    source = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if source is None:
+        raise RuntimeError("FSRCNN could not decode image")
+
+    source_is_gray = len(source.shape) == 2
+    source_has_alpha = len(source.shape) == 3 and source.shape[2] == 4
+    if source_is_gray:
+        model_input = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
+    elif source_has_alpha:
+        model_input = source[:, :, :3]
+    else:
+        model_input = source
+
+    with _FSRCNN_MODEL_LOCK:
+        global _FSRCNN_MODEL_INSTANCE
+        if _FSRCNN_MODEL_INSTANCE is None:
+            if not hasattr(cv2, "dnn_superres"):
+                raise RuntimeError("OpenCV dnn_superres is unavailable")
+            model = cv2.dnn_superres.DnnSuperResImpl_create()
+            model.readModel(str(_FSRCNN_MODEL))
+            model.setModel("fsrcnn", 2)
+            _FSRCNN_MODEL_INSTANCE = model
+        model = _FSRCNN_MODEL_INSTANCE
+        if source_has_alpha:
+            alpha = source[:, :, 3]
+            upscaled = model.upsample(model_input)
+            alpha = cv2.resize(alpha, (upscaled.shape[1], upscaled.shape[0]), interpolation=cv2.INTER_CUBIC)
+            upscaled = cv2.merge((*cv2.split(upscaled), alpha))
+        else:
+            upscaled = model.upsample(model_input)
+            if source_is_gray:
+                upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+
+    if (upscaled.shape[1], upscaled.shape[0]) != target:
+        upscaled = cv2.resize(upscaled, target, interpolation=cv2.INTER_LANCZOS4)
+    with Image.open(io.BytesIO(image_data)) as source_image:
+        image_format = str(source_image.format or "PNG").upper()
+    extension = ".jpg" if image_format in {"JPG", "JPEG"} else ".webp" if image_format == "WEBP" else ".png"
+    success, output = cv2.imencode(extension, upscaled)
+    if not success:
+        raise RuntimeError("FSRCNN could not encode image")
+    return output.tobytes()
+
+
 def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
     if not image_data or not config.image_upscale_enabled:
         return image_data
@@ -112,7 +176,8 @@ def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
         return image_data
 
     engine = config.image_upscale_engine
-    with _UpscaleSlot() as queue_ms:
+    slots = _FSRCNN_SLOTS if engine == "fsrcnn_x2" else _UPSCALE_SLOTS
+    with _UpscaleSlot(slots) as queue_ms:
         upscale_started = time.perf_counter()
         try:
             if engine == "sharp_lanczos3":
@@ -127,6 +192,8 @@ def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
                     })
                     result = _pillow_lanczos(image_data, target)
                     engine = "pillow_lanczos"
+            elif engine == "fsrcnn_x2":
+                result = _fsrcnn_x2(image_data, target)
             else:
                 result = _pillow_lanczos(image_data, target)
             logger.info({

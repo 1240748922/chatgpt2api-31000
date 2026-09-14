@@ -44,7 +44,7 @@ from services.storage.base import (
     StorageMutation,
     StorageRevisionConflictError,
 )
-from services.runtime_configuration import account_shard_settings, stable_shard_index
+from services.runtime_configuration import account_shard_settings, env_int, stable_shard_index
 from utils.diagnostics import sanitize_diagnostic_text
 from utils.helper import anonymize_token
 
@@ -118,6 +118,12 @@ class AccountService:
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _POOL_HEALTH_REFRESH_BATCH_SIZE = 10
+    _UNKNOWN_QUOTA_SYNC_BATCH_SIZE = env_int(
+        "CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE",
+        50,
+        1,
+        1000,
+    )
     _IMAGE_FAILURE_REFRESH_DEDUP_SECONDS = 30
     _ACCESS_TOKEN_FINGERPRINT_LIMIT = 8
     _REFRESH_PROGRESS_COMPLETED_TTL_SECONDS = 10 * 60
@@ -2685,6 +2691,48 @@ class AccountService:
                    and item.get("last_remote_check_result") != "pending"
                    and (token := item.get("access_token") or "")
             ]
+
+    def list_unknown_quota_tokens(
+        self,
+        limit: int | None = None,
+        *,
+        freshness_seconds: int | float | None = None,
+    ) -> list[str]:
+        """Return a bounded, oldest-first batch of accounts needing quota checks.
+
+        This intentionally never returns the whole unknown pool. The lifecycle
+        watcher uses it to make gradual progress through large imports while the
+        recent-attempt guard prevents a failed check from being retried every
+        cycle.
+        """
+        self._refresh_accounts_snapshot_if_stale()
+        freshness = self._pool_health_freshness_seconds(freshness_seconds)
+        batch_size = (
+            self._UNKNOWN_QUOTA_SYNC_BATCH_SIZE
+            if limit is None
+            else max(1, int(limit))
+        )
+        now = datetime.now(timezone.utc)
+        candidates: list[tuple[float, str]] = []
+        with self._lock:
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if (
+                    not token
+                    or item.get("status") != "正常"
+                    or not bool(item.get("image_quota_unknown"))
+                    or item.get("last_remote_check_result") == "pending"
+                    or self._remote_check_is_fresh(item, now, freshness)
+                    or self._remote_check_attempt_is_recent(item, now, freshness)
+                ):
+                    continue
+                checked_at = self._parse_time(
+                    item.get("last_remote_check_attempt_at")
+                    or item.get("last_remote_checked_at")
+                )
+                candidates.append((checked_at.timestamp() if checked_at else 0.0, token))
+        candidates.sort(key=lambda candidate: candidate[0])
+        return [token for _, token in candidates[:batch_size]]
 
     @classmethod
     def _pool_health_freshness_seconds(cls, freshness_seconds: int | float | None = None) -> int:

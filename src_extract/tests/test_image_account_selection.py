@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 from services.account_service import AccountService
 
@@ -62,3 +64,26 @@ def test_selection_prefers_recently_successful_unknown_over_cold_unknown(monkeyp
     ])
 
     assert _select(probe) == "warm"
+
+
+def test_unknown_quota_scan_is_bounded_oldest_first_and_skips_recent_attempts(monkeypatch):
+    probe = AccountService.__new__(AccountService)
+    probe._lock = Lock()
+    now = datetime.now(timezone.utc)
+    probe._accounts = OrderedDict([
+        ("new", _account("new")),
+        ("old", _account("old")),
+        ("recent", _account("recent")),
+        ("pending", _account("pending")),
+    ])
+    probe._accounts["old"]["last_remote_check_attempt_at"] = (
+        now - timedelta(hours=2)
+    ).isoformat()
+    probe._accounts["recent"]["last_remote_check_attempt_at"] = now.isoformat()
+    probe._accounts["pending"]["last_remote_check_result"] = "pending"
+    monkeypatch.setattr(probe, "_refresh_accounts_snapshot_if_stale", lambda: None)
+
+    assert probe.list_unknown_quota_tokens(limit=2, freshness_seconds=60) == [
+        "new",
+        "old",
+    ]

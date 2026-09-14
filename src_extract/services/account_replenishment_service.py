@@ -877,9 +877,11 @@ class AccountReplenishmentService:
             self._mark_finished(result=result)
             return result
 
-        emergency = minimum_available > 0 and int(metrics.get("current_available") or 0) < minimum_available
         if not force:
-            allowed, load = maintenance_is_allowed(emergency=emergency)
+            # Account replenishment is intentionally never an emergency path.
+            # The registration tool has its own operator-controlled workflow;
+            # this service must not start it during image traffic.
+            allowed, load = maintenance_is_allowed()
             if not allowed:
                 metrics["maintenance_load"] = load
                 result = {

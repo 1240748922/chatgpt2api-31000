@@ -81,17 +81,13 @@ def cluster_image_load() -> dict[str, Any]:
         }
 
 
-def maintenance_is_allowed(*, emergency: bool = False) -> tuple[bool, dict[str, Any]]:
-    """Return whether background maintenance may run now.
+def maintenance_is_allowed() -> tuple[bool, dict[str, Any]]:
+    """Return whether non-user-facing maintenance may run now.
 
-    Emergency replenishment is allowed when the confirmed account pool falls
-    below its configured minimum.  This bypasses only the load gate; it does
-    not change image concurrency or the account-pool coordination lock.
+    Every automatic maintenance task respects the image load gate. Account
+    replenishment can still be started manually through the registration tool,
+    but low inventory never bypasses this gate.
     """
 
     load = cluster_image_load()
-    if emergency:
-        load["bypassed"] = True
-        load["bypass_reason"] = "account_pool_below_minimum"
-        return True, load
     return bool(load.get("ok") and load.get("low_load")), load

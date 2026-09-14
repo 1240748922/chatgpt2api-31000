@@ -1114,6 +1114,7 @@ class AccountService:
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
+        normalized["last_image_success_at"] = normalized.get("last_image_success_at") or None
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
@@ -2091,10 +2092,14 @@ class AccountService:
         selected_ordinal: int | None = None
         selected_known_quota_token: str | None = None
         selected_known_quota_ordinal: int | None = None
+        selected_warm_unknown_token: str | None = None
+        selected_warm_unknown_ordinal: int | None = None
         first_available_token: str | None = None
         first_available_ordinal: int | None = None
         first_known_quota_token: str | None = None
         first_known_quota_ordinal: int | None = None
+        first_warm_unknown_token: str | None = None
+        first_warm_unknown_ordinal: int | None = None
         ready_count = 0
         matched_count = 0
         limited_count = 0
@@ -2134,6 +2139,12 @@ class AccountService:
             if known_quota and first_known_quota_token is None:
                 first_known_quota_token = token
                 first_known_quota_ordinal = ordinal
+            warm_unknown = bool(item.get("image_quota_unknown")) and bool(
+                item.get("last_image_success_at")
+            )
+            if warm_unknown and first_warm_unknown_token is None:
+                first_warm_unknown_token = token
+                first_warm_unknown_ordinal = ordinal
             if selected_token is None and ordinal >= cursor:
                 selected_token = token
                 selected_ordinal = ordinal
@@ -2144,6 +2155,13 @@ class AccountService:
             ):
                 selected_known_quota_token = token
                 selected_known_quota_ordinal = ordinal
+            if (
+                warm_unknown
+                and selected_warm_unknown_token is None
+                and ordinal >= cursor
+            ):
+                selected_warm_unknown_token = token
+                selected_warm_unknown_ordinal = ordinal
 
         if selected_known_quota_token is not None:
             selected_token = selected_known_quota_token
@@ -2151,6 +2169,12 @@ class AccountService:
         elif first_known_quota_token is not None:
             selected_token = first_known_quota_token
             selected_ordinal = first_known_quota_ordinal
+        elif selected_warm_unknown_token is not None:
+            selected_token = selected_warm_unknown_token
+            selected_ordinal = selected_warm_unknown_ordinal
+        elif first_warm_unknown_token is not None:
+            selected_token = first_warm_unknown_token
+            selected_ordinal = first_warm_unknown_ordinal
         elif selected_token is None:
             selected_token = first_available_token
             selected_ordinal = first_available_ordinal
@@ -4393,6 +4417,7 @@ class AccountService:
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1
+                    next_item["last_image_success_at"] = now.isoformat()
                 if consumed_quota:
                     if not image_quota_unknown:
                         current_quota = max(0, int(next_item.get("quota") or 0))

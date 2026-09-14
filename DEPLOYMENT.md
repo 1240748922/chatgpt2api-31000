@@ -41,7 +41,7 @@ Build and publish container image
 当前稳定应用的构建已成功，镜像地址是：
 
 ```text
-ghcr.io/1240748922/chatgpt2api-31000:sha-16e7193
+ghcr.io/1240748922/chatgpt2api-31000:sha-f6a3f02
 ```
 
 首次构建可能需要较长时间，因为会安装 Python 依赖、Playwright 和 Chromium。
@@ -208,7 +208,7 @@ GPT-Register-Tool-main/runtime/
 
 ## 六点一、新维护方案（仅测试版）
 
-默认稳定镜像 `sha-16e7193` 不包含以下新方案。只有主动选择 `sha-f1648e6` 或后续包含该方案的镜像时，这些负载门控才会生效。普通稳定版不需要配置以下三项变量。
+默认稳定镜像 `sha-f6a3f02` 不包含以下新方案。只有主动选择 `sha-f1648e6` 或后续包含该方案的镜像时，这些负载门控才会生效。普通稳定版不需要配置以下三项变量。
 
 后台账号同步、自动清理和自动补号会读取 8 个实例的实时生图负载。默认只有在生图活动数不超过 2 且没有等待队列时才执行维护，因此不会为了维护任务降低生图线程池并发。
 
@@ -239,7 +239,7 @@ nano .env
 至少修改这些内容：
 
 ```env
-CHATGPT2API_IMAGE_TAG=sha-16e7193
+CHATGPT2API_IMAGE_TAG=sha-f6a3f02
 POSTGRES_PASSWORD=改成一个长密码
 CHATGPT2API_AUTH_KEY=改成你的API访问密钥
 CHATGPT2API_MONITOR_CLUSTER_SECRET=改成一个随机字符串
@@ -420,7 +420,7 @@ git pull --ff-only
 ```
 
 编辑 `.env` 的 `CHATGPT2API_IMAGE_TAG`，填入这次成功构建的 `sha-提交号前7位`。
-例如 `sha-16e7193` 表示新维护方案之前的稳定应用，`sha-f1648e6` 表示新方案测试版。然后执行：
+例如 `sha-f6a3f02` 表示新维护方案之前且已修复 Sharp 依赖的稳定应用，`sha-f1648e6` 表示新方案测试版。然后执行：
 
 ```bash
 docker compose --env-file .env config -q

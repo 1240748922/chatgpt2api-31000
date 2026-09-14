@@ -2,7 +2,7 @@ name: Build and publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [main, stable-sharp-fix-20260914]
   workflow_dispatch:
 
 permissions:

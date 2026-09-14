@@ -17,6 +17,7 @@ RUN apt-get update \
         libffi-dev \
         libnss3 \
         libssl-dev \
+        npm \
         nodejs \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -25,7 +26,13 @@ RUN python -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --upgrade pip
 
 COPY src_extract/pyproject.toml /app/src_extract/pyproject.toml
+COPY src_extract/scripts/image_upscale/package.json /app/src_extract/scripts/image_upscale/package.json
+COPY src_extract/scripts/image_upscale/package-lock.json /app/src_extract/scripts/image_upscale/package-lock.json
 COPY GPT-Register-Tool-main/requirements.txt /app/GPT-Register-Tool-main/requirements.txt
+
+RUN cd /app/src_extract/scripts/image_upscale \
+    && npm ci --omit=dev \
+    && node --input-type=module -e "import sharp from 'sharp'; if (typeof sharp !== 'function') process.exit(1)"
 
 RUN /app/.venv/bin/pip install --no-cache-dir \
         "curl-cffi>=0.16.0,<0.17" \

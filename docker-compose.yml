@@ -2,7 +2,7 @@ name: chatgpt2api-31000
 
 x-app: &app
   # Pin the known stable application; select a tested revision in .env to upgrade.
-  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-26d613e}
+  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-281017a}
   restart: unless-stopped
   depends_on:
     postgres:

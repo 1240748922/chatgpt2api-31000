@@ -1,8 +1,8 @@
 name: chatgpt2api-31000
 
 x-app: &app
-  # Pin the known stable application; select a tested revision in .env to upgrade.
-  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-281017a}
+  # Use the application revision selected by this checkout; .env can pin another version.
+  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-edd7084}
   restart: unless-stopped
   depends_on:
     postgres:
@@ -42,7 +42,6 @@ x-app: &app
     CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY: ${CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY:-2}
     CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE: ${CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE:-50}
     CHATGPT2API_ACCOUNT_SHARD_COUNT: 8
-    # Preview-only controls: the stable sha-f6a3f02 image ignores these values.
     # Background account maintenance yields while image traffic is active.
     # These values do not change the image worker-pool concurrency.
     CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX: ${CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX:-2}

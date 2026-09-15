@@ -15,17 +15,20 @@
 | 版本用途 | 应用镜像 | 说明 |
 | --- | --- | --- |
 | 稳定版（默认） | `sha-f6a3f02` | 新维护方案之前、已补齐 Sharp 运行依赖的版本 |
-| 维护与超分版（main 默认） | `sha-281017a` | 加入按生图负载延后维护、CPU FSRCNN 超分、未知额度分批验证，并包含 Sharp 依赖修复 |
+| 当前修复版（main 默认） | `sha-edd7084` | 维护小批次让出资源、上传冷却、同任务超时恢复、导航与日志修复 |
+| 上一版维护与超分版 | `sha-281017a` | 本次修复之前的维护与 CPU 超分方案 |
 | 上一版维护修复镜像 | `sha-26d613e` | 按生图负载延后维护、低库存放行补号和 Sharp 依赖修复 |
 
 先前创建的 `stable-20260913` 标签误把新方案当成稳定版，已弃用；不要用它回退旧方案。为避免已拉取标签的电脑和服务器产生歧义，不重写该标签，改用上面的新稳定标签。
-`main` 保留新方案代码，Compose 默认运行 `sha-281017a`。直接用源码启动或自行构建 `main` 也会运行新方案；需要旧方案源码时使用 `stable-before-maintenance-sharp-20260914`。
+`main` 保留新方案代码，Compose 默认运行 `sha-edd7084`。直接用源码启动或自行构建 `main` 也会运行新方案；需要旧方案源码时使用 `stable-before-maintenance-sharp-20260914`。
 如果之前已经在服务器 `.env` 中写了 `CHATGPT2API_IMAGE_TAG=sha-f1648e6`，本次 `git pull` 不会覆盖它，必须手动改为 `sha-f6a3f02` 才会回到旧方案。
 
 Git 标签保存源码和部署文件；GHCR 镜像保存已构建的应用。回退运行版本需要切换镜像，单独 `git pull` 或回退 Python 文件不够。
 `latest` 会随新构建变化。稳定服务器使用具体的 `sha-xxxxxxx` 标签，并保留 GHCR 中相应的镜像版本，不要删除或重新指向其他镜像。PostgreSQL 和 Nginx 使用各自的镜像标签，应用版本锁定不等于数据库备份。
 
-## 1. 先把当前应用锁定
+不设置 `CHATGPT2API_IMAGE_TAG` 时，日常更新跟随仓库 Compose 默认版本。需要暂停升级或回退时才在 `.env` 中显式指定标签；恢复自动跟随时删除该行。若只想退回本次修改之前，指定 `sha-281017a`。
+
+## 1. 按需把当前应用锁定
 
 服务器先拉取一次包含版本选择功能的部署文件：
 
@@ -38,7 +41,7 @@ nano .env
 在 `.env` 中添加下面这一行；如果已经有这一项，就修改原来的值，不要重复添加：
 
 ```env
-CHATGPT2API_IMAGE_TAG=sha-281017a
+CHATGPT2API_IMAGE_TAG=sha-edd7084
 ```
 
 保存后执行以下命令，每一步成功后再执行下一步：
@@ -52,7 +55,7 @@ docker compose --env-file .env ps
 curl --fail http://127.0.0.1:31000/version
 ```
 
-配置输出中的应用镜像应以 `:sha-281017a` 结尾。如果仍然是 `latest`，检查部署文件是否更新，或者终端是否设置了覆盖 `.env` 的同名环境变量。可用 `unset CHATGPT2API_IMAGE_TAG` 清除终端覆盖后重试。
+配置输出中的应用镜像应以 `:sha-edd7084` 结尾。如果仍然是 `latest`，检查部署文件是否更新，或者终端是否设置了覆盖 `.env` 的同名环境变量。可用 `unset CHATGPT2API_IMAGE_TAG` 清除终端覆盖后重试。
 Compose 未配置这项时也默认使用该修复版本，但建议写入 `.env`，使今后的 Git 更新继续保留你的选择。
 重建 8 个应用会中断正在处理的请求，请在停止新请求并等待现有任务结束后切换。
 
@@ -76,14 +79,14 @@ docker compose --env-file .env exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USE
 还可以在服务器保留当前应用镜像的离线副本，避免以后 GHCR 中的镜像被误删。先确保它已下载成功：
 
 ```bash
-docker image save -o "$RELEASE_BACKUP/stable-image.tar" ghcr.io/1240748922/chatgpt2api-31000:sha-281017a
+docker image save -o "$RELEASE_BACKUP/stable-image.tar" ghcr.io/1240748922/chatgpt2api-31000:sha-edd7084
 ```
 
 镜像较大，需要预留磁盘空间。离线恢复时用 `docker image load -i 备份路径/stable-image.tar`，跳过在线 `pull`，再执行 `up`。镜像副本不包含数据库和挂载文件。
 
 ## 3. 选择一个新版进行测试
 
-当前维护与超分方案的镜像是 `sha-281017a`。主动使用该方案时，把 `.env` 改成 `CHATGPT2API_IMAGE_TAG=sha-281017a`；如果需要恢复旧方案，改回 `sha-f6a3f02`。
+当前维护与超分方案的镜像是 `sha-edd7084`。主动使用该方案时，把 `.env` 改成 `CHATGPT2API_IMAGE_TAG=sha-edd7084`；如果需要恢复旧方案，改回 `sha-f6a3f02`。
 
 先确认目标提交对应的 Actions 构建成功，记下其前 7 位提交号，然后执行：
 

@@ -8,9 +8,9 @@
 
 [DEPLOYMENT.md](./DEPLOYMENT.md)
 
-当前 `main` 默认使用镜像 `sha-281017a`，包含低负载维护调度、Sharp 运行依赖修复、CPU 超分和未知额度账号分批验证。
+当前 `main` 默认使用镜像 `sha-edd7084`，包含按小批次让出资源的后台同步、上传冷却单独统计、图片超时恢复、导航与日志修复，以及 CPU 超分并发修复。
 之前认可的旧稳定版仍保留为 `stable-before-maintenance-sharp-20260914`，镜像为 `sha-f6a3f02`。
-Compose 默认锁定 `sha-281017a`；如果 `.env` 没有设置 `CHATGPT2API_IMAGE_TAG`，服务器直接执行更新命令即可使用该版本。
+Compose 默认锁定 `sha-edd7084`；如果 `.env` 没有设置 `CHATGPT2API_IMAGE_TAG`，服务器直接执行更新命令即可使用该版本。
 版本选择、升级前备份和恢复步骤请查看 [VERSIONING.md](./VERSIONING.md)。
 
 ## 在本地电脑启动

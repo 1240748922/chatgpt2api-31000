@@ -479,7 +479,11 @@
       state.textContent = "测试中，请等待网络请求完成...";
       try {
         const result = await providerRequest("/api/accounts/replenishment/proxy-test", { method: "POST", body: JSON.stringify(payload) });
-        const lines = (result.results || []).map((item) => `${item.label}：${item.ok ? "成功" : "失败"}${item.status ? `，HTTP ${item.status}` : ""}${item.latency_ms ? `，${item.latency_ms} ms` : ""}${item.error ? `，${item.error}` : ""}`);
+        const stageNames = {"chatgpt-login":"ChatGPT 登录页", "auth-login":"Auth 登录页", "sentinel-frame":"Sentinel", "chatgpt-backend":"ChatGPT 后端"};
+        const lines = (result.results || []).map((item) => {
+          const stages = (item.checks || []).map((stage) => `${stageNames[stage.name] || stage.name} ${stage.ok ? "通过" : "失败"}${stage.status ? `(${stage.status})` : ""}${stage.latency_ms ? ` ${stage.latency_ms}ms` : ""}${stage.error ? `：${stage.error}` : ""}`).join("；");
+          return `${item.label}：${item.ok ? "注册前置检查通过" : "注册前置检查失败"}${stages ? `，${stages}` : ""}${item.error ? `，${item.error}` : ""}`;
+        });
         state.className = `register-save-state${result.ok ? "" : " error"}`;
         state.textContent = result.tested ? lines.join("；") : (result.error || "没有可测试的代理");
       } catch (error) {

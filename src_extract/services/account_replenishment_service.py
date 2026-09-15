@@ -16,7 +16,6 @@ from uuid import uuid4
 
 from services.account_service import account_service
 from services.config import config
-from services.proxy_service import test_proxy
 from services.storage.coordination_repository import AccountReplenishmentRepository
 from services.json_file import read_json_object, write_json_file
 from services.maintenance_load import maintenance_is_allowed
@@ -38,6 +37,16 @@ def _tail(text: str, limit: int = 4000) -> str:
     if len(value) <= limit:
         return value
     return value[-limit:]
+
+
+def _redact_proxy_value(value: object) -> str:
+    """Keep proxy credentials out of the management API response and logs."""
+    text = _text(value)
+    return re.sub(
+        r"(?i)((?:https?|socks5h?|socks4a?)://)[^\s/@]+@",
+        r"\1***@",
+        text,
+    )
 
 
 def _mask_secret(value: object) -> str:
@@ -537,7 +546,15 @@ class AccountReplenishmentService:
         results: list[dict[str, Any]] = []
         for label, candidate in candidates:
             try:
-                result = test_proxy(candidate)
+                # Use the registration tool's real auth-edge preflight.  The
+                # generic proxy probe only checks one endpoint and can report
+                # HTTP 200 even when registration cannot reach Sentinel/Auth.
+                from sms_tool.registration_preflight import registration_network_preflight_report
+
+                result = registration_network_preflight_report(candidate, proxy_attempts=2)
+                result = dict(result)
+                result.pop("attempts", None)
+                result["proxy"] = _redact_proxy_value(result.get("proxy") or candidate)
             except Exception as exc:
                 result = {
                     "ok": False,
@@ -547,7 +564,10 @@ class AccountReplenishmentService:
                 }
             results.append({"label": label, **result})
         return {
-            "ok": all(bool(item.get("ok")) for item in results),
+            # A pool is usable when at least one route passes.  Showing every
+            # route still lets the operator replace dead entries without
+            # blocking registration on an unrelated bad pool member.
+            "ok": any(bool(item.get("ok")) for item in results),
             "mode": "fixed" if fixed else "pool",
             "tested": len(results),
             "results": results,

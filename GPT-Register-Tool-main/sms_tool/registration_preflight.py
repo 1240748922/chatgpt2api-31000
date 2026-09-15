@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from typing import Mapping
+from time import perf_counter
 
 from curl_cffi import requests as curl_requests
 
@@ -91,41 +92,35 @@ def _resolve_proxy_scheme(proxy, *, cfg=None):
     return candidate
 
 
-def registration_network_preflight(proxy=None, *, proxy_attempts: int = 2):
-    """Validate the three auth edge nodes before claiming a mailbox."""
-    capabilities = curl_cffi_capabilities()
-    profile_capabilities = auth_fingerprint_capabilities()
-    if not capabilities["version_ok"] and profile_capabilities["missing"]:
-        raise RuntimeError(
-            "auth_fingerprint_unavailable:curl_cffi_requires_0.15.x_or_0.16.x"
-        )
-    if profile_capabilities["missing"]:
-        raise RuntimeError(
-            "auth_fingerprint_unavailable:" + ",".join(profile_capabilities["missing"])
-        )
+def _preflight_checks():
     chat_base = str((CFG.get("chatgpt") or {}).get("chat_base_url") or "https://chatgpt.com").rstrip("/")
     auth_base = str((CFG.get("chatgpt") or {}).get("auth_base_url") or "https://auth.openai.com").rstrip("/")
     sentinel_url = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=" + _sentinel_frame_version()
-    checks = (
+    return (
         ("chatgpt-login", f"{chat_base}/login", f"{chat_base}/", False),
         ("auth-login", f"{auth_base}/log-in", f"{chat_base}/login", False),
         ("sentinel-frame", sentinel_url, f"{auth_base}/log-in", False),
-        # The endpoint requires an AT, so an HTTP 401/403 is expected here.  A
-        # transport failure is not: it would discard an already-created account
-        # later when the registration AT is validated.
+        # The endpoint requires an AT, so an HTTP 401/403 is expected here.
         ("chatgpt-backend", CODEX_USAGE_URL, f"{chat_base}/", True),
     )
-    candidate = normalize_proxy_url(proxy) or None
-    last_error = None
-    for attempt in range(max(1, min(int(proxy_attempts or 1), 3))):
-        session = curl_requests.Session()
-        try:
-            session.trust_env = False
-        except Exception:
-            pass
-        session.proxies = {"http": candidate, "https": candidate} if candidate else {"http": "", "https": ""}
-        try:
-            for label, url, referer, allow_http_error in checks:
+
+
+def _preflight_once(candidate, *, checks):
+    """Run one complete auth-edge probe and return a UI-safe diagnostic report."""
+    from .phone_proxy import redact_proxy_text
+
+    stages = []
+    session = curl_requests.Session()
+    try:
+        session.trust_env = False
+    except Exception:
+        pass
+    session.proxies = {"http": candidate, "https": candidate} if candidate else {"http": "", "https": ""}
+    try:
+        for label, url, referer, allow_http_error in checks:
+            started = perf_counter()
+            response = None
+            try:
                 headers = openai_auth_headers(
                     referer=referer,
                     origin=url.split("/", 3)[0] + "//" + url.split("/", 3)[2],
@@ -139,21 +134,98 @@ def registration_network_preflight(proxy=None, *, proxy_attempts: int = 2):
                     },
                 )
                 response = session.get(url, headers=headers, timeout=15, impersonate=auth_impersonate())
-                if not allow_http_error and int(getattr(response, "status_code", 0) or 0) >= 400:
-                    raise RuntimeError(f"registration_preflight_failed:{label}:http_{response.status_code}")
-            result = {"ok": True, "profile": current_auth_fingerprint()["impersonate"]}
-            original = normalize_proxy_url(proxy) or ""
-            if candidate and candidate != original:
-                result["proxy"] = candidate
-            return result
-        except Exception as exc:
-            last_error = exc
-            if attempt + 1 >= max(1, min(int(proxy_attempts or 1), 3)) or not candidate:
-                break
-            candidate = refresh_proxy_sid(candidate)
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
-    raise RuntimeError(str(last_error or "registration_preflight_failed"))
+                status = int(getattr(response, "status_code", 0) or 0)
+                if not allow_http_error and status >= 400:
+                    raise RuntimeError(f"http_{status}")
+                stages.append({
+                    "name": label,
+                    "ok": True,
+                    "status": status,
+                    "latency_ms": int((perf_counter() - started) * 1000),
+                    "expected_http_error": bool(allow_http_error and status >= 400),
+                })
+            except Exception as exc:
+                error = redact_proxy_text(str(exc) or exc.__class__.__name__, candidate)
+                stages.append({
+                    "name": label,
+                    "ok": False,
+                    "status": int(getattr(response, "status_code", 0) or 0),
+                    "latency_ms": int((perf_counter() - started) * 1000),
+                    "error": error[:500],
+                })
+                return {
+                    "ok": False,
+                    "proxy": candidate or "",
+                    "profile": current_auth_fingerprint()["impersonate"],
+                    "checks": stages,
+                    "error": f"registration_preflight_failed:{label}:{error[:240]}",
+                }
+            finally:
+                response = None
+        return {
+            "ok": True,
+            "proxy": candidate or "",
+            "profile": current_auth_fingerprint()["impersonate"],
+            "checks": stages,
+        }
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def registration_network_preflight_report(proxy=None, *, proxy_attempts: int = 2):
+    """Return the same registration preflight result with stage diagnostics.
+
+    This is used by the management UI.  It deliberately shares the exact
+    request sequence with ``registration_network_preflight`` so a green proxy
+    test means the registration path itself is reachable.
+    """
+    capabilities = curl_cffi_capabilities()
+    profile_capabilities = auth_fingerprint_capabilities()
+    if not capabilities["version_ok"] and profile_capabilities["missing"]:
+        return {"ok": False, "proxy": normalize_proxy_url(proxy) or "", "checks": [],
+                "error": "auth_fingerprint_unavailable:curl_cffi_requires_0.15.x_or_0.16.x"}
+    if profile_capabilities["missing"]:
+        return {"ok": False, "proxy": normalize_proxy_url(proxy) or "", "checks": [],
+                "error": "auth_fingerprint_unavailable:" + ",".join(profile_capabilities["missing"])}
+    checks = _preflight_checks()
+    candidate = normalize_proxy_url(proxy) or None
+    if candidate:
+        candidate = _resolve_proxy_scheme(candidate)
+    last_error = None
+    attempts = []
+    for attempt in range(max(1, min(int(proxy_attempts or 1), 3))):
+        report = _preflight_once(candidate, checks=checks)
+        attempts.append(report)
+        if report.get("ok"):
+            report["attempt"] = attempt + 1
+            report["attempts"] = attempts
+            return report
+        last_error = report.get("error") or "registration_preflight_failed"
+        if attempt + 1 >= max(1, min(int(proxy_attempts or 1), 3)) or not candidate:
+            break
+        candidate = refresh_proxy_sid(candidate)
+    return {
+        "ok": False,
+        "proxy": candidate or "",
+        "profile": current_auth_fingerprint()["impersonate"],
+        "checks": attempts[-1].get("checks", []) if attempts else [],
+        "attempt": len(attempts),
+        "attempts": attempts,
+        "error": str(last_error),
+    }
+
+
+def registration_network_preflight(proxy=None, *, proxy_attempts: int = 2):
+    """Validate the auth edge nodes before claiming a mailbox."""
+    report = registration_network_preflight_report(proxy, proxy_attempts=proxy_attempts)
+    if not report.get("ok"):
+        raise RuntimeError(str(report.get("error") or "registration_preflight_failed"))
+    result = {"ok": True, "profile": report.get("profile")}
+    original = normalize_proxy_url(proxy) or ""
+    selected = str(report.get("proxy") or "")
+    if selected and selected != original:
+        result["proxy"] = selected
+    return result

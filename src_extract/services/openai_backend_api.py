@@ -34,6 +34,7 @@ from services.image_failure import (
     classify_image_exception,
     classify_upstream_message,
     classify_task_failure,
+    extract_message_facts,
     image_failure,
     is_terminal_message_status,
     merge_message_failure,
@@ -464,16 +465,17 @@ class OpenAIBackendAPI:
 
     @classmethod
     def _is_image_stream_terminal_payload(cls, payload: str) -> bool:
-        """Return True when an image SSE payload says the assistant turn is done.
+        """A completed message is not necessarily a completed image turn.
 
-        ChatGPT sometimes sends a final assistant/tool-argument message with
-        ``finished_successfully`` and ``is_complete`` metadata, then keeps the
-        HTTP/SSE connection open without emitting image file IDs.  Waiting for
-        the transport to close wastes the whole curl timeout.  Once this
-        structured terminal marker appears, the image flow can safely leave the
-        SSE phase and use the existing conversation/task polling path.
+        Tool arguments and reasoning messages can have is_complete=true and
+        finished_successfully while end_turn=false. Closing SSE at that point
+        discards later image output and may cancel the in-flight generation.
+        Require an explicit turn boundary; otherwise keep reading within the
+        existing stream deadline.
         """
-        if not payload or payload == "[DONE]":
+        if payload == "[DONE]":
+            return True
+        if not payload:
             return False
         try:
             event = json.loads(payload)
@@ -481,9 +483,8 @@ class OpenAIBackendAPI:
             return False
         if not isinstance(event, dict):
             return False
-        if not cls._payload_has_completion_marker(event):
-            return False
-        return any(is_terminal_message_status(status) for status in cls._payload_status_values(event))
+        facts = extract_message_facts(event)
+        return facts.get("end_turn") is True and is_terminal_message_status(facts.get("status"))
 
     def _iter_timed_sse_payloads(
             self,
@@ -3111,6 +3112,17 @@ class OpenAIBackendAPI:
                         candidate_failure = classify_task_failure(task)
                         task_message = task.get("image_gen_message")
                         task_message = task_message if isinstance(task_message, dict) else {}
+                        # Async tasks can publish their output before the
+                        # conversation mapping is updated. Use those image
+                        # messages too, rather than consulting tasks only for
+                        # errors and waiting on an already completed image.
+                        records = self._extract_image_tool_records({
+                            "mapping": {"task-result": {"message": task_message}},
+                        })
+                        for record in records:
+                            self._add_unique(file_ids, record["file_ids"])
+                            self._add_unique(sediment_ids, record["sediment_ids"])
+                        probe.update(file_count=len(file_ids), sediment_count=len(sediment_ids))
                         if len(probe["tasks"]) < 8:
                             probe["tasks"].append({
                                 "status": str(task.get("status") or "")[:80],
@@ -3687,7 +3699,7 @@ class OpenAIBackendAPI:
         with self._image_request_phase("uploading"):
             references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         with self._image_request_phase("bootstrapping"):
-            self._bootstrap(timeout_secs=self._image_request_timeout(30))
+            self._bootstrap_image()
         with self._image_request_phase("getting_token"):
             requirements = self._get_chat_requirements(
                 deadline=self.deadline_monotonic,
@@ -3736,6 +3748,40 @@ class OpenAIBackendAPI:
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+
+    def _bootstrap_image(self) -> None:
+        """Retry the read-only page warmup once on a fresh connection.
+
+        Generation has not been submitted yet, so reconnecting here cannot
+        duplicate an image job. Both attempts share a twenty-second budget and
+        the caller's overall deadline; auth and rate-limit failures are final.
+        """
+        deadline = time.monotonic() + self._image_request_timeout(20)
+        for attempt in range(2):
+            options = getattr(getattr(self, "session", None), "curl_options", None)
+            force_fresh = attempt > 0 and isinstance(options, dict)
+            had_fresh = force_fresh and CurlOpt.FRESH_CONNECT in options
+            previous_fresh = options.get(CurlOpt.FRESH_CONNECT) if force_fresh else None
+            if force_fresh:
+                options[CurlOpt.FRESH_CONNECT] = 1
+            try:
+                self._bootstrap(timeout_secs=max(0.001, min(10.0, deadline - time.monotonic())))
+                return
+            except (TimeoutError, requests.exceptions.RequestException, UpstreamHTTPError) as exc:
+                if isinstance(exc, UpstreamHTTPError) and exc.status_code not in {500, 502, 503, 504}:
+                    raise
+                failure = classify_image_exception(exc)
+                if attempt > 0 or time.monotonic() >= deadline or failure.code not in {
+                    "upstream_connection_failed", "upstream_connection_timeout", "upstream_unavailable",
+                }:
+                    raise
+                logger.info({"event": "image_bootstrap_reconnect", "failure_code": failure.code})
+            finally:
+                if force_fresh:
+                    if had_fresh:
+                        options[CurlOpt.FRESH_CONNECT] = previous_fresh
+                    else:
+                        options.pop(CurlOpt.FRESH_CONNECT, None)
 
     def _get_chat_requirements(
             self,

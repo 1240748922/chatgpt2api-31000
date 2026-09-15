@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -2971,6 +2972,7 @@ class OpenAIBackendAPI:
         last_assistant_text = ""
         conversation_transport_failure: ImageFailure | None = None
         conversation_transport_error: Exception | None = None
+        poll_trace: list[dict[str, Any]] = []
 
         def _raise_final_failure(
             failure: ImageFailure,
@@ -2998,6 +3000,7 @@ class OpenAIBackendAPI:
             setattr(exc, "poll_timeout_secs", timeout_secs)
             setattr(exc, "last_assistant_text", last_assistant_text)
             setattr(exc, "last_conversation_snapshot", last_conversation_snapshot or {})
+            setattr(exc, "poll_trace", [dict(item) for item in poll_trace])
             setattr(exc, "raw_error", diagnostic_excerpt(raw_error, 4000))
             setattr(exc, "upstream_error", diagnostic_excerpt(upstream_error, 4000))
             setattr(exc, "raw_upstream_message", diagnostic_excerpt(raw_upstream_message, 4000))
@@ -3008,6 +3011,17 @@ class OpenAIBackendAPI:
 
         while _remaining() > 0:
             attempt += 1
+            probe: dict[str, Any] = {
+                "attempt": attempt,
+                "elapsed_ms": int((time.monotonic() - started_at) * 1000),
+                "conversation_query": "pending",
+                "task_query": "not_checked",
+            }
+            poll_trace.append(probe)
+            # Keep the first probe and the most recent fifteen, without prompts
+            # or complete task payloads in every entry.
+            if len(poll_trace) > 16:
+                del poll_trace[1]
             task_count = 0
             task_check_ok = False
             conversation_query_started = time.perf_counter()
@@ -3023,6 +3037,7 @@ class OpenAIBackendAPI:
                     )
             except UpstreamHTTPError as exc:
                 failure = classify_image_exception(exc)
+                probe.update(conversation_query="failed", failure_code=failure.code)
                 setattr(exc, "failure", failure)
                 if failure.retryable:
                     conversation_transport_failure = failure
@@ -3040,6 +3055,7 @@ class OpenAIBackendAPI:
                 )
             except requests.exceptions.RequestException as exc:
                 failure = classify_image_exception(exc)
+                probe.update(conversation_query="failed", failure_code=failure.code)
                 setattr(exc, "failure", failure)
                 if failure.retryable:
                     conversation_transport_failure = failure
@@ -3058,6 +3074,14 @@ class OpenAIBackendAPI:
             conversation_transport_failure = None
             conversation_transport_error = None
             last_conversation_snapshot, last_assistant_text = self._conversation_poll_snapshot(conversation)
+            probe.update(
+                conversation_query="ok",
+                mapping_count=last_conversation_snapshot.get("mapping_count", 0),
+                messages=[
+                    {key: message[key] for key in ("role", "content_type", "status") if key in message}
+                    for message in last_conversation_snapshot.get("messages", [])[-4:]
+                ],
+            )
 
             for record in self._extract_image_tool_records(conversation):
                 for file_id in record["file_ids"]:
@@ -3067,6 +3091,7 @@ class OpenAIBackendAPI:
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
 
+            probe.update(file_count=len(file_ids), sediment_count=len(sediment_ids))
             if (
                 not file_ids and not sediment_ids and _remaining() > 0
                 and classify_conversation_failure(conversation) is None
@@ -3079,10 +3104,19 @@ class OpenAIBackendAPI:
                     )
                     task_count = len(tasks)
                     task_check_ok = True
+                    probe.update(task_query="ok", task_count=task_count, tasks=[])
                     task_probe_failure = None
                     task_probe_error = None
                     for task in tasks:
                         candidate_failure = classify_task_failure(task)
+                        task_message = task.get("image_gen_message")
+                        task_message = task_message if isinstance(task_message, dict) else {}
+                        if len(probe["tasks"]) < 8:
+                            probe["tasks"].append({
+                                "status": str(task.get("status") or "")[:80],
+                                "message_status": str(task_message.get("status") or "")[:80],
+                                "failure_code": candidate_failure.code if candidate_failure else "",
+                            })
                         if candidate_failure is None:
                             continue
                         error_msg, metadata = self.image_task_diagnostics(task)
@@ -3110,6 +3144,7 @@ class OpenAIBackendAPI:
                         })
                 except (UpstreamHTTPError, requests.exceptions.RequestException) as exc:
                     task_probe_failure = classify_image_exception(exc)
+                    probe.update(task_query="failed", task_failure_code=task_probe_failure.code)
                     task_probe_error = exc
                     logger.warning({
                         "event": "image_poll_task_check_failed",
@@ -3129,6 +3164,7 @@ class OpenAIBackendAPI:
                         )
                 except Exception as exc:
                     # tasks 查询失败不影响正常轮询流程
+                    probe.update(task_query="failed", task_error_type=type(exc).__name__)
                     logger.debug({
                         "event": "image_poll_task_check_failed",
                         "conversation_id": conversation_id,
@@ -3143,12 +3179,10 @@ class OpenAIBackendAPI:
             if not file_ids and not sediment_ids:
                 conversation_failure = classify_conversation_failure(conversation)
                 failure = merge_message_failure(pending_task_failure, conversation_failure)
-                if conversation_failure is not None or (
-                    pending_task_failure is not None
-                    and pending_task_failure.code != "upstream_error"
-                ):
-                    failure = failure or conversation_failure or pending_task_failure
-                    assert failure is not None
+                # Even a generic explicit task failure is terminal. Waiting
+                # for a more specific error cannot make that task succeed.
+                if failure is not None:
+                    probe["failure_code"] = failure.code
                     raw_detail = (
                         failure.raw_detail
                         if isinstance(failure.raw_detail, str)
@@ -3650,35 +3684,46 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
-        self._report_progress("bootstrapping")
-        self._bootstrap(timeout_secs=self._image_request_timeout(30))
-        self._report_progress("getting_token")
-        requirements = self._get_chat_requirements(
-            deadline=self.deadline_monotonic,
-            timeout_message="image request deadline exceeded",
-        )
-        self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
-        self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
-        self._report_progress("generating")
+        with self._image_request_phase("uploading"):
+            references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        with self._image_request_phase("bootstrapping"):
+            self._bootstrap(timeout_secs=self._image_request_timeout(30))
+        with self._image_request_phase("getting_token"):
+            requirements = self._get_chat_requirements(
+                deadline=self.deadline_monotonic,
+                timeout_message="image request deadline exceeded",
+            )
+        with self._image_request_phase("preparing_conversation"):
+            conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        with self._image_request_phase("starting_generation"):
+            response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         try:
-            for payload in self._iter_timed_sse_payloads(
-                response,
-                max_duration_secs=self._image_request_timeout(config.image_stream_timeout_secs),
-                timing_key="image_generation_stream",
-            ):
-                yield payload
-                if self._is_image_stream_terminal_payload(payload):
-                    logger.info({
-                        "event": "image_stream_terminal_break",
-                        "payload_preview": diagnostic_excerpt(payload, 1000),
-                    })
-                    break
+            with self._image_request_phase("generating"):
+                for payload in self._iter_timed_sse_payloads(
+                    response,
+                    max_duration_secs=self._image_request_timeout(config.image_stream_timeout_secs),
+                    timing_key="image_generation_stream",
+                ):
+                    yield payload
+                    if self._is_image_stream_terminal_payload(payload):
+                        logger.info({
+                            "event": "image_stream_terminal_break",
+                            "payload_preview": diagnostic_excerpt(payload, 1000),
+                        })
+                        break
         finally:
             response.close()
+
+    @contextmanager
+    def _image_request_phase(self, phase: str) -> Iterator[None]:
+        started = time.perf_counter()
+        self._report_progress(phase)
+        try:
+            yield
+        except Exception as exc:
+            exc.failure_phase = phase
+            exc.failure_phase_ms = max(0, int((time.perf_counter() - started) * 1000))
+            raise
 
     def _bootstrap(self, timeout_secs: float = 30.0) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""

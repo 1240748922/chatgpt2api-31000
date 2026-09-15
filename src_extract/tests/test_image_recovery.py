@@ -14,6 +14,8 @@ class Clock:
         return self.now
     def perf_counter(self):
         return self.now
+    def time(self):
+        return self.now
     def sleep(self, seconds):
         self.now += seconds
 
@@ -124,3 +126,42 @@ def test_expired_request_does_not_probe_or_poll_again(monkeypatch):
             {"conversation_id": "existing-conversation"}, TimeoutError("SSE closed"), 1, 1, 950,
         )
     assert exc.value.failure.code == "image_stream_timeout"
+
+
+def test_explicit_generic_task_failure_ends_poll_immediately(backend, monkeypatch):
+    instance, clock = backend
+    monkeypatch.setattr(instance, "_get_conversation", lambda *a, **kw: document())
+    monkeypatch.setattr(instance, "_query_backend_tasks", lambda **kw: [{
+        "image_gen_message": {
+            "author": {"role": "assistant"}, "status": "failed",
+            "content": {"content_type": "text", "parts": []},
+        },
+    }])
+    with pytest.raises(ImageFailureError) as caught:
+        instance._poll_image_results("existing-conversation", timeout_secs=120)
+    assert caught.value.failure.code == "upstream_error"
+    assert caught.value.poll_attempts == 1
+    assert caught.value.poll_trace[0]["tasks"][0]["message_status"] == "failed"
+    assert clock.now == 1000
+
+
+def test_running_tasks_keep_polling_and_trace_is_bounded(backend, monkeypatch):
+    instance, clock = backend
+    monkeypatch.setattr(instance, "_get_conversation", lambda *a, **kw: document())
+    monkeypatch.setattr(instance, "_query_backend_tasks", lambda **kw: [{
+        "status": "running", "access_token": "must-not-be-logged",
+        "image_gen_message": {
+            "author": {"role": "assistant"}, "status": "in_progress",
+            "content": {"content_type": "code", "text": '{"prompt":"a tree","size":"1024x1024"}'},
+        },
+    }])
+    with pytest.raises(ImagePollTimeoutError) as caught:
+        instance._poll_image_results("existing-conversation", timeout_secs=25)
+    trace = caught.value.poll_trace
+    assert caught.value.poll_attempts == 25
+    assert len(trace) == 16
+    assert trace[0]["attempt"] == 1
+    assert trace[-1]["attempt"] == 25
+    assert trace[-1]["tasks"][0]["status"] == "running"
+    assert "must-not-be-logged" not in str(trace)
+    assert clock.now == 1025

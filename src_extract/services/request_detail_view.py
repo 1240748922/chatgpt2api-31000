@@ -282,9 +282,9 @@ def _timeline_segment_value(
     primary_value = sum(_int(timings.get(key)) for key in aggregate_keys)
     if segment_key != "upstream":
         return primary_value
-    envelope_value = _int(timings.get("conversation_stream_ms")) or _int(timings.get("stream_error_ms"))
+    envelope_value = _int(timings.get("conversation_stream_ms"))
     if envelope_value <= 0:
-        return primary_value
+        return max(primary_value, _int(timings.get("generation_start_ms")) + _int(timings.get("stream_error_ms")))
     prepare_keys = next((keys for key, _, _, keys in _TIMELINE_SEGMENTS if key == "prepare"), ())
     prepare_value = sum(_int(timings.get(key)) for key in prepare_keys)
     return max(primary_value, max(0, envelope_value - prepare_value))
@@ -312,6 +312,16 @@ def build_request_timeline_presentation(
     image_count: int = 0,
     request_shape: object = None,
 ) -> dict[str, Any]:
+    phase_metrics = {
+        "uploading": "upload_ms", "bootstrapping": "bootstrap_ms",
+        "getting_token": "requirements_ms", "preparing_conversation": "prepare_conversation_ms",
+        "starting_generation": "generation_start_ms", "generating": "stream_error_ms",
+    }
+    failed_metrics = {
+        phase_metrics.get(str(event.get("failure_phase") or ""))
+        for event in (events if isinstance(events, (list, tuple)) else [])
+        if isinstance(event, Mapping) and event.get("event") in {"image_attempt_failed", "image_stream_failed"}
+    }
     segments: list[dict[str, Any]] = []
     for segment_key, label, category, aggregate_keys in _TIMELINE_SEGMENTS:
         value_ms = _timeline_segment_value(timings, segment_key, aggregate_keys)
@@ -323,7 +333,7 @@ def build_request_timeline_presentation(
             for key in tone_keys
             if (metric_value := _int(timings.get(key))) > 0
         ]
-        tone = "danger" if "danger" in tones else "warning" if "warning" in tones else "info"
+        tone = "danger" if "danger" in tones or failed_metrics.intersection(tone_keys) else "warning" if "warning" in tones else "info"
         segments.append({
             "key": segment_key,
             "label": label,
@@ -345,7 +355,7 @@ def build_request_timeline_presentation(
             description_parts.append(f"结果图 {image_count}")
         if key == "download_ms" and image_count > 0:
             description_parts.append(f"下载 {image_count} 张")
-        tone = _timeline_metric_tone(key, value_ms)
+        tone = "danger" if key in failed_metrics else _timeline_metric_tone(key, value_ms)
         steps_by_category.setdefault(category, []).append({
             "key": key,
             "label": label,

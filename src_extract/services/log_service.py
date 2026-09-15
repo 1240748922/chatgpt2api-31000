@@ -139,6 +139,16 @@ def _collect_conversation_ids(value: object) -> list[str]:
 
 
 IMAGE_ATTEMPT_KEYS = {
+    "failure_phase",
+    "failure_phase_ms",
+    "poll_trace",
+    "poll_attempts",
+    "poll_timeout_secs",
+    "last_task_error",
+    "last_conversation_snapshot",
+    "last_assistant_text",
+    "stream_timeout_secs",
+    "stream_timeout_followup",
     "slot",
     "attempt",
     "account_email",
@@ -163,6 +173,7 @@ IMAGE_ATTEMPT_KEYS = {
 }
 IMAGE_ATTEMPT_INTEGER_KEYS = {
     "slot", "attempt", "duration_ms", "status_code", "failure_retry_after",
+    "failure_phase_ms", "poll_attempts",
 }
 IMAGE_ATTEMPT_BOOLEAN_KEYS = {
     "failure_retryable", "failure_account_failure", "account_failure", "switched_account",
@@ -232,7 +243,7 @@ def _normalize_image_attempt_monitor(value: object) -> dict[str, object] | None:
                         event[key] = parsed
                 elif key in {
                     "time", "event", "label", "status",
-                    "failure_code", "failure_scope", "failure_capability",
+                    "failure_code", "failure_scope", "failure_capability", "failure_phase",
                     "error_type", "public_error",
                 }:
                     text = str(item or "").strip()
@@ -259,6 +270,12 @@ def _normalize_image_attempt(value: object) -> dict[str, object] | None:
             monitor = _normalize_image_attempt_monitor(item)
             if monitor:
                 attempt[key] = monitor
+        elif key == "poll_trace" and isinstance(item, list):
+            attempt[key] = scrub_diagnostic_value(item if len(item) <= 16 else [item[0], *item[-15:]])
+        elif key in {"last_conversation_snapshot", "stream_timeout_followup"} and isinstance(item, dict):
+            attempt[key] = scrub_diagnostic_value(item)
+        elif key in {"poll_timeout_secs", "stream_timeout_secs"} and isinstance(item, (int, float)):
+            attempt[key] = max(0, item)
         elif key in IMAGE_ATTEMPT_INTEGER_KEYS:
             parsed = _normalize_image_attempt_int(key, item)
             if parsed is not None:

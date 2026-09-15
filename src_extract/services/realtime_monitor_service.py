@@ -35,6 +35,8 @@ RAW_DIAGNOSTIC_FIELDS = (
 
 
 CANONICAL_FAILURE_FIELDS = (
+    "failure_phase",
+    "failure_phase_ms",
     "failure_code",
     "failure_scope",
     "failure_capability",
@@ -77,7 +79,7 @@ STAGE_LABELS = {
     "image_preparing_conversation": "准备会话",
     "image_starting_generation": "等待上游首包",
     "image_generating": "上游生成中",
-    "image_stream_failed": "上游断流",
+    "image_stream_failed": "上游流中断，查询结果",
     "image_attempt_failed": "尝试失败",
     "image_cross_account_retry": "切换账号",
     "image_egress_fallback_retry": "切换备用出口",
@@ -303,6 +305,7 @@ class RealtimeMonitorService:
             if detail.get("conversation_id"):
                 record["conversation_id"] = str(detail.get("conversation_id") or "")
             for key in RAW_DIAGNOSTIC_FIELDS:
+                record.pop(key, None)
                 if detail.get(key):
                     record[key] = _trim_raw(detail.get(key))
             self._merge_failure_fields(record, detail)
@@ -472,6 +475,18 @@ class RealtimeMonitorService:
         return self._public_record(record)
 
     def _merge_stage_data(self, record: dict[str, Any], data: dict[str, Any]) -> None:
+        if record.get("stage") == "image_getting_account":
+            # Prior attempts stay in the event history, never in the current
+            # attempt's error fields. Empty values must also clear old errors.
+            targets = [record]
+            image = record.get("images", {}).get(str(data.get("index") or ""))
+            if isinstance(image, dict):
+                targets.append(image)
+                image["metrics"] = {}
+            for target in targets:
+                for key in (*RAW_DIAGNOSTIC_FIELDS, *CANONICAL_FAILURE_FIELDS,
+                            "public_error", "account_failure", "conversation_id"):
+                    target.pop(key, None)
         metrics = record.setdefault("metrics", {})
         metric_data = {key: value for key, value in data.items() if key.endswith("_ms")}
         self._merge_metric_dict(metrics, metric_data)
@@ -498,8 +513,11 @@ class RealtimeMonitorService:
             if key in data:
                 record[key] = str(data.get(key) or "")
         for key in RAW_DIAGNOSTIC_FIELDS:
-            if key in data and data.get(key):
-                record[key] = _trim_raw(data.get(key))
+            if key in data:
+                if data.get(key):
+                    record[key] = _trim_raw(data.get(key))
+                else:
+                    record.pop(key, None)
         self._merge_failure_fields(record, data)
         if "has_proxy" in data:
             record["has_proxy"] = bool(data.get("has_proxy"))
@@ -544,8 +562,11 @@ class RealtimeMonitorService:
                 if key in data:
                     image[key] = str(data.get(key) or "")
             for key in RAW_DIAGNOSTIC_FIELDS:
-                if key in data and data.get(key):
-                    image[key] = _trim_raw(data.get(key))
+                if key in data:
+                    if data.get(key):
+                        image[key] = _trim_raw(data.get(key))
+                    else:
+                        image.pop(key, None)
             self._merge_failure_fields(image, data)
             if "has_proxy" in data:
                 image["has_proxy"] = bool(data.get("has_proxy"))
@@ -575,6 +596,7 @@ class RealtimeMonitorService:
     @staticmethod
     def _merge_failure_fields(target: dict[str, Any], values: dict[str, Any]) -> None:
         for key in (
+            "failure_phase",
             "failure_code",
             "failure_scope",
             "failure_capability",
@@ -583,7 +605,7 @@ class RealtimeMonitorService:
             if key in values:
                 value = values.get(key)
                 target[key] = None if value is None else str(value)
-        for key in ("status_code", "failure_retry_after"):
+        for key in ("status_code", "failure_retry_after", "failure_phase_ms"):
             if key in values:
                 value = values.get(key)
                 target[key] = None if value is None else _int_ms(value)

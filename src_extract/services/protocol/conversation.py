@@ -147,6 +147,28 @@ _IMAGE_PROGRESS_DURATION_KEYS = {
 }
 
 
+_IMAGE_FAILURE_DIAGNOSTIC_ATTRS = (
+    "failure_phase", "failure_phase_ms", "poll_trace",
+    "poll_attempts", "poll_timeout_secs", "last_task_error",
+    "last_conversation_snapshot", "last_assistant_text",
+    "stream_timeout_secs", "stream_timeout_followup",
+)
+
+
+def _image_failure_timing_data(error: Exception | None) -> dict[str, Any]:
+    phase = str(getattr(error, "failure_phase", "") or "")
+    if not phase:
+        return {}
+    elapsed = max(0, int(getattr(error, "failure_phase_ms", 0) or 0))
+    result: dict[str, Any] = {"failure_phase": phase, "failure_phase_ms": elapsed}
+    metric = _IMAGE_PROGRESS_DURATION_KEYS.get(phase)
+    if phase == "generating":
+        metric = "stream_error_ms"
+    if metric:
+        result[metric] = elapsed
+    return result
+
+
 def _image_progress_callback_with_monitor(
         request: "ConversationRequest",
         index: int,
@@ -202,6 +224,8 @@ def _resolve_image_urls_with_monitor(
             **kwargs,
         )
     except Exception as exc:
+        exc.failure_phase = "resolving"
+        exc.failure_phase_ms = _elapsed_ms(resolve_started)
         if request.trace_image_perf:
             result_timing = _backend_image_result_timing_data(
                 backend,
@@ -1530,8 +1554,9 @@ def _recover_after_image_stream_timeout(
     recovery_budget = recovery_deadline - time.monotonic()
     if conversation_id and recovery_budget > 0:
         try:
-            urls = backend.resolve_conversation_image_urls(
-                conversation_id, [], [], poll=True, poll_timeout_secs=recovery_budget,
+            urls = _resolve_image_urls_with_monitor(
+                backend, request, conversation_id, [], [], index, total,
+                path=recovery_path, poll=True, poll_timeout_secs=recovery_budget,
             )
             output = _image_result_output_from_urls(
                 backend, request, conversation_id, urls, index, total, path=recovery_path,
@@ -1543,6 +1568,7 @@ def _recover_after_image_stream_timeout(
         except ImagePollTimeoutError as exc:
             followup["recovery_poll_attempts"] = getattr(exc, "poll_attempts", 0)
             followup["recovery_poll_timeout_secs"] = recovery_budget
+            followup["poll_trace"] = getattr(exc, "poll_trace", [])
         except Exception:
             # Preserve a decisive upstream failure instead of replacing it with an SSE timeout.
             raise
@@ -1693,34 +1719,36 @@ def stream_image_outputs(
                     total=total,
                     upstream_event_type=raw_type,
                 )
-    except (TimeoutError, curl_exceptions.Timeout) as exc:
-        yield _recover_after_image_stream_timeout(
-            backend,
-            request,
-            last,
-            exc,
-            index,
-            total,
-            conversation_wall_started,
-        )
-        return
-    except curl_exceptions.RequestException as exc:
-        if not any((
+    except (TimeoutError, curl_exceptions.RequestException) as exc:
+        phase = str(getattr(exc, "failure_phase", "") or "")
+        has_stream_state = any((
             last.get("conversation_id"),
             last.get("file_ids"),
             last.get("sediment_ids"),
-        )):
+        ))
+        # Preparation timeouts have not entered SSE. Do not search for an
+        # unrelated conversation or spend the result-poll budget on them.
+        if (phase and phase != "generating") or (not phase and not has_stream_state):
             raise
-        yield _recover_after_image_stream_timeout(
-            backend,
-            request,
-            last,
-            exc,
-            index,
-            total,
-            conversation_wall_started,
-            failure_code="image_stream_interrupted",
+        failure_code = (
+            "image_stream_timeout"
+            if isinstance(exc, (TimeoutError, curl_exceptions.Timeout))
+            else "image_stream_interrupted"
         )
+        _monitor_image_stage(
+            request, "image_stream_failed", index=index, total=total,
+            **_image_failure_timing_data(exc), **_backend_http_timing_data(backend),
+        )
+        try:
+            yield _recover_after_image_stream_timeout(
+                backend, request, last, exc, index, total, conversation_wall_started,
+                failure_code=failure_code,
+            )
+        except Exception as recovery_error:
+            if not getattr(recovery_error, "failure_phase", ""):
+                recovery_error.failure_phase = phase
+                recovery_error.failure_phase_ms = getattr(exc, "failure_phase_ms", 0)
+            raise
         return
 
     conversation_id = str(last.get("conversation_id") or "")
@@ -2290,6 +2318,10 @@ def _generate_single_image(
                 if raw_upstream_message:
                     failure_fields["raw_upstream_message"] = raw_upstream_message
                 attempt.update(failure_fields)
+                if error is not None:
+                    for attr in _IMAGE_FAILURE_DIAGNOSTIC_ATTRS:
+                        if hasattr(error, attr):
+                            attempt[attr] = getattr(error, attr)
             image_attempts.append(attempt)
             if failure is not None and request.trace_image_perf:
                 _monitor_image_stage(
@@ -2299,13 +2331,12 @@ def _generate_single_image(
                     **failure.diagnostic_fields(),
                     public_error=attempt.get("public_error", ""),
                     raw_error=attempt.get("raw_error", ""),
+                    upstream_error=attempt.get("upstream_error", ""),
+                    upstream_message=attempt.get("raw_upstream_message", ""),
                     account_failure=failure.verify_account,
                     account_email=account_email,
                     conversation_id=attempt_conversation_id,
-                    stream_error_ms=(
-                        int((time.perf_counter() - stream_started) * 1000)
-                        if stream_started > 0 else 0
-                    ),
+                    **_image_failure_timing_data(error),
                     index=index,
                     total=total,
                 )
@@ -2610,12 +2641,13 @@ def _generate_single_image(
                 else classify_image_exception(exc)
             )
             attempt_conversation_id = str(getattr(exc, "conversation_id", "") or attempt_conversation_id)
-            stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
+            attempt_elapsed_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
+            failure_timing = _image_failure_timing_data(exc)
             http_timing = _backend_http_timing_data(backend)
             quick_timeout_retry_ms = min(30000, max(5000, int(config.image_stream_timeout_secs * 1000 * 0.2)))
             early_connection_failure = (
                 not emitted_for_token
-                and (stream_error_ms == 0 or stream_error_ms <= quick_timeout_retry_ms)
+                and (attempt_elapsed_ms == 0 or attempt_elapsed_ms <= quick_timeout_retry_ms)
                 and failure.code in {
                     "upstream_connection_failed",
                     "upstream_connection_timeout",
@@ -2636,7 +2668,8 @@ def _generate_single_image(
                     "fallback_proxy_configured": True,
                     "fallback_from_egress_key": fallback_from_egress.get("egress_key", ""),
                     "fallback_from_egress_label": fallback_from_egress.get("egress_label", ""),
-                    "stream_error_ms": stream_error_ms,
+                    "attempt_elapsed_ms": attempt_elapsed_ms,
+                    **failure_timing,
                     "error": str(exc)[:200],
                 })
                 if request.trace_image_perf:
@@ -2691,13 +2724,7 @@ def _generate_single_image(
                 )
                 for attr in (
                     "conversation_id",
-                    "poll_attempts",
-                    "poll_timeout_secs",
-                    "last_task_error",
-                    "last_conversation_snapshot",
-                    "last_assistant_text",
-                    "stream_timeout_secs",
-                    "stream_timeout_followup",
+                    *_IMAGE_FAILURE_DIAGNOSTIC_ATTRS,
                 ):
                     if hasattr(exc, attr):
                         setattr(image_error, attr, getattr(exc, attr))
@@ -2711,7 +2738,7 @@ def _generate_single_image(
                 "failure_code": failure.code,
                 "status_code": failure.status_code,
                 "account_failure": failure.verify_account,
-                "stream_error_ms": stream_error_ms,
+                **failure_timing,
                 "index": index,
                 **http_timing,
             })

@@ -1,6 +1,7 @@
 # Runtime secrets and local configuration
 .env
 config.json
+config.before-*.json
 data/
 src_extract/data/
 

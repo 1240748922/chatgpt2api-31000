@@ -58,6 +58,7 @@ class DashboardAccountView(BaseModel):
     cumulative_total: int = 0
     active: int = 0
     limited: int = 0
+    upload_limited: int = 0
     abnormal: int = 0
     disabled: int = 0
     total_quota: int = 0

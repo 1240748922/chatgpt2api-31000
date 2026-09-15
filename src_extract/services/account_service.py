@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import random
@@ -14,6 +15,7 @@ from threading import Condition, Lock, Thread
 from typing import Any, Callable
 from uuid import uuid4
 
+from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     access_token_expires_in_seconds,
@@ -2019,6 +2021,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline_monotonic: float | None = None,
+            requires_file_upload: bool = False,
     ) -> str:
         while True:
             with self._image_slot_condition:
@@ -2046,6 +2049,7 @@ class AccountService:
                         plan_type,
                         source_type,
                         plan_types,
+                        requires_file_upload=requires_file_upload,
                     )
                 )
                 if ready_count == 0:
@@ -2080,6 +2084,7 @@ class AccountService:
             plan_type: str | None,
             source_type: str | None,
             plan_types: set[str] | tuple[str, ...] | None,
+            requires_file_upload: bool = False,
     ) -> tuple[str | None, int, int, int]:
         """Find one image token without allocating a full candidate list.
 
@@ -2088,6 +2093,7 @@ class AccountService:
         request.  With a large pool that created unnecessary allocations and
         temporary references on the hot path.
         """
+        now_epoch = time.time()
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         account_count = len(self._accounts)
         if account_count == 0:
@@ -2127,6 +2133,8 @@ class AccountService:
             if str(item.get("status") or "") == "限流":
                 limited_count += 1
             if not self._is_image_account_available(item):
+                continue
+            if requires_file_upload and upload_blocked(item, now_epoch):
                 continue
             ready_count += 1
             if int(self._image_inflight.get(token, 0)) >= max_concurrency:
@@ -2255,6 +2263,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             excluded_tokens: set[str] | None = None,
             deadline_monotonic: float | None = None,
+            requires_file_upload: bool = False,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -2277,6 +2286,7 @@ class AccountService:
             source_type=source_type,
             plan_types=plan_types,
             deadline_monotonic=deadline_monotonic,
+            requires_file_upload=requires_file_upload,
         )
         try:
             active_token = self.ensure_access_token(
@@ -2581,8 +2591,10 @@ class AccountService:
                 and (token := str(item.get("access_token") or "").strip())
             ]
 
-    def resume_pending_auth_verifications(self) -> int:
+    def resume_pending_auth_verifications(self, limit: int | None = None) -> int:
         tokens = self.list_pending_auth_verification_tokens()
+        if limit is not None:
+            tokens = tokens[:limit]
         scheduled = 0
         for token in tokens:
             if self._schedule_account_refresh_after_image_failure(token):
@@ -2715,24 +2727,26 @@ class AccountService:
         now = datetime.now(timezone.utc)
         candidates: list[tuple[float, str]] = []
         with self._lock:
-            for item in self._accounts.values():
-                token = str(item.get("access_token") or "").strip()
-                if (
-                    not token
-                    or item.get("status") != "正常"
-                    or not bool(item.get("image_quota_unknown"))
-                    or item.get("last_remote_check_result") == "pending"
-                    or self._remote_check_is_fresh(item, now, freshness)
-                    or self._remote_check_attempt_is_recent(item, now, freshness)
-                ):
-                    continue
-                checked_at = self._parse_time(
-                    item.get("last_remote_check_attempt_at")
-                    or item.get("last_remote_checked_at")
-                )
-                candidates.append((checked_at.timestamp() if checked_at else 0.0, token))
-        candidates.sort(key=lambda candidate: candidate[0])
-        return [token for _, token in candidates[:batch_size]]
+            snapshot = tuple(self._accounts.values())
+            busy = set(self._image_inflight)
+        for item in snapshot:
+            token = str(item.get("access_token") or "").strip()
+            if (
+                not token
+                or token in busy
+                or item.get("status") != "正常"
+                or not bool(item.get("image_quota_unknown"))
+                or item.get("last_remote_check_result") == "pending"
+                or self._remote_check_is_fresh(item, now, freshness)
+                or self._remote_check_attempt_is_recent(item, now, freshness)
+            ):
+                continue
+            checked_at = self._parse_time(
+                item.get("last_remote_check_attempt_at")
+                or item.get("last_remote_checked_at")
+            )
+            candidates.append((checked_at.timestamp() if checked_at else 0.0, token))
+        return [token for _, token in heapq.nsmallest(batch_size, candidates, key=lambda candidate: candidate[0])]
 
     @classmethod
     def _pool_health_freshness_seconds(cls, freshness_seconds: int | float | None = None) -> int:
@@ -2771,15 +2785,14 @@ class AccountService:
             for item in local_normal
             if cls._remote_check_is_fresh(item, now, freshness_seconds)
         ]
-        unconfirmed_normal = [item for item in local_normal if item not in confirmed_normal]
+        confirmed_ids = {id(item) for item in confirmed_normal}
+        unconfirmed_normal = [item for item in local_normal if id(item) not in confirmed_ids]
         unconfirmed_never_checked = [
             item for item in unconfirmed_normal
             if cls._parse_time(item.get("last_remote_checked_at")) is None
         ]
-        unconfirmed_stale = [
-            item for item in unconfirmed_normal
-            if item not in unconfirmed_never_checked
-        ]
+        never_checked_ids = {id(item) for item in unconfirmed_never_checked}
+        unconfirmed_stale = [item for item in unconfirmed_normal if id(item) not in never_checked_ids]
         unconfirmed_errors = [
             item for item in unconfirmed_normal
             if str(item.get("last_remote_check_result") or "").strip().lower() in {"error", "invalid"}
@@ -4427,8 +4440,6 @@ class AccountService:
         expected_last_token_refresh_at: str | None = None,
         defer_persistence: bool = False,
     ) -> dict | None:
-        # Retained as call metadata only; capability-specific account state is gone.
-        _ = capabilities
         if not access_token:
             return None
         now = datetime.now(timezone.utc)
@@ -4462,6 +4473,9 @@ class AccountService:
                     next_item["status"] = "限流"
                     next_item["quota"] = 0
                     next_item["image_quota_unknown"] = False
+                if failure is not None and failure.code == "file_upload_throttled":
+                    record_upload_throttle(next_item, failure.retry_after, now.timestamp())
+                    next_item["fail"] = int(next_item.get("fail") or 0) + 1
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1
@@ -5469,6 +5483,8 @@ class AccountService:
         total = len(items)
         active = sum(1 for a in items if a.get("status") == "正常")
         limited = sum(1 for a in items if a.get("status") == "限流")
+        now_epoch = time.time()
+        upload_limited = sum(1 for a in items if upload_blocked(a, now_epoch))
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
         normal_items = [a for a in items if a.get("status") == "正常"]
@@ -5494,6 +5510,7 @@ class AccountService:
             "cumulative_total": self._cumulative_total,
             "active": active,
             "limited": limited,
+            "upload_limited": upload_limited,
             "abnormal": abnormal,
             "disabled": disabled,
             "total_quota": total_quota,

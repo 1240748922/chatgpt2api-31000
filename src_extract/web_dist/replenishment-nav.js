@@ -21,7 +21,7 @@
   `;
   function isRegisterRoute(){return window.location.hash.includes("/settings")&&window.location.hash.includes("tab=replenishment")}
   function authHeaders(){const key=window.localStorage.getItem(ADMIN_KEY)||"";return key?{Authorization:`Bearer ${key}`,"Content-Type":"application/json"}:{"Content-Type":"application/json"}}
-  async function request(path,options){const response=await fetch(path,{...options,headers:{...authHeaders(),...(options?.headers||{})}});const body=await response.json().catch(()=>({}));if(!response.ok){const detail=body?.detail?.error||body?.detail||body?.error||`请求失败（${response.status}）`;throw new Error(typeof detail==="string"?detail:JSON.stringify(detail))}return body}
+  async function request(path,options){const response=await fetch(path,{...options,signal:options?.signal||AbortSignal.timeout(15000),headers:{...authHeaders(),...(options?.headers||{})}});const body=await response.json().catch(()=>({}));if(!response.ok){const detail=body?.detail?.error||body?.detail||body?.error||`请求失败（${response.status}）`;throw new Error(typeof detail==="string"?detail:JSON.stringify(detail))}return body}
   function esc(value){return String(value??"").replace(/&/g,"&amp;").replace(/"/g,"&quot;")}
   function field(label,key,value,help,type="text",wide=false){return `<div class="register-field${wide?" wide":""}"><label for="register-${key}">${label}</label><input id="register-${key}" data-register-key="${key}" type="${type}" value="${esc(value)}"><small>${help}</small></div>`}
   function selectField(label,key,value,options,help,wide=false){return `<div class="register-field${wide?" wide":""}"><label for="register-${key}">${label}</label><select id="register-${key}" data-register-key="${key}">${options.map(([option,labelText])=>`<option value="${esc(option)}"${String(value??"")===option?" selected":""}>${labelText}</option>`).join("")}</select><small>${help}</small></div>`}
@@ -59,7 +59,7 @@
   }
 
   async function request(path, options = {}) {
-    const response = await fetch(path, { ...options, headers: { ...authHeaders(), ...(options.headers || {}) } });
+    const response = await fetch(path, { ...options, signal: options.signal || AbortSignal.timeout(15000), headers: { ...authHeaders(), ...(options.headers || {}) } });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
       const detail = body?.detail?.error || body?.detail || body?.error || `请求失败（${response.status}）`;
@@ -92,6 +92,8 @@
       card.dataset.manualActive = "true";
       state.className = "register-manual-state";
       state.textContent = `正在注册 ${count} 个账号...`;
+      const liveLog = page.querySelector("[data-register-log]");
+      if (liveLog) liveLog.textContent += `\n正在提交手动注册请求：${count} 个账号...`;
       try {
         const result = await request(`/api/accounts/replenishment/run?manual_count=${count}`, { method: "POST", body: "{}" });
         if (result.reason === "started") {
@@ -115,6 +117,7 @@
         state.className = "register-manual-state error";
         state.textContent = error.message || "手动注册启动失败";
       } finally {
+        window.dispatchEvent(new Event("register-status-refresh"));
         button.disabled = false;
         input.disabled = false;
       }
@@ -165,20 +168,31 @@
     };
     const sections = history.map(render).filter(Boolean);
     const result = status?.last_result || {};
-    if (status?.running && result.reason === "running") sections.push(render({ ...result, finished_at: "进行中" }));
+    if (status?.running && ["starting", "running"].includes(result.reason)) sections.push(render({ ...result, finished_at: "进行中" }));
     if (!sections.length) sections.push(render({ finished_at: status?.last_checked_at, reason: result.reason || "状态检查", metrics: status?.current_metrics || {} }));
     if (status?.last_error) sections.push(`错误：${status.last_error}`);
     return sections.join("\n\n==============================\n\n") || "暂无运行记录\n\n保存配置或执行一次补号后，这里会显示注册机输出和 session 导入结果。";
   }
+  let polling = false;
   async function poll() {
+    if (polling) return;
     const page = document.querySelector("[data-account-replenishment-page]");
     if (!page || !isRegisterRoute()) return;
+    polling = true;
     try {
-      const response = await fetch("/api/accounts/replenishment", { headers: authHeaders() });
-      if (!response.ok) return;
+      const response = await fetch("/api/accounts/replenishment", { headers: authHeaders(), signal: AbortSignal.timeout(8000) });
+      if (!response.ok) throw new Error(`状态读取失败（HTTP ${response.status}），将自动重试`);
       const status = await response.json();
       const log = page.querySelector("[data-register-log]");
-      if (log) { const followBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48; log.textContent = formatLiveLog(status); if (followBottom) log.scrollTop = log.scrollHeight; }
+      if (log) {
+        const previousTop = log.scrollTop;
+        const followBottom = log.scrollHeight - previousTop - log.clientHeight < 48;
+        const nextText = formatLiveLog(status);
+        if (log.textContent !== nextText) {
+          log.textContent = nextText;
+          log.scrollTop = followBottom ? log.scrollHeight : previousTop;
+        }
+      }
       const metrics = status?.current_metrics || {};
       const available = page.querySelector('[data-register-metric="available"]');
       if (available && metrics.current_available !== undefined) available.textContent = metrics.current_available;
@@ -204,7 +218,8 @@
         if (running) {
           manualState.className = "register-manual-state";
           manualState.textContent = "正在注册，日志会实时显示...";
-        } else if (result.reason === "failed" || status?.last_error) {
+        } else if (result.ok === false || result.reason === "failed" || status?.last_error) {
+          manualCard.dataset.manualActive = "false";
           manualState.className = "register-manual-state error";
           manualState.textContent = `注册失败：${result.stderr_tail || status.last_error || "请查看右侧日志"}`;
         } else if (result.reason === "replenished") {
@@ -213,11 +228,17 @@
           manualCard.dataset.manualActive = "false";
         }
       }
-    } catch (_) {
-      // The main page keeps its last successful status visible during a transient poll failure.
+    } catch (error) {
+      const label = page.querySelector("[data-register-log-status]");
+      if (label) label.textContent = error.message || "连接暂时中断，保留现有日志并自动重试";
+      const dot = page.querySelector("[data-register-log-dot]");
+      if (dot) dot.className = "register-log-dot error";
+    } finally {
+      polling = false;
     }
   }
-  setInterval(poll, 1000);
+  window.addEventListener("register-status-refresh", poll);
+  setInterval(poll, 3000);
   poll();
 })();
 

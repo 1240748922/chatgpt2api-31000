@@ -41,6 +41,42 @@ def local_internal_snapshot(provided: str) -> dict[str, Any]:
     return realtime_monitor_service.snapshot()
 
 
+def _local_image_load() -> dict[str, Any]:
+    from services.log_service import image_threadpool_snapshot
+
+    return {"threadpool": {"image": image_threadpool_snapshot()}}
+
+
+def local_internal_image_load(provided: str) -> dict[str, Any]:
+    _authorize(provided)
+    return _local_image_load()
+
+
+def cluster_image_load_snapshot() -> dict[str, Any]:
+    """Read only admission counters; no accounts, logs or history are scanned."""
+    count, own_index = account_shard_settings()
+    snapshots = [_local_image_load()]
+    if count > 1:
+        secret = _secret()
+        with ThreadPoolExecutor(max_workers=min(count - 1, 16), thread_name_prefix="maintenance-load") as executor:
+            futures = [
+                executor.submit(_request_json, f"http://app{index}:80/internal/monitor/load", secret, 2)
+                for index in range(count) if index != own_index
+            ]
+            for future in as_completed(futures):
+                try:
+                    snapshot = future.result()
+                    counters = (snapshot.get("threadpool") or {}).get("image")
+                    if isinstance(counters, dict) and {"active", "waiting"} <= counters.keys():
+                        snapshots.append(snapshot)
+                except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+                    continue
+    return {
+        "cluster": {"expected": count, "responding": len(snapshots)},
+        "threadpool": {"image": _pool_sum(snapshots, "image")},
+    }
+
+
 def local_internal_call_detail(call_id: str, provided: str) -> dict[str, Any] | None:
     _authorize(provided)
     return realtime_monitor_service.call_detail(call_id)
@@ -73,7 +109,8 @@ def cluster_monitor_snapshot() -> dict[str, Any]:
             except (OSError, ValueError, RuntimeError, urllib.error.URLError):
                 continue
     if not snapshots:
-        return realtime_monitor_service.snapshot()
+        local = realtime_monitor_service.snapshot()
+        return {**local, "cluster": {"expected": count, "responding": 0}}
     return _merge_snapshots(snapshots, count)
 
 
@@ -146,6 +183,7 @@ def _merge_snapshots(snapshots: list[Mapping[str, Any]], expected_count: int) ->
         "inflight": sum(_int(shard.get("inflight")) for shard in shards),
     }
     return {
+        "cluster": {"expected": expected_count, "responding": len(snapshots)},
         "updated_at": max((str(snapshot.get("updated_at") or "") for snapshot in snapshots), default=""),
         "threadpool": threadpool,
         "window": {

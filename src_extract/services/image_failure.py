@@ -39,7 +39,9 @@ class ImageFailure:
 
     @property
     def switch_account(self) -> bool:
-        return self.outcome == "failure"
+        # Return explicit upstream rate/quota restrictions to the caller.
+        # Retrying with another credential does not resolve that restriction.
+        return self.outcome == "failure" and self.status_code != 429
 
     @property
     def account_failure(self) -> bool:
@@ -105,7 +107,7 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
     ),
     "file_upload_throttled": FailurePolicy(
         "account", "file_upload", True, 429, "rate_limit_error",
-        verify_account=True,
+        verify_account=False,
     ),
     "auth_invalid": FailurePolicy(
         "account", "auth", False, 401, "authentication_error",

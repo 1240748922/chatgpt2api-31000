@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+from contextlib import contextmanager
+from queue import LifoQueue, Empty, Full
 import re
 import shutil
 import subprocess
@@ -23,8 +25,9 @@ _UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 4, 1, 96
 _UPSCALE_SLOTS = threading.BoundedSemaphore(_UPSCALE_CONCURRENCY)
 _FSRCNN_CONCURRENCY = env_int("CHATGPT2API_FSRCNN_CONCURRENCY", 4, 1, 16)
 _FSRCNN_SLOTS = threading.BoundedSemaphore(_FSRCNN_CONCURRENCY)
-_FSRCNN_MODEL_LOCK = threading.Lock()
-_FSRCNN_MODEL_INSTANCE = None
+_FSRCNN_MODELS = LifoQueue(maxsize=_FSRCNN_CONCURRENCY)
+_FSRCNN_INIT_LOCK = threading.Lock()
+_FSRCNN_RUNTIME_READY = False
 _UPSCALE_STATE_LOCK = threading.Lock()
 _UPSCALE_ACTIVE = 0
 _UPSCALE_WAITING = 0
@@ -32,8 +35,9 @@ _MAX_TARGET_DIMENSION = 8192
 
 
 def image_upscale_snapshot() -> dict[str, int]:
+    limit = _FSRCNN_CONCURRENCY if config.image_upscale_engine == "fsrcnn_x2" else _UPSCALE_CONCURRENCY
     with _UPSCALE_STATE_LOCK:
-        return {"limit": _UPSCALE_CONCURRENCY, "active": _UPSCALE_ACTIVE, "waiting": _UPSCALE_WAITING}
+        return {"limit": limit, "active": _UPSCALE_ACTIVE, "waiting": _UPSCALE_WAITING}
 
 
 class _UpscaleSlot:
@@ -109,6 +113,25 @@ def _sharp_lanczos3(image_data: bytes, target: tuple[int, int]) -> bytes:
     return completed.stdout
 
 
+@contextmanager
+def _lease_fsrcnn_model(cv2):
+    try:
+        model = _FSRCNN_MODELS.get_nowait()
+    except Empty:
+        if not hasattr(cv2, "dnn_superres"):
+            raise RuntimeError("OpenCV dnn_superres is unavailable")
+        model = cv2.dnn_superres.DnnSuperResImpl_create()
+        model.readModel(str(_FSRCNN_MODEL))
+        model.setModel("fsrcnn", 2)
+    try:
+        yield model
+    finally:
+        try:
+            _FSRCNN_MODELS.put_nowait(model)
+        except Full:
+            pass
+
+
 def _fsrcnn_x2(image_data: bytes, target: tuple[int, int]) -> bytes:
     """Run the small CPU FSRCNN x2 model, then fit the exact requested size."""
 
@@ -134,25 +157,20 @@ def _fsrcnn_x2(image_data: bytes, target: tuple[int, int]) -> bytes:
     else:
         model_input = source
 
-    with _FSRCNN_MODEL_LOCK:
-        global _FSRCNN_MODEL_INSTANCE
-        if _FSRCNN_MODEL_INSTANCE is None:
-            if not hasattr(cv2, "dnn_superres"):
-                raise RuntimeError("OpenCV dnn_superres is unavailable")
-            model = cv2.dnn_superres.DnnSuperResImpl_create()
-            model.readModel(str(_FSRCNN_MODEL))
-            model.setModel("fsrcnn", 2)
-            _FSRCNN_MODEL_INSTANCE = model
-        model = _FSRCNN_MODEL_INSTANCE
-        if source_has_alpha:
-            alpha = source[:, :, 3]
-            upscaled = model.upsample(model_input)
-            alpha = cv2.resize(alpha, (upscaled.shape[1], upscaled.shape[0]), interpolation=cv2.INTER_CUBIC)
-            upscaled = cv2.merge((*cv2.split(upscaled), alpha))
-        else:
-            upscaled = model.upsample(model_input)
-            if source_is_gray:
-                upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+    global _FSRCNN_RUNTIME_READY
+    with _FSRCNN_INIT_LOCK:
+        if not _FSRCNN_RUNTIME_READY:
+            # Eight API replicas must not each let OpenCV claim every CPU core.
+            cv2.setNumThreads(env_int("CHATGPT2API_FSRCNN_THREADS", 1, 1, 16))
+            _FSRCNN_RUNTIME_READY = True
+    # Each admitted request leases an independent model; no lock covers inference.
+    with _lease_fsrcnn_model(cv2) as model:
+        upscaled = model.upsample(model_input)
+    if source_has_alpha:
+        alpha = cv2.resize(source[:, :, 3], (upscaled.shape[1], upscaled.shape[0]), interpolation=cv2.INTER_CUBIC)
+        upscaled = cv2.merge((*cv2.split(upscaled), alpha))
+    elif source_is_gray:
+        upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
 
     if (upscaled.shape[1], upscaled.shape[0]) != target:
         upscaled = cv2.resize(upscaled, target, interpolation=cv2.INTER_LANCZOS4)

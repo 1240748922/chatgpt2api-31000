@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -161,6 +162,9 @@ class AccountReplenishmentService:
         self._last_result: dict[str, Any] = {}
         self._last_metrics: dict[str, Any] = {}
         self._log_history: list[dict[str, Any]] = []
+        self._metrics_cache: dict[str, Any] = {}
+        self._metrics_cache_at = 0.0
+        self._metrics_lock = threading.Lock()
 
     @staticmethod
     def _timestamp(value: float | None = None) -> str:
@@ -230,7 +234,7 @@ class AccountReplenishmentService:
             "reason": "starting",
             "manual_count": requested_count,
             "requested_count": requested_count,
-            "stdout_tail": "",
+            "stdout_tail": f"已接收手动注册请求：{requested_count} 个账号，正在检查配置和启动环境。",
         }
         with self._status_lock:
             self._running = True
@@ -295,35 +299,47 @@ class AccountReplenishmentService:
                     state["last_checked_at"] = now
                     state["last_metrics"] = dict(metrics)
 
-    def status(self) -> dict[str, Any]:
-        metrics = {}
+    def _pool_metrics(self, *, force: bool = False) -> dict[str, Any]:
+        if not force and time.monotonic() - self._metrics_cache_at < 15:
+            return dict(self._metrics_cache)
+        if not self._metrics_lock.acquire(blocking=False):
+            return dict(self._metrics_cache)
         try:
             metrics = account_service.evaluate_account_pool(refresh_stale=False)
-        except Exception as exc:
-            metrics = {"error": str(exc)}
+            self._metrics_cache = dict(metrics)
+            self._metrics_cache_at = time.monotonic()
+            return metrics
+        finally:
+            self._metrics_lock.release()
+
+    def status(self) -> dict[str, Any]:
+        # Log polling must not scan the account pool or write coordination state.
+        # Metrics are refreshed by the existing scheduler/manual run.
+        with self._status_lock:
+            metrics = dict(self._last_metrics)
         workdir = _effective_workdir(dict(config.account_replenishment))
 
         if self._repository is not None:
-            with self._shared_state() as state:
-                status = self._empty_status()
-                for field in status:
-                    if field in state:
-                        status[field] = state[field]
-                for field in ("last_result", "last_metrics"):
-                    if isinstance(state.get(field), dict):
-                        status[field] = dict(state[field])
-                if isinstance(state.get("log_history"), list):
-                    status["log_history"] = list(state["log_history"])[-50:]
-                if isinstance(status.get("last_result"), dict):
-                    status["last_result"] = _normalize_result_paths(status["last_result"], workdir)
-                status["log_history"] = [
-                    _normalize_result_paths(item, workdir)
-                    for item in status["log_history"]
-                    if isinstance(item, Mapping)
-                ]
-                status["config"] = self._config_snapshot()
-                status["current_metrics"] = metrics
-                return status
+            state = self._repository.load()
+            status = self._empty_status()
+            for field in status:
+                if field in state:
+                    status[field] = state[field]
+            for field in ("last_result", "last_metrics"):
+                if isinstance(state.get(field), dict):
+                    status[field] = dict(state[field])
+            if isinstance(state.get("log_history"), list):
+                status["log_history"] = list(state["log_history"])[-50:]
+            if isinstance(status.get("last_result"), dict):
+                status["last_result"] = _normalize_result_paths(status["last_result"], workdir)
+            status["log_history"] = [
+                _normalize_result_paths(item, workdir)
+                for item in status["log_history"]
+                if isinstance(item, Mapping)
+            ]
+            status["config"] = self._config_snapshot()
+            status["current_metrics"] = dict(state.get("last_metrics") or metrics)
+            return status
 
         with self._status_lock:
             return {
@@ -374,14 +390,18 @@ class AccountReplenishmentService:
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         python_executable = _text(settings.get("python_executable"))
-        if python_executable and not _WINDOWS_ABSOLUTE_PATH_RE.match(python_executable):
-            python_path = _resolve_path(python_executable, workdir)
+        if python_executable in {"python", "python3", "python.exe"}:
+            python_path = Path(sys.executable)
+        elif python_executable and not _WINDOWS_ABSOLUTE_PATH_RE.match(python_executable):
+            python_path = Path(shutil.which(python_executable) or _resolve_path(python_executable, workdir))
         else:
             candidates = [
                 workdir / ".venv" / "Scripts" / "python.exe",
                 workdir / ".venv" / "bin" / "python",
             ]
             python_path = next((candidate for candidate in candidates if candidate.exists()), Path(sys.executable))
+        if not python_path.is_file():
+            raise FileNotFoundError(f"注册机 Python 不存在：{python_path}；请在运行参数中清空 Python 路径，使用镜像自带环境。")
         return workdir, output_dir, entrypoint, python_path
 
     def _provider_config_path(self) -> Path:
@@ -847,7 +867,7 @@ class AccountReplenishmentService:
         launch_timeout_seconds = max(300, int(settings.get("launch_timeout_seconds") or 300))
 
         try:
-            quick_metrics = account_service.evaluate_account_pool(refresh_stale=False)
+            quick_metrics = self._pool_metrics()
         except Exception as exc:
             quick_metrics = {"error": str(exc)}
         metrics = dict(quick_metrics)
@@ -912,12 +932,12 @@ class AccountReplenishmentService:
 
         try:
             metrics = account_service.evaluate_account_pool(
-                refresh_stale=True,
+                refresh_stale=requested_count is None,
                 target_available=trigger_threshold or None,
                 freshness_seconds=interval_seconds,
             )
         except Exception as exc:
-            metrics = account_service.evaluate_account_pool(refresh_stale=False)
+            metrics = self._pool_metrics()
             metrics["evaluation_error"] = str(exc)
         self._touch_check(metrics)
 
@@ -1100,7 +1120,7 @@ class AccountReplenishmentService:
             if last_error and quota_refresh.get("errors"):
                 quota_refresh["error"] = last_error
 
-        post_metrics = account_service.evaluate_account_pool(refresh_stale=False)
+        post_metrics = self._pool_metrics(force=True)
         result = {
             "ok": returncode == 0 and not timed_out,
             "triggered": True,

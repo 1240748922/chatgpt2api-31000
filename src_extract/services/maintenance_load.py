@@ -15,9 +15,9 @@ from services.runtime_configuration import env_int
 def _cluster_monitor_snapshot() -> dict[str, Any]:
     """Load the monitor lazily so callers and tests can replace the boundary."""
 
-    from services.cluster_monitor_service import cluster_monitor_snapshot
+    from services.cluster_monitor_service import cluster_image_load_snapshot
 
-    return cluster_monitor_snapshot()
+    return cluster_image_load_snapshot()
 
 
 def _nonnegative(value: object) -> int:
@@ -51,9 +51,12 @@ def cluster_image_load() -> dict[str, Any]:
         waiting = _nonnegative(image.get("waiting")) if isinstance(image, dict) else 0
         limit = _nonnegative(image.get("limit")) if isinstance(image, dict) else 0
         active_max, waiting_max, retry_seconds = configured_thresholds()
-        low_load = active <= active_max and waiting <= waiting_max
+        cluster = snapshot.get("cluster") or {}
+        complete = int(cluster.get("responding", 1)) >= int(cluster.get("expected", 1))
+        valid = isinstance(image, dict) and {"active", "waiting"} <= image.keys() and complete
+        low_load = valid and active <= active_max and waiting <= waiting_max
         return {
-            "ok": True,
+            "ok": valid,
             "low_load": low_load,
             "image_active": active,
             "image_waiting": waiting,

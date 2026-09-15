@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from services.account_capabilities import upload_blocked
+
 from services.account_credentials import project_upstream_credential_availability
 from services.proxy_management_service import project_proxy_assignment
 from utils.diagnostics import sanitize_diagnostic_text
@@ -189,6 +191,8 @@ def _status(
         reason_code, reason = "credentials_unavailable", "AT 已失效，且没有可用 RT，账号无法参与调度"
     elif backend_category == "limited":
         reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
+    elif upload_blocked(account):
+        reason_code, reason = "file_upload_throttled", "参考图上传冷却中，仍可文生图"
     elif remote_result == "pending":
         reason_code, reason = "verification_pending", "正在核验账号状态"
     elif remote_result == "error" or raw_error:
@@ -246,6 +250,10 @@ def account_row(
         account,
         credential_lifecycle,
     )
+    upload_limited = upload_blocked(account)
+    if upload_limited and category == "normal":
+        status_label = "上传受限 · 可文生图" if available else "上传受限 · 生图待确认"
+        status_tone = "warning"
     plan, plan_label = _plan(account)
     source, source_label = _source(account)
     proxy, proxy_mode, proxy_group_id, proxy_label = _proxy(account)
@@ -281,6 +289,8 @@ def account_row(
         "backend_status": _STATUS_LABEL[backend_category],
         "status_category": category,
         "status_label": status_label,
+        "file_upload_limited": upload_limited,
+        "file_upload_blocked_until": account.get("file_upload_blocked_until"),
         "status_tone": status_tone,
         "status_reason_code": reason_code,
         "status_reason": reason,

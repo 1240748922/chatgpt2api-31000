@@ -1282,10 +1282,11 @@ def _recover_image_conversation_id(
 def _image_stream_timeout_task_diagnostics(
         backend: OpenAIBackendAPI,
         conversation_id: str,
+        timeout_secs: float = 3.0,
 ) -> tuple[ImageFailure | None, str, list[dict[str, Any]], str]:
     """Collect a small task summary after an upstream SSE timeout."""
     try:
-        tasks = backend._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+        tasks = backend._query_backend_tasks(conversation_id=conversation_id, timeout_secs=timeout_secs)
     except Exception as exc:
         if _is_account_auth_failure(exc):
             raise
@@ -1409,49 +1410,37 @@ def _recover_after_image_stream_timeout(
     conversation_failure: ImageFailure | None = None
     conversation_probe_error = ""
 
-    if conversation_id and not (file_ids or sediment_ids):
-        task_failure, task_error, task_summaries, task_probe_error = _image_stream_timeout_task_diagnostics(
-            backend,
-            conversation_id,
-        )
+    recovery_started = time.monotonic()
+    remaining = (
+        request.deadline_monotonic - recovery_started - 5
+        if request.deadline_monotonic > 0 else 30.0
+    )
+    recovery_deadline = recovery_started + max(0.0, min(30.0, float(config.image_poll_timeout_secs), remaining))
+
+    if conversation_id and not (file_ids or sediment_ids) and time.monotonic() < recovery_deadline:
         try:
-            conversation = backend._get_conversation(conversation_id, timeout_secs=10)
+            conversation = backend._get_conversation(
+                conversation_id, timeout_secs=max(0.001, min(10.0, recovery_deadline - time.monotonic())),
+            )
             conversation_snapshot, snapshot_assistant_text = backend._conversation_poll_snapshot(conversation)
             latest_assistant_text = terminal_assistant_text(conversation) or snapshot_assistant_text
             for record in backend._extract_image_tool_records(conversation):
                 add_unique(file_ids, [str(item) for item in record.get("file_ids") or []])
                 add_unique(sediment_ids, [str(item) for item in record.get("sediment_ids") or []])
             conversation_failure = classify_conversation_failure(conversation)
-            terminal_message = next(
-                (
-                    item
-                    for item in reversed(conversation_snapshot.get("messages") or [])
-                    if (
-                        isinstance(item, dict)
-                        and str(item.get("role") or "").strip().lower() == "assistant"
-                        and str(item.get("content_type") or "").strip().lower() in {"text", "code"}
-                        and bool(item.get("text_preview"))
-                    )
-                ),
-                None,
-            )
-            if (
-                terminal_message is not None
-                and str(terminal_message.get("content_type") or "").strip().lower() == "code"
-                and is_image_generation_arguments(
-                    latest_assistant_text,
-                    role="assistant",
-                    content_type="code",
-                )
-            ):
-                conversation_failure = merge_message_failure(
-                    conversation_failure,
-                    image_failure("image_tool_error", raw_detail=latest_assistant_text),
-                )
         except Exception as exc:
             if _is_account_auth_failure(exc):
                 raise
             conversation_probe_error = diagnostic_excerpt(repr(exc), 1000)
+
+        if (
+            not (file_ids or sediment_ids) and conversation_failure is None
+            and stream_failure is None and time.monotonic() < recovery_deadline
+        ):
+            task_failure, task_error, task_summaries, task_probe_error = _image_stream_timeout_task_diagnostics(
+                backend, conversation_id,
+                timeout_secs=max(0.001, min(3.0, recovery_deadline - time.monotonic())),
+            )
 
     terminal_failure: ImageFailure | None = None
     for failure in (stream_failure, task_failure, conversation_failure):
@@ -1535,6 +1524,28 @@ def _recover_after_image_stream_timeout(
         if conversation_snapshot:
             setattr(terminal_exc, "last_conversation_snapshot", conversation_snapshot)
         raise terminal_exc
+
+    # A disconnected SSE stream does not cancel the upstream task. Recover the
+    # same conversation within one bounded recovery budget.
+    recovery_budget = recovery_deadline - time.monotonic()
+    if conversation_id and recovery_budget > 0:
+        try:
+            urls = backend.resolve_conversation_image_urls(
+                conversation_id, [], [], poll=True, poll_timeout_secs=recovery_budget,
+            )
+            output = _image_result_output_from_urls(
+                backend, request, conversation_id, urls, index, total, path=recovery_path,
+            )
+            if output:
+                logger.info({"event": "image_stream_recovered_by_poll", "call_id": request.call_id,
+                             "conversation_id": conversation_id, "recovery_budget_secs": recovery_budget})
+                return output
+        except ImagePollTimeoutError as exc:
+            followup["recovery_poll_attempts"] = getattr(exc, "poll_attempts", 0)
+            followup["recovery_poll_timeout_secs"] = recovery_budget
+        except Exception:
+            # Preserve a decisive upstream failure instead of replacing it with an SSE timeout.
+            raise
 
     logger.warning({
         "event": f"image_{recovery_reason}_followup",
@@ -2136,6 +2147,7 @@ def _generate_single_image(
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                     excluded_tokens=attempted_tokens,
                     deadline_monotonic=request.deadline_monotonic or None,
+                    requires_file_upload=bool(request.images),
                 )
                 attempted_tokens.add(token)
                 account_attempt_started = account_wait_started

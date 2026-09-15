@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import time
+from collections import deque
+from itertools import islice
 from pathlib import Path
 from threading import Event, Thread
 
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
-from services.maintenance_load import maintenance_is_allowed
+from services.maintenance_load import maintenance_is_allowed, configured_thresholds
+from services.account_maintenance import sync_idle_batch
 from services.account_replenishment_service import account_replenishment_service
 from services.auth_service import auth_service
 from services.config import config
@@ -76,56 +80,38 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
+        next_lifecycle = 0.0
+        limited_pending: deque[str] = deque()
+        expiring_pending: deque[str] = deque()
         while not stop_event.is_set():
             try:
                 allowed, load = maintenance_is_allowed()
-                if not allowed:
-                    print(
-                        "[account-watcher] maintenance deferred: "
-                        f"image_active={load.get('image_active')} "
-                        f"image_waiting={load.get('image_waiting')}"
-                    )
-                    stop_event.wait(config.refresh_account_interval_minute * 60)
-                    continue
-                pending_auth = account_service.list_pending_auth_verification_tokens()
-                if pending_auth:
-                    account_service.resume_pending_auth_verifications()
-                expiring_tokens = account_service.list_expiring_access_tokens()
-                if expiring_tokens:
-                    print(
-                        "[account-watcher] renewing "
-                        f"{len(expiring_tokens)} expiring access tokens"
-                    )
-                    result = account_service.renew_expiring_access_tokens(expiring_tokens)
-                    if result.get("errors"):
-                        print(f"[account-watcher] renewal errors: {result['errors']}")
-
-                limited_tokens = account_service.list_limited_tokens()
-                normal_tokens = account_service.list_normal_tokens()
-                if limited_tokens:
-                    print(
-                        "[account-watcher] syncing "
-                        f"{len(limited_tokens)} limited accounts "
-                        f"(skipping {len(normal_tokens)} healthy accounts, "
-                        f"recovering {len(pending_auth)} pending auth accounts)"
-                    )
-                    account_service.sync_accounts_and_quota(limited_tokens)
-
-                # Large imports can leave many normal accounts with unknown
-                # image quota. Verify only a bounded batch per cycle; the
-                # existing sync path applies the configured auto-remove rules.
-                unknown_tokens = account_service.list_unknown_quota_tokens()
-                if unknown_tokens:
-                    print(
-                        "[account-watcher] syncing "
-                        f"{len(unknown_tokens)} unknown-quota accounts"
-                    )
-                    result = account_service.sync_accounts_and_quota(unknown_tokens)
-                    if result.get("errors"):
-                        print(f"[account-watcher] unknown-quota sync errors: {result['errors']}")
+                if allowed:
+                    tokens = account_service.list_unknown_quota_tokens()
+                    if tokens:
+                        checked = sync_idle_batch(account_service, tokens, stop_event)
+                        print(f"[account-watcher] unknown quota checked={checked} selected={len(tokens)}")
+                    if time.monotonic() >= next_lifecycle and not (limited_pending or expiring_pending):
+                        limited_pending.extend(account_service.list_limited_tokens())
+                        expiring_pending.extend(account_service.list_expiring_access_tokens())
+                        next_lifecycle = time.monotonic() + config.refresh_account_interval_minute * 60
+                    # Carry unfinished work into the next idle cycle, rather
+                    # than repeatedly checking just the first accounts.
+                    allowed, _ = maintenance_is_allowed()
+                    if allowed and not stop_event.is_set():
+                        account_service.resume_pending_auth_verifications(limit=2)
+                    allowed, _ = maintenance_is_allowed()
+                    if allowed and not stop_event.is_set() and expiring_pending:
+                        expiring = [expiring_pending.popleft() for _ in range(min(2, len(expiring_pending)))]
+                        account_service.renew_expiring_access_tokens(expiring)
+                    limited = list(islice(limited_pending, 50))
+                    checked = sync_idle_batch(account_service, limited, stop_event)
+                    for _ in range(checked):
+                        limited_pending.popleft()
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
-            stop_event.wait(config.refresh_account_interval_minute * 60)
+            # A traffic spike must not postpone another check for 30 minutes.
+            stop_event.wait(configured_thresholds()[2])
 
     thread = Thread(target=worker, name="account-lifecycle-watcher", daemon=True)
     thread.start()

@@ -2,12 +2,15 @@ import base64
 import hashlib
 import json
 import mimetypes
+import math
 import queue
 import re
 import threading
 import time
 import uuid
 from pathlib import Path
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
@@ -190,6 +193,22 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
+def parse_retry_after(value: object, *, now: datetime | None = None) -> int | None:
+    text = str(value or "").strip()
+    if text.isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    try:
+        date = parsedate_to_datetime(text)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(0, math.ceil((date - (now or datetime.now(timezone.utc))).total_seconds()))
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def ensure_ok(
     response: requests.Response,
     context: str,
@@ -204,11 +223,7 @@ def ensure_ok(
     except Exception:
         pass
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
-    retry_after: int | None = None
-    if retry_after_header is not None:
-        ra_str = str(retry_after_header).strip()
-        if ra_str.isdigit():
-            retry_after = int(ra_str)
+    retry_after = parse_retry_after(retry_after_header)
     raise UpstreamHTTPError(
         context,
         response.status_code,

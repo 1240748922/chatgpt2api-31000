@@ -466,7 +466,10 @@ def _image_error_payload(exc: Exception) -> dict[str, object]:
 
 def _image_error_response(exc: Exception) -> JSONResponse:
     failure = _final_image_failure(exc)
-    return openai_error_response(_image_error_payload(exc), failure.status_code)
+    headers = None
+    if failure.status_code == 429 and failure.retry_after is not None:
+        headers = {"Retry-After": str(max(0, failure.retry_after))}
+    return openai_error_response(_image_error_payload(exc), failure.status_code, headers=headers)
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:

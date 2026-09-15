@@ -2,7 +2,7 @@ name: chatgpt2api-31000
 
 x-app: &app
   # Use the application revision selected by this checkout; .env can pin another version.
-  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-edd7084}
+  image: ghcr.io/1240748922/chatgpt2api-31000:${CHATGPT2API_IMAGE_TAG:-sha-a8648f6}
   restart: unless-stopped
   depends_on:
     postgres:

@@ -8,9 +8,9 @@
 
 [DEPLOYMENT.md](./DEPLOYMENT.md)
 
-当前 `main` 默认使用镜像 `sha-6064cdb`，修复准备阶段超时误记为 SSE 断流、轮询耗时误记为断流耗时、换号后错误残留；明确失败的图片任务会立即结束轮询，并增加任务状态诊断。之前版本的上传受限换号、注册代理检查、后台同步和 CPU 超分修复也保留。
+当前 `main` 默认使用镜像 `sha-a831bd9`，修复中间消息完成时提前关闭生图 SSE、任务接口已有图片却未接收的问题，并为初始化连接失败增加有时间上限的新连接重试。上一版的阶段诊断、上传受限换号、注册代理检查、后台同步和 CPU 超分修复也保留。
 之前认可的旧稳定版仍保留为 `stable-before-maintenance-sharp-20260914`，镜像为 `sha-f6a3f02`。
-Compose 默认锁定 `sha-6064cdb`；如果 `.env` 没有设置 `CHATGPT2API_IMAGE_TAG`，服务器直接执行更新命令即可使用该版本。
+Compose 默认锁定 `sha-a831bd9`；如果 `.env` 没有设置 `CHATGPT2API_IMAGE_TAG`，服务器直接执行更新命令即可使用该版本。
 版本选择、升级前备份和恢复步骤请查看 [VERSIONING.md](./VERSIONING.md)。
 
 ## 在本地电脑启动

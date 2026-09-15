@@ -39,8 +39,12 @@ class ImageFailure:
 
     @property
     def switch_account(self) -> bool:
-        # Return explicit upstream rate/quota restrictions to the caller.
-        # Retrying with another credential does not resolve that restriction.
+        # A file-upload throttle is account capability-specific: the same
+        # request can succeed immediately with another account. Generation
+        # quota/rate-limit 429s remain terminal for this request to avoid
+        # duplicating an upstream job unnecessarily.
+        if self.code == "file_upload_throttled":
+            return True
         return self.outcome == "failure" and self.status_code != 429
 
     @property
@@ -106,6 +110,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
         verify_account=True,
     ),
     "file_upload_throttled": FailurePolicy(
+        # A reference-image request cannot succeed on this account until the
+        # upload cooldown expires. Mark the account locally and let the image
+        # retry loop move to another account immediately.
         "account", "file_upload", True, 429, "rate_limit_error",
         verify_account=False,
     ),

@@ -24,8 +24,11 @@ NUMERIC_SETTING_SPECS = MappingProxyType({
     "image_retention_hours": NumericSettingSpec(24, 1, unit="hours"),
     "log_retention_hours": NumericSettingSpec(24, 1, unit="hours"),
     "console_request_timeout_secs": NumericSettingSpec(600, 30, 3600, unit="seconds"),
-    "image_poll_timeout_secs": NumericSettingSpec(60, 1, unit="seconds"),
-    "image_stream_timeout_secs": NumericSettingSpec(80, 1, unit="seconds"),
+    # Image generation commonly takes 40-60s. Keep the stream and result
+    # windows above that range so a slow but valid upstream job is recovered
+    # instead of being turned into a local 502 too early.
+    "image_poll_timeout_secs": NumericSettingSpec(120, 90, unit="seconds"),
+    "image_stream_timeout_secs": NumericSettingSpec(90, 90, unit="seconds"),
     "image_poll_initial_wait_secs": NumericSettingSpec(
         5.0,
         0.0,

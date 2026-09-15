@@ -25,7 +25,7 @@ def test_upload_429_records_only_upload_cooldown(monkeypatch):
     error = UpstreamHTTPError("/backend-api/files", 429, {"error": "file upload throttled"}, retry_after=3600)
     failure = classify_image_exception(error)
     assert failure.code == "file_upload_throttled"
-    assert failure.switch_account is False
+    assert failure.switch_account is True
     result = service.mark_image_result("token", False, failure=failure)
     assert result["status"] == "正常"
     assert result["quota"] == 8
@@ -54,9 +54,13 @@ def test_bad_persisted_cooldown_does_not_break_failure_handling(previous):
     assert account["file_upload_blocked_until"] == 1060
 
 
-@pytest.mark.parametrize("code", ["file_upload_throttled", "upstream_rate_limited", "image_quota_exhausted"])
-def test_explicit_429_does_not_rotate_credentials(code):
+@pytest.mark.parametrize("code", ["upstream_rate_limited", "image_quota_exhausted"])
+def test_non_upload_429_does_not_rotate_credentials(code):
     assert image_failure(code).switch_account is False
+
+
+def test_reference_upload_429_rotates_to_another_account():
+    assert image_failure("file_upload_throttled").switch_account is True
 
 
 def test_retry_after_accepts_seconds_and_http_date():

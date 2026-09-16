@@ -38,16 +38,19 @@ class ImageFailure:
         return "text" if self.status_code == 400 else "failure"
 
     @property
+    def account_capacity_limited(self) -> bool:
+        """Only confirmed account-local capacity limits may bypass retry caps."""
+        return self.code in {
+            "file_upload_throttled", "image_quota_exhausted", "insufficient_quota",
+        }
+
+    @property
     def switch_account(self) -> bool:
         # Both upload throttles and confirmed image quota exhaustion are
         # account-local. A request can succeed immediately with another
         # account, so these failures must enter the cross-account retry loop.
         # Other 429s may represent a request-level limit and remain terminal.
-        if self.code in {
-            "file_upload_throttled",
-            "image_quota_exhausted",
-            "insufficient_quota",
-        }:
+        if self.account_capacity_limited:
             return True
         return self.outcome == "failure" and self.status_code != 429
 

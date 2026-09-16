@@ -2138,6 +2138,7 @@ def _generate_single_image(
     retry_error: ImageGenerationError | None = None
     pending_switch_attempt_index: int | None = None
     account_attempt_started = 0.0
+    ordinary_failure_count = 0
     max_account_attempts = (
         config.image_max_account_attempts
         if config.image_account_retry_enabled
@@ -2159,21 +2160,23 @@ def _generate_single_image(
         error: ImageGenerationError | None = None,
     ) -> bool:
         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
-        # A confirmed quota exhaustion belongs to the selected account. Keep
-        # walking the local candidate pool instead of applying the normal
-        # retry cap; attempted_tokens prevents selecting the same account
-        # again after a token refresh/alias rotation. The request deadline is
-        # still the hard upper bound, so this cannot become an unbounded job.
-        quota_retry = failure.code in {"image_quota_exhausted", "insufficient_quota"}
-        attempt_limit = None if quota_retry else max_account_attempts
+        nonlocal ordinary_failure_count
+        # Upload/quota exhaustion is account-local. Walk distinct candidates
+        # within the request deadline without spending the ordinary failure
+        # budget. Failed capacity probes must not exhaust that budget when a
+        # later account encounters a different, transient error.
+        capacity_retry = failure.account_capacity_limited
+        if not capacity_retry:
+            ordinary_failure_count += 1
         if (
-            failure.code == "task_interrupted"
+            not config.image_account_retry_enabled
+            or failure.code == "task_interrupted"
             or (
                 request.deadline_monotonic > 0
                 and time.monotonic() >= request.deadline_monotonic
             )
             or not failure.switch_account
-            or (attempt_limit is not None and len(image_attempts) >= attempt_limit)
+            or (not capacity_retry and ordinary_failure_count >= max_account_attempts)
         ):
             return False
         # Do not start another full upstream attempt when the request has only
@@ -2183,7 +2186,7 @@ def _generate_single_image(
         # long tail latency. The bound scales with the configured stream
         # timeout but is capped so normal 30-60s image generations still get a
         # retry opportunity.
-        if request.deadline_monotonic > 0 and not quota_retry:
+        if request.deadline_monotonic > 0 and not capacity_retry:
             remaining = request.deadline_monotonic - time.monotonic()
             minimum_retry_window = max(
                 30.0,
@@ -2413,10 +2416,7 @@ def _generate_single_image(
                 "attempted_account_count": len(image_attempts) + 1,
                 "max_account_attempts": (
                     None
-                    if previous_attempt.get("failure_code") in {
-                        "image_quota_exhausted",
-                        "insufficient_quota",
-                    }
+                    if image_failure(previous_attempt.get("failure_code", "")).account_capacity_limited
                     else max_account_attempts
                 ),
                 "index": index,
@@ -2432,10 +2432,7 @@ def _generate_single_image(
                     account_switch_count=len(image_attempts),
                     max_account_attempts=(
                         None
-                        if previous_attempt.get("failure_code") in {
-                            "image_quota_exhausted",
-                            "insufficient_quota",
-                        }
+                        if image_failure(previous_attempt.get("failure_code", "")).account_capacity_limited
                         else max_account_attempts
                     ),
                     index=index,

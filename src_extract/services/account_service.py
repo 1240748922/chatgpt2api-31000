@@ -146,6 +146,7 @@ class AccountService:
     # from exhausting the conflict budget and dropping quota/state updates.
     _STORAGE_MUTATION_MAX_ATTEMPTS = 12
     _ACCOUNT_SNAPSHOT_TTL_SECONDS = 5.0
+    _EMPTY_POOL_SNAPSHOT_TTL_SECONDS = 0.5
     _GIT_ACCOUNT_SNAPSHOT_TTL_SECONDS = 60.0
     # Operational totals only; resettable state such as invalid_count stays LWW.
     _ADDITIVE_ACCOUNT_COUNTER_FIELDS = frozenset({"success", "fail"})
@@ -470,9 +471,12 @@ class AccountService:
         *,
         wait_for_refresh: bool = False,
         allow_full_reload: bool = True,
+        max_age_seconds: float | None = None,
     ) -> bool:
         now = time.monotonic()
         ttl = self._account_snapshot_ttl_seconds()
+        if max_age_seconds is not None and callable(getattr(self.storage, "get_collection_revision", None)):
+            ttl = min(ttl, max(0.0, max_age_seconds))
         with self._lock:
             if (
                 now - self._account_snapshot_checked_at
@@ -480,6 +484,10 @@ class AccountService:
             ):
                 return False
 
+        if not allow_full_reload:
+            with self._account_snapshot_refresh_dispatch_lock:
+                if self._account_snapshot_refresh_scheduled:
+                    return False
         if not self._account_snapshot_refresh_lock.acquire(blocking=wait_for_refresh):
             return False
         try:
@@ -510,7 +518,7 @@ class AccountService:
                 # Image dispatch must not synchronously deserialize the entire
                 # account collection after another replica updates one row.
                 # Refresh the cross-replica view in the background instead.
-                self._schedule_accounts_snapshot_refresh()
+                self._schedule_accounts_snapshot_refresh(max_age_seconds=max_age_seconds)
                 return False
 
             try:
@@ -527,8 +535,32 @@ class AccountService:
                 self._account_snapshot_checked_at = time.monotonic()
                 if revision == expected_revision:
                     return False
+                # Image completions update the dispatch view before the
+                # coalesced DB writer runs. Do not erase their cooldown/quota
+                # changes when refreshing a different replica's import.
+                # Keep remote deletions and credential replacements authoritative.
+                refreshed = dict(loaded)
+                for token, local in self._accounts.items():
+                    baseline = self._persisted_accounts.get(token)
+                    remote = loaded.get(token)
+                    if (
+                        baseline is not None
+                        and remote is not None
+                        and local != baseline
+                        and local != remote
+                        and self._credential_generation(token, local)
+                        == self._credential_generation(token, remote)
+                    ):
+                        # The DB write may have finished before its bookkeeping
+                        # acquired this lock. Fields already matching local
+                        # state are acknowledged, not another counter delta.
+                        merge_baseline = dict(baseline)
+                        for field, value in local.items():
+                            if field in remote and remote[field] == value:
+                                merge_baseline[field] = value
+                        refreshed[token] = self._merge_account_fields(merge_baseline, local, remote)
                 self._apply_account_view_locked(
-                    loaded,
+                    refreshed,
                     persisted_accounts=loaded,
                     revision=revision,
                 )
@@ -536,7 +568,7 @@ class AccountService:
         finally:
             self._account_snapshot_refresh_lock.release()
 
-    def _schedule_accounts_snapshot_refresh(self) -> None:
+    def _schedule_accounts_snapshot_refresh(self, *, max_age_seconds: float | None = None) -> None:
         """Refresh a changed account snapshot without blocking image dispatch."""
         with self._account_snapshot_refresh_dispatch_lock:
             if self._account_snapshot_refresh_scheduled:
@@ -545,7 +577,9 @@ class AccountService:
 
         def worker() -> None:
             try:
-                self._refresh_accounts_snapshot_if_stale(wait_for_refresh=True)
+                self._refresh_accounts_snapshot_if_stale(
+                    wait_for_refresh=True, max_age_seconds=max_age_seconds,
+                )
             except Exception:
                 # A later request or lifecycle operation can retry the refresh.
                 pass
@@ -2063,13 +2097,13 @@ class AccountService:
                     )
                 )
                 if ready_count == 0:
-                    if matched_count > 0 and limited_count == matched_count:
-                        raise ImageAccountSelectionError(
-                            "quota_exhausted",
-                            "all matched image accounts are remote-confirmed quota exhausted",
-                        )
                     pool_wait_remaining = pool_wait_deadline - time.monotonic()
                     if pool_wait_remaining <= 0:
+                        if matched_count > 0 and limited_count == matched_count:
+                            raise ImageAccountSelectionError(
+                                "quota_exhausted",
+                                "all matched image accounts are remote-confirmed quota exhausted",
+                            )
                         raise ImageAccountSelectionError(
                             "unavailable",
                             "no image account is ready for current model/status filters",
@@ -2090,12 +2124,17 @@ class AccountService:
                     self._image_slot_condition.wait(
                         timeout=min(1.0, remaining) if remaining is not None else 1.0
                     )
-            # The wait can outlive the account snapshot TTL. Refresh outside the
-            # account lock before considering another candidate so a remote delete
-            # or disable cannot be leased from the stale in-memory view.
+            # Empty-pool waiting is shorter than the normal snapshot TTL. Check
+            # the shared revision sooner so imports/quota updates on another
+            # replica become visible before rejecting. Full reloads stay in one
+            # background worker; unchanged revisions are checked at most twice
+            # a second per process, not once per waiting request.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                continue
             self._refresh_accounts_snapshot_if_stale(
                 wait_for_refresh=False,
                 allow_full_reload=False,
+                max_age_seconds=self._EMPTY_POOL_SNAPSHOT_TTL_SECONDS if ready_count == 0 else None,
             )
 
     def _find_available_image_token_locked(
@@ -4638,7 +4677,7 @@ class AccountService:
                     # Image-result writes are keyed row mutations. Do not use
                     # the collection CAS here: a burst across replicas would
                     # otherwise force every loser to reload all 37k accounts.
-                    result = self.storage.mutate_accounts(
+                    self.storage.mutate_accounts(
                         StorageMutation(upserts=(account,))
                     )
                 except Exception:
@@ -4650,7 +4689,10 @@ class AccountService:
                     current = self._accounts.get(access_token)
                     if current == account:
                         self._persisted_accounts[access_token] = deepcopy(account)
-                        self._accounts_revision = result.revision
+                        # A keyed write does not load the collection. Its new
+                        # revision may also include unseen imports/deletions
+                        # from another replica. Only a full snapshot (or CAS
+                        # against the known revision) can advance our view.
 
             retry_pending: dict[str, dict] = {}
             with self._image_slot_condition:

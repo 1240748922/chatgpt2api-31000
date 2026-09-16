@@ -21,7 +21,10 @@ from utils.log import logger
 
 _SHARP_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "image_upscale" / "upscale.mjs"
 _FSRCNN_MODEL = Path(__file__).resolve().parents[1] / "models" / "FSRCNN_x2.pb"
-_UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 4, 1, 96)
+# Keep post-processing from becoming the bottleneck for image traffic. This is
+# per API replica; the deployment can lower it through the environment when
+# CPU saturation is observed.
+_UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 8, 1, 96)
 _UPSCALE_SLOTS = threading.BoundedSemaphore(_UPSCALE_CONCURRENCY)
 _FSRCNN_CONCURRENCY = env_int("CHATGPT2API_FSRCNN_CONCURRENCY", 4, 1, 16)
 _FSRCNN_SLOTS = threading.BoundedSemaphore(_FSRCNN_CONCURRENCY)

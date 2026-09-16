@@ -41,7 +41,7 @@ Build and publish container image
 当前默认修复版本的构建已成功，镜像地址是：
 
 ```text
-ghcr.io/1240748922/chatgpt2api-31000:sha-a831bd9
+ghcr.io/1240748922/chatgpt2api-31000:sha-fde08d4
 ```
 
 首次构建可能需要较长时间，因为会安装 Python 依赖、Playwright 和 Chromium。
@@ -253,7 +253,7 @@ nano .env
 至少修改这些内容：
 
 ```env
-CHATGPT2API_IMAGE_TAG=sha-a831bd9
+CHATGPT2API_IMAGE_TAG=sha-fde08d4
 POSTGRES_PASSWORD=改成一个长密码
 CHATGPT2API_AUTH_KEY=改成你的API访问密钥
 CHATGPT2API_MONITOR_CLUSTER_SECRET=改成一个随机字符串

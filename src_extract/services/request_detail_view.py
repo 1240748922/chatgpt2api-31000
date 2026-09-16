@@ -11,6 +11,7 @@ _TIMELINE_CATEGORIES = (
     ("upstream", "上游生成"),
     ("resolve", "结果处理"),
     ("download", "图片下载"),
+    ("postprocess", "图片后处理"),
 )
 
 _TIMELINE_STEPS = (
@@ -40,6 +41,9 @@ _TIMELINE_STEPS = (
     ("resolve_ms", "解析结果", "resolve", "file ID / 下载地址"),
     ("response_ms", "响应整理", "resolve", "Codex 响应"),
     ("download_ms", "下载图片", "download", "图片文件下载"),
+    ("upscale_ms", "图片超分", "postprocess", "Sharp / FSRCNN"),
+    ("storage_ms", "保存图片", "postprocess", "本地或远程图片存储"),
+    ("postprocess_ms", "后处理总计", "postprocess", "超分与保存图片"),
 )
 
 _TIMELINE_SEGMENTS = (
@@ -60,6 +64,7 @@ _TIMELINE_SEGMENTS = (
         ("poll_request_ms", "resolve_ms", "response_ms"),
     ),
     ("download", "图片下载", "download", ("download_ms",)),
+    ("postprocess", "图片后处理", "postprocess", ("postprocess_ms",)),
 )
 
 _DEFAULT_TIMELINE_WARNING_THRESHOLD_MS = 60_000
@@ -85,6 +90,9 @@ _TIMELINE_WARNING_THRESHOLDS_MS = {
     "poll_wait_ms": 60_000,
     "poll_request_ms": 30_000,
     "download_ms": 60_000,
+    "upscale_ms": 60_000,
+    "storage_ms": 60_000,
+    "postprocess_ms": 60_000,
     "response_ms": 30_000,
 }
 

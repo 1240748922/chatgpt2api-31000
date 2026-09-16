@@ -127,6 +127,15 @@ class AccountService:
         1000,
     )
     _IMAGE_FAILURE_REFRESH_DEDUP_SECONDS = 30
+    # A newly imported or asynchronously verified pool can be temporarily
+    # empty from this process's point of view. Re-scan briefly before exposing
+    # no_available_account to a customer; the value is also used by Compose.
+    _IMAGE_POOL_WAIT_SECONDS = env_int(
+        "CHATGPT2API_IMAGE_RETRY_AFTER_SECS",
+        2,
+        0,
+        30,
+    )
     _ACCESS_TOKEN_FINGERPRINT_LIMIT = 8
     _REFRESH_PROGRESS_COMPLETED_TTL_SECONDS = 10 * 60
     _REFRESH_PROGRESS_ACTIVE_TTL_SECONDS = 60 * 60
@@ -2023,6 +2032,7 @@ class AccountService:
             deadline_monotonic: float | None = None,
             requires_file_upload: bool = False,
     ) -> str:
+        pool_wait_deadline = time.monotonic() + self._IMAGE_POOL_WAIT_SECONDS
         while True:
             with self._image_slot_condition:
                 remaining = (
@@ -2058,18 +2068,28 @@ class AccountService:
                             "quota_exhausted",
                             "all matched image accounts are remote-confirmed quota exhausted",
                         )
-                    raise ImageAccountSelectionError(
-                        "unavailable",
-                        "no image account is ready for current model/status filters",
+                    pool_wait_remaining = pool_wait_deadline - time.monotonic()
+                    if pool_wait_remaining <= 0:
+                        raise ImageAccountSelectionError(
+                            "unavailable",
+                            "no image account is ready for current model/status filters",
+                        )
+                    self._image_slot_condition.wait(
+                        timeout=min(
+                            0.25,
+                            pool_wait_remaining,
+                            remaining if remaining is not None else pool_wait_remaining,
+                        )
                     )
-                if access_token:
+                elif access_token:
                     self._image_inflight[access_token] = int(
                         self._image_inflight.get(access_token, 0)
                     ) + 1
                     return access_token
-                self._image_slot_condition.wait(
-                    timeout=min(1.0, remaining) if remaining is not None else 1.0
-                )
+                else:
+                    self._image_slot_condition.wait(
+                        timeout=min(1.0, remaining) if remaining is not None else 1.0
+                    )
             # The wait can outlive the account snapshot TTL. Refresh outside the
             # account lock before considering another candidate so a remote delete
             # or disable cannot be leased from the stale in-memory view.
@@ -2280,31 +2300,45 @@ class AccountService:
                 "deadline_exceeded",
                 "image request deadline exceeded before account selection",
             )
-        access_token = self._acquire_next_candidate_token(
-            excluded_tokens=excluded_tokens,
-            plan_type=plan_type,
-            source_type=source_type,
-            plan_types=plan_types,
-            deadline_monotonic=deadline_monotonic,
-            requires_file_upload=requires_file_upload,
-        )
-        try:
-            active_token = self.ensure_access_token(
-                access_token,
-                event="image_request_token_maintenance",
-                image_scope=True,
-                raise_on_error=True,
+        attempted_tokens = set(excluded_tokens or set())
+        while True:
+            access_token = self._acquire_next_candidate_token(
+                excluded_tokens=attempted_tokens,
+                plan_type=plan_type,
+                source_type=source_type,
+                plan_types=plan_types,
                 deadline_monotonic=deadline_monotonic,
+                requires_file_upload=requires_file_upload,
             )
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                raise ImageAccountSelectionError(
-                    "deadline_exceeded",
-                    "image request deadline exceeded during token maintenance",
+            try:
+                active_token = self.ensure_access_token(
+                    access_token,
+                    event="image_request_token_maintenance",
+                    image_scope=True,
+                    raise_on_error=True,
+                    deadline_monotonic=deadline_monotonic,
                 )
-            return active_token
-        except BaseException:
-            self.release_image_slot(access_token)
-            raise
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    raise ImageAccountSelectionError(
+                        "deadline_exceeded",
+                        "image request deadline exceeded during token maintenance",
+                    )
+                return active_token
+            except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError, TimeoutError):
+                # A stale/expired credential must not turn a large healthy pool
+                # into a customer-visible no_available_account. Release this
+                # lease, exclude the account for this request, and immediately
+                # obtain another candidate while the request deadline remains.
+                self.release_image_slot(access_token)
+                attempted_tokens.add(access_token)
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    raise ImageAccountSelectionError(
+                        "deadline_exceeded",
+                        "image request deadline exceeded during token maintenance",
+                    )
+            except BaseException:
+                self.release_image_slot(access_token)
+                raise
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         self._refresh_accounts_snapshot_if_stale()

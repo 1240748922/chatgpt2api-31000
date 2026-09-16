@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from services.protocol import conversation
 from services.realtime_monitor_service import RealtimeMonitorService
+from services.request_detail_view import build_request_timeline_presentation
 
 
 def test_image_postprocess_metrics_include_upscale_and_storage(monkeypatch):
@@ -59,3 +60,22 @@ def test_collect_image_outputs_keeps_postprocess_metrics():
         "storage_ms": 34,
         "postprocess_ms": 46,
     }
+
+
+def test_request_detail_timeline_includes_postprocess_steps():
+    timeline = build_request_timeline_presentation(
+        {
+            "upscale_ms": 1200,
+            "storage_ms": 300,
+            "postprocess_ms": 1500,
+        },
+        [],
+        image_count=1,
+    )
+
+    group = next(item for item in timeline["groups"] if item["key"] == "postprocess")
+    assert [item["key"] for item in group["steps"]] == [
+        "upscale_ms",
+        "storage_ms",
+        "postprocess_ms",
+    ]

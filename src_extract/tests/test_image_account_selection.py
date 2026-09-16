@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 import time
 
-from services.account_service import AccountService
+from services.account_service import AccountService, TerminalRefreshTokenError
 
 
 class _SelectionProbe:
@@ -101,3 +101,31 @@ def test_upload_cooldown_keeps_text_generation_available():
     assert token is None
     assert ready == 0
     assert _select(probe) == "limited-upload"
+
+
+def test_image_selection_skips_account_that_fails_token_maintenance():
+    class MaintenanceProbe:
+        get_available_access_token = AccountService.get_available_access_token
+        _IMAGE_POOL_WAIT_SECONDS = 0
+
+        def __init__(self):
+            self.selected = iter(("stale", "healthy"))
+            self.released = []
+
+        def _refresh_accounts_snapshot_if_stale(self, **_kwargs):
+            return False
+
+        def _acquire_next_candidate_token(self, **_kwargs):
+            return next(self.selected)
+
+        def ensure_access_token(self, access_token, **_kwargs):
+            if access_token == "stale":
+                raise TerminalRefreshTokenError(400, "invalid_refresh_token")
+            return access_token
+
+        def release_image_slot(self, access_token):
+            self.released.append(access_token)
+
+    probe = MaintenanceProbe()
+    assert probe.get_available_access_token() == "healthy"
+    assert probe.released == ["stale"]

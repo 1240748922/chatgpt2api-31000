@@ -39,11 +39,11 @@ class ImageFailure:
 
     @property
     def switch_account(self) -> bool:
-        # A file-upload throttle is account capability-specific: the same
-        # request can succeed immediately with another account. Generation
-        # quota/rate-limit 429s remain terminal for this request to avoid
-        # duplicating an upstream job unnecessarily.
-        if self.code == "file_upload_throttled":
+        # Both upload throttles and confirmed image quota exhaustion are
+        # account-local. A request can succeed immediately with another
+        # account, so these failures must enter the cross-account retry loop.
+        # Other 429s may represent a request-level limit and remain terminal.
+        if self.code in {"file_upload_throttled", "image_quota_exhausted"}:
             return True
         return self.outcome == "failure" and self.status_code != 429
 
@@ -465,8 +465,18 @@ def structured_upstream_codes(value: Any) -> set[str]:
 
 _IMAGE_QUOTA_MESSAGE_MARKERS = (
     "图像生成请求上限",
+    "图像生成请求限制",
+    "已达到 free 套餐",
+    "已达到免费套餐",
+    "free plan limit",
+    "free tier limit",
+    "limit for image generation",
+    "limit on image generation",
+    "limits for image generation",
+    "image generation requests",
     "image generation request limit",
     "image generation quota",
+    "no image generation quota",
     "quota exhausted",
     "insufficient quota",
 )
@@ -474,7 +484,18 @@ _IMAGE_QUOTA_MESSAGE_MARKERS = (
 
 def _looks_like_image_quota_message(value: Any) -> bool:
     """Recognize quota exhaustion when upstream omits a structured error code."""
-    text = value if isinstance(value, str) else _message_text(value)
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (Mapping, list, tuple)):
+        try:
+            # HTTP errors commonly put the prose under `error`, `message`, or
+            # `detail` instead of the SSE message shape. Serializing the small
+            # error payload makes all of those forms visible to one matcher.
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(value)
+    else:
+        text = _message_text(value)
     normalized = str(text or "").strip().casefold()
     return bool(normalized) and any(
         marker.casefold() in normalized for marker in _IMAGE_QUOTA_MESSAGE_MARKERS
@@ -644,6 +665,15 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
         )
         if is_file_upload:
             return image_failure("file_upload_throttled", retry_after=retry_after, raw_detail=exc.body)
+        # The web UI often returns the Free-plan image limit as prose with no
+        # structured error code. It is still account-local and must rotate to
+        # another account instead of being treated as a generic request 429.
+        if _looks_like_image_quota_message(exc.body):
+            return image_failure(
+                "image_quota_exhausted",
+                retry_after=retry_after,
+                raw_detail=exc.body,
+            )
     if structured_failure is not None and structured_failure.status_code == status_code:
         return structured_failure
     if status_code in {403, 423}:
@@ -777,9 +807,12 @@ def classify_upstream_message(value: Any) -> ImageFailure | None:
             _structured_codes(outer),
             raw_detail=outer,
         )
-        failure = structured_failure or image_failure(
-            "image_tool_error",
-            raw_detail=outer,
+        response_error = response.get("error") or outer.get("error") or outer
+        failure = (
+            image_failure("image_quota_exhausted", raw_detail=response_error)
+            if _looks_like_image_quota_message(response_error)
+            else structured_failure
+            or image_failure("image_tool_error", raw_detail=outer)
         )
         if event_type == "response.failed":
             failure = failure.with_public_detail(

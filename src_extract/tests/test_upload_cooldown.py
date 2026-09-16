@@ -7,7 +7,11 @@ import pytest
 from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_service import AccountService
 from services.account_view import account_row
-from services.image_failure import image_failure, classify_image_exception
+from services.image_failure import (
+    classify_image_exception,
+    classify_upstream_message,
+    image_failure,
+)
 from utils.helper import UpstreamHTTPError, parse_retry_after
 
 
@@ -54,8 +58,51 @@ def test_bad_persisted_cooldown_does_not_break_failure_handling(previous):
     assert account["file_upload_blocked_until"] == 1060
 
 
-@pytest.mark.parametrize("code", ["upstream_rate_limited", "image_quota_exhausted"])
-def test_non_upload_429_does_not_rotate_credentials(code):
+def test_request_rate_limit_does_not_rotate_credentials():
+    assert image_failure("upstream_rate_limited").switch_account is False
+
+
+def test_image_quota_exhaustion_rotates_credentials():
+    assert image_failure("image_quota_exhausted").switch_account is True
+
+
+def test_free_plan_image_limit_message_rotates_credentials():
+    error = UpstreamHTTPError(
+        "/backend-api/conversation",
+        429,
+        {
+            "error": (
+                "You've reached the Free plan limit for image generation requests. "
+                "Your limit will reset in 12 hours."
+            )
+        },
+    )
+    failure = classify_image_exception(error)
+    assert failure.code == "image_quota_exhausted"
+    assert failure.switch_account is True
+
+
+def test_free_plan_image_limit_sse_message_rotates_credentials():
+    failure = classify_upstream_message({
+        "message": {
+            "author": {"role": "assistant"},
+            "content": {
+                "content_type": "text",
+                "parts": [
+                    "You've reached the Free plan limit for image generation requests."
+                ],
+            },
+            "status": "finished_successfully",
+            "end_turn": True,
+        }
+    })
+    assert failure is not None
+    assert failure.code == "image_quota_exhausted"
+    assert failure.switch_account is True
+
+
+@pytest.mark.parametrize("code", ["insufficient_quota"])
+def test_other_quota_aliases_remain_terminal(code):
     assert image_failure(code).switch_account is False
 
 

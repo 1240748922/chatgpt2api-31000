@@ -89,6 +89,10 @@ STAGE_LABELS = {
     "image_text_reply": "上游文本回复",
     "image_download_done": "下载图片",
     "image_download_failed": "下载失败",
+    "image_upscale": "图片超分",
+    "image_storage": "保存图片",
+    "image_postprocess_done": "图片后处理",
+    "image_gallery_push": "图片发布",
     "image_codex_response_done": "Codex 响应",
     "image_single_stream_done": "生成返回",
     "image_single_done": "单图完成",
@@ -124,6 +128,10 @@ ACTIVE_STAGE_GROUPS = {
     "image_text_reply": "上游文本回复",
     "image_download_done": "下载图片",
     "image_download_failed": "下载图片",
+    "image_upscale": "图片后处理",
+    "image_storage": "图片后处理",
+    "image_postprocess_done": "图片后处理",
+    "image_gallery_push": "图片发布",
     "image_local_rejected": "本地拒绝/繁忙",
 }
 

@@ -770,6 +770,11 @@ class ImageTaskService:
             perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
+            processing_metrics = result.get("_image_processing_metrics")
+            if isinstance(processing_metrics, dict):
+                for metric, value in processing_metrics.items():
+                    if str(metric).endswith("_ms"):
+                        perf_timings[str(metric)] = max(0, int(value or 0))
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
@@ -798,10 +803,19 @@ class ImageTaskService:
             )
             # Auto-push only the assets produced by this task and carry through
             # metadata that is present in the real generation response.
+            gallery_push_started = time.perf_counter()
             auto_push_gallery_urls(
                 _collect_image_urls(result),
                 metadata=_generation_push_metadata(result, prompt=payload.get("prompt"), model=model),
                 base_url=_clean(payload.get("base_url")),
+            )
+            perf_timings["gallery_push_dispatch_ms"] = int(
+                (time.perf_counter() - gallery_push_started) * 1000
+            )
+            realtime_monitor_service.stage(
+                call_id,
+                "image_gallery_push",
+                gallery_push_dispatch_ms=perf_timings["gallery_push_dispatch_ms"],
             )
             image_attempts = collect_image_attempts(result)
             self._log_call(
@@ -821,6 +835,11 @@ class ImageTaskService:
             )
         except Exception as exc:
             perf_timings["handler_exec_ms"] = int((time.perf_counter() - handler_started) * 1000)
+            processing_metrics = getattr(exc, "_image_processing_metrics", None)
+            if isinstance(processing_metrics, dict):
+                for metric, value in processing_metrics.items():
+                    if str(metric).endswith("_ms"):
+                        perf_timings[str(metric)] = max(0, int(value or 0))
             public_error, raw_error, error_details = _normalize_task_failure(exc, "image task failed")
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
@@ -883,6 +902,11 @@ class ImageTaskService:
         if request_payload is not None:
             detail["request_meta"] = image_request_metadata(request_payload)
         detail.update(image_result_metrics(result))
+        if isinstance(result, dict) and isinstance(result.get("_image_processing_metrics"), dict):
+            for metric, value in result["_image_processing_metrics"].items():
+                if str(metric).endswith("_ms"):
+                    perf = perf if perf is not None else {}
+                    perf[str(metric)] = max(0, int(value or 0))
         if perf:
             detail["perf"] = dict(perf)
         if request_preview:

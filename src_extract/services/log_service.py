@@ -49,6 +49,7 @@ INTERNAL_RESPONSE_KEYS = {
     "_image_urls",
     "_image_attempts",
     "_image_metadata",
+    "_image_processing_metrics",
 }
 LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/image-thumbnails/)[^\s)\"']+)\)")
 PERF_WAIT_WARN_MS = 1000
@@ -825,6 +826,12 @@ class LoggedCall:
             image_metrics = image_result_metrics(result)
             if image_metrics:
                 detail.update(image_metrics)
+            if isinstance(result, dict) and isinstance(result.get("_image_processing_metrics"), dict):
+                detail.setdefault("perf", {}).update({
+                    str(key): max(0, int(value or 0))
+                    for key, value in result["_image_processing_metrics"].items()
+                    if str(key).endswith("_ms")
+                })
         if self._trace_image_perf():
             realtime_monitor_service.finish(detail)
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

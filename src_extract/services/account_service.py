@@ -2606,7 +2606,8 @@ class AccountService:
         *,
         remove_invalid: bool,
         remove_rate_limited: bool,
-    ) -> tuple[list[str], list[str]]:
+        remove_quota_exhausted: bool,
+    ) -> tuple[list[str], list[str], list[str]]:
         invalid_tokens = [
             token
             for item in self._accounts.values()
@@ -2621,13 +2622,24 @@ class AccountService:
                and item.get("status") == "限流"
                and (token := item.get("access_token") or "")
         ]
-        return invalid_tokens, rate_limited_tokens
+        quota_exhausted_tokens = [
+            token
+            for item in self._accounts.values()
+            if remove_quota_exhausted
+               and item.get("status") != "禁用"
+               and (not remove_rate_limited or item.get("status") != "限流")
+               and not bool(item.get("image_quota_unknown"))
+               and int(item.get("quota") or 0) <= 0
+               and (token := item.get("access_token") or "")
+        ]
+        return invalid_tokens, rate_limited_tokens, quota_exhausted_tokens
 
     def preview_auto_remove_accounts(
         self,
         *,
         remove_invalid: bool | None = None,
         remove_rate_limited: bool | None = None,
+        remove_quota_exhausted: bool | None = None,
     ) -> dict[str, Any]:
         self._refresh_accounts_snapshot_if_stale()
         remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
@@ -2636,20 +2648,25 @@ class AccountService:
             if remove_rate_limited is None
             else bool(remove_rate_limited)
         )
+        remove_quota_exhausted = bool(remove_quota_exhausted)
         with self._lock:
-            invalid_tokens, rate_limited_tokens = self._auto_remove_tokens_locked(
+            invalid_tokens, rate_limited_tokens, quota_exhausted_tokens = self._auto_remove_tokens_locked(
                 remove_invalid=remove_invalid,
                 remove_rate_limited=remove_rate_limited,
+                remove_quota_exhausted=remove_quota_exhausted,
             )
         invalid = len(invalid_tokens)
         rate_limited = len(rate_limited_tokens)
+        quota_exhausted = len(quota_exhausted_tokens)
         return {
             "dry_run": True,
             "invalid": invalid,
             "rate_limited": rate_limited,
-            "total_removed": invalid + rate_limited,
+            "quota_exhausted": quota_exhausted,
+            "total_removed": invalid + rate_limited + quota_exhausted,
             "auto_remove_invalid_accounts": remove_invalid,
             "auto_remove_rate_limited_accounts": remove_rate_limited,
+            "remove_quota_exhausted": remove_quota_exhausted,
         }
 
     def cleanup_auto_remove_accounts(
@@ -2657,6 +2674,7 @@ class AccountService:
         *,
         remove_invalid: bool | None = None,
         remove_rate_limited: bool | None = None,
+        remove_quota_exhausted: bool | None = None,
     ) -> dict[str, Any]:
         self._refresh_accounts_snapshot_if_stale()
         remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
@@ -2665,13 +2683,19 @@ class AccountService:
             if remove_rate_limited is None
             else bool(remove_rate_limited)
         )
+        remove_quota_exhausted = bool(remove_quota_exhausted)
         with self._lock:
-            invalid_tokens, rate_limited_tokens = self._auto_remove_tokens_locked(
+            invalid_tokens, rate_limited_tokens, quota_exhausted_tokens = self._auto_remove_tokens_locked(
                 remove_invalid=remove_invalid,
                 remove_rate_limited=remove_rate_limited,
+                remove_quota_exhausted=remove_quota_exhausted,
             )
 
-        target_tokens = list(dict.fromkeys([*invalid_tokens, *rate_limited_tokens]))
+        target_tokens = list(dict.fromkeys([
+            *invalid_tokens,
+            *rate_limited_tokens,
+            *quota_exhausted_tokens,
+        ]))
         result = self.delete_accounts(target_tokens, return_items=False) if target_tokens else {"removed": 0}
         removed = int(result.get("removed") or 0)
         if removed:
@@ -2682,15 +2706,18 @@ class AccountService:
                     "removed": removed,
                     "invalid": len(invalid_tokens),
                     "rate_limited": len(rate_limited_tokens),
+                    "quota_exhausted": len(quota_exhausted_tokens),
                 },
             )
         return {
             "dry_run": False,
             "invalid": len(invalid_tokens),
             "rate_limited": len(rate_limited_tokens),
+            "quota_exhausted": len(quota_exhausted_tokens),
             "total_removed": removed,
             "auto_remove_invalid_accounts": remove_invalid,
             "auto_remove_rate_limited_accounts": remove_rate_limited,
+            "remove_quota_exhausted": remove_quota_exhausted,
         }
 
     def list_normal_tokens(self) -> list[str]:

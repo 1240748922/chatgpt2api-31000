@@ -514,21 +514,52 @@ def format_image_result(
     message: str = "",
     requested_size: str | None = None,
     deadline_monotonic: float | None = None,
+    monitor_request: "ConversationRequest | None" = None,
+    index: int = 0,
+    total: int = 0,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
+    processing_metrics = {
+        "upscale_ms": 0,
+        "storage_ms": 0,
+        "postprocess_ms": 0,
+    }
+    postprocess_started = time.perf_counter()
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
+        upscale_started = time.perf_counter()
         image_bytes = upscale_image_if_needed(image_bytes, requested_size)
+        upscale_ms = _elapsed_ms(upscale_started)
+        processing_metrics["upscale_ms"] += upscale_ms
+        if monitor_request is not None and monitor_request.trace_image_perf:
+            _monitor_image_stage(
+                monitor_request,
+                "image_upscale",
+                upscale_ms=upscale_ms,
+                index=index,
+                total=total,
+            )
+        storage_started = time.perf_counter()
         stored_url = save_image_bytes(
             image_bytes,
             base_url,
             deadline_monotonic=deadline_monotonic,
         )
+        storage_ms = _elapsed_ms(storage_started)
+        processing_metrics["storage_ms"] += storage_ms
+        if monitor_request is not None and monitor_request.trace_image_perf:
+            _monitor_image_stage(
+                monitor_request,
+                "image_storage",
+                storage_ms=storage_ms,
+                index=index,
+                total=total,
+            )
         if stored_url:
             image_urls.append(stored_url)
         # Keep the local URL alongside the requested representation so clients
@@ -540,11 +571,22 @@ def format_image_result(
         if dimensions:
             asset["width"], asset["height"] = dimensions
         data.append(asset)
+    processing_metrics["postprocess_ms"] = _elapsed_ms(postprocess_started)
+    if monitor_request is not None and monitor_request.trace_image_perf:
+        _monitor_image_stage(
+            monitor_request,
+            "image_postprocess_done",
+            **processing_metrics,
+            index=index,
+            total=total,
+        )
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if image_urls:
         result["_image_urls"] = image_urls
     if message and not data:
         result["message"] = message
+    if any(processing_metrics.values()):
+        result["_image_processing_metrics"] = processing_metrics
     return result
 
 
@@ -597,6 +639,7 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
     image_attempts: list[dict[str, Any]] = field(default_factory=list)
+    processing_metrics: dict[str, int] = field(default_factory=dict)
     account_email: str = ""
     conversation_id: str = ""
     failure: ImageFailure | None = field(default=None, repr=False)
@@ -1660,6 +1703,9 @@ def _image_result_output_from_urls(
         int(time.time()),
         requested_size=request.size,
         deadline_monotonic=request.deadline_monotonic or None,
+        monitor_request=request,
+        index=index,
+        total=total,
     )
     data = formatted["data"]
     if not data:
@@ -1671,6 +1717,7 @@ def _image_result_output_from_urls(
         total=total,
         data=data,
         image_urls=list(formatted.get("_image_urls") or []),
+        processing_metrics=dict(formatted.get("_image_processing_metrics") or {}),
         conversation_id=conversation_id,
     )
 
@@ -2049,6 +2096,9 @@ def stream_codex_image_outputs(
         int(time.time()),
         requested_size=request.size,
         deadline_monotonic=request.deadline_monotonic or None,
+        monitor_request=request,
+        index=index,
+        total=total,
     )
     data = formatted["data"]
     if data:
@@ -2059,6 +2109,7 @@ def stream_codex_image_outputs(
             total=total,
             data=data,
             image_urls=list(formatted.get("_image_urls") or []),
+            processing_metrics=dict(formatted.get("_image_processing_metrics") or {}),
         )
         return
     raise ImageGenerationError(
@@ -2108,11 +2159,13 @@ def _generate_single_image(
         error: ImageGenerationError | None = None,
     ) -> bool:
         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
-        attempt_limit = (
-            min(max_account_attempts, 2)
-            if failure.code == "image_quota_exhausted"
-            else max_account_attempts
-        )
+        # A confirmed quota exhaustion belongs to the selected account. Keep
+        # walking the local candidate pool instead of applying the normal
+        # retry cap; attempted_tokens prevents selecting the same account
+        # again after a token refresh/alias rotation. The request deadline is
+        # still the hard upper bound, so this cannot become an unbounded job.
+        quota_retry = failure.code == "image_quota_exhausted"
+        attempt_limit = None if quota_retry else max_account_attempts
         if (
             failure.code == "task_interrupted"
             or (
@@ -2120,7 +2173,7 @@ def _generate_single_image(
                 and time.monotonic() >= request.deadline_monotonic
             )
             or not failure.switch_account
-            or len(image_attempts) >= attempt_limit
+            or (attempt_limit is not None and len(image_attempts) >= attempt_limit)
         ):
             return False
         # Do not start another full upstream attempt when the request has only
@@ -2130,7 +2183,7 @@ def _generate_single_image(
         # long tail latency. The bound scales with the configured stream
         # timeout but is capped so normal 30-60s image generations still get a
         # retry opportunity.
-        if request.deadline_monotonic > 0:
+        if request.deadline_monotonic > 0 and not quota_retry:
             remaining = request.deadline_monotonic - time.monotonic()
             minimum_retry_window = max(
                 30.0,
@@ -2358,9 +2411,8 @@ def _generate_single_image(
                 "account_email": previous_attempt.get("account_email", ""),
                 "next_account_email": account_email,
                 "attempted_account_count": len(image_attempts) + 1,
-                "max_account_attempts": max_account_attempts,
-                "failure_attempt_limit": (
-                    min(max_account_attempts, 2)
+                "max_account_attempts": (
+                    None
                     if previous_attempt.get("failure_code") == "image_quota_exhausted"
                     else max_account_attempts
                 ),
@@ -2375,7 +2427,11 @@ def _generate_single_image(
                     account_email=account_email,
                     previous_account_email=previous_attempt.get("account_email", ""),
                     account_switch_count=len(image_attempts),
-                    max_account_attempts=max_account_attempts,
+                    max_account_attempts=(
+                        None
+                        if previous_attempt.get("failure_code") == "image_quota_exhausted"
+                        else max_account_attempts
+                    ),
                     index=index,
                     total=total,
                 )
@@ -3022,6 +3078,7 @@ def collect_image_outputs(
     conversation_id = ""
     image_urls: list[str] = []
     image_attempts: list[dict[str, Any]] = []
+    processing_metrics: dict[str, int] = {}
     failed_output: ImageOutput | None = None
     for output in outputs:
         created = created or output.created
@@ -3032,6 +3089,12 @@ def collect_image_outputs(
         for attempt in output.image_attempts:
             if isinstance(attempt, dict) and attempt not in image_attempts:
                 image_attempts.append(dict(attempt))
+        for metric, value in output.processing_metrics.items():
+            if str(metric).endswith("_ms"):
+                processing_metrics[metric] = max(
+                    int(processing_metrics.get(metric) or 0),
+                    max(0, int(value or 0)),
+                )
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -3070,4 +3133,6 @@ def collect_image_outputs(
         result["_image_urls"] = list(dict.fromkeys(image_urls))
     if image_attempts:
         result["_image_attempts"] = image_attempts
+    if processing_metrics:
+        result["_image_processing_metrics"] = processing_metrics
     return result

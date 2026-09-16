@@ -762,6 +762,29 @@ class ConfigStore:
             return "0.0.0"
         return value or "0.0.0"
 
+    @staticmethod
+    def _runtime_identity(name: str, fallback: str = "") -> str:
+        """Return a short, operator-controlled runtime identity.
+
+        These values are deliberately read from the environment on demand so
+        the version endpoint describes the running container, rather than the
+        source tree that may be mounted beside it.
+        """
+        value = str(os.getenv(name) or "").strip()
+        return value[:160] if value else fallback
+
+    @property
+    def build_version(self) -> str:
+        return self._runtime_identity("CHATGPT2API_BUILD_VERSION", "dev")
+
+    @property
+    def image_tag(self) -> str:
+        return self._runtime_identity("CHATGPT2API_IMAGE_TAG", "unknown")
+
+    @property
+    def build_time(self) -> str:
+        return self._runtime_identity("CHATGPT2API_BUILD_TIME", "unknown")
+
     def get(self) -> dict[str, object]:
         with self._lock:
             self.reload_if_changed()

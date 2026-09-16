@@ -49,6 +49,14 @@ ghcr.io/1240748922/chatgpt2api-31000:sha-fde08d4
 Compose 默认锁定这版应用，避免拉取镜像时意外切换到其他版本。
 完整版本说明和回退步骤见 [VERSIONING.md](./VERSIONING.md)。
 
+更新后可以用接口确认实际运行版本：
+
+```bash
+curl -s http://127.0.0.1:31000/version
+```
+
+如果需要给本次部署设置一个自己的识别号，在 `.env` 中加入 `CHATGPT2API_BUILD_VERSION=release-2026-09-17-a`，重建后该值会出现在接口响应中；它不会替换实际镜像标签。
+
 ## 二、准备云服务器
 
 以下以 Ubuntu 22.04/24.04 为例。先通过 SSH 登录服务器：

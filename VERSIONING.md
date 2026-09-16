@@ -28,6 +28,26 @@
 Git 标签保存源码和部署文件；GHCR 镜像保存已构建的应用。回退运行版本需要切换镜像，单独 `git pull` 或回退 Python 文件不够。
 `latest` 会随新构建变化。稳定服务器使用具体的 `sha-xxxxxxx` 标签，并保留 GHCR 中相应的镜像版本，不要删除或重新指向其他镜像。PostgreSQL 和 Nginx 使用各自的镜像标签，应用版本锁定不等于数据库备份。
 
+## 运行版本确认
+
+应用的 `/version` 接口现在同时返回源码应用版本、实际运行镜像标签和可选的人工构建标识。这样可以确认服务器是否已经运行了目标容器，而不是只看到固定的应用版本 `3.2.3`。
+
+默认情况下，`build_version` 会跟随 `CHATGPT2API_IMAGE_TAG`。需要给一次部署加上容易识别的标识时，在服务器 `.env` 中增加或修改：
+
+```env
+CHATGPT2API_BUILD_VERSION=release-2026-09-17-a
+CHATGPT2API_BUILD_TIME=2026-09-17T00:00:00+08:00
+```
+
+更新并重建后验证：
+
+```bash
+curl -s http://127.0.0.1:31000/version
+docker compose --env-file .env images
+```
+
+返回内容中的 `build_version`、`image_tag` 和 `build_time` 就是当前实际响应请求的应用容器信息。`CHATGPT2API_BUILD_VERSION` 只用于标识，不会改变镜像选择；镜像仍由 `CHATGPT2API_IMAGE_TAG` 决定。
+
 不设置 `CHATGPT2API_IMAGE_TAG` 时，日常更新跟随仓库 Compose 默认版本。需要暂停升级或回退时才在 `.env` 中显式指定标签；恢复自动跟随时删除该行。本次链路修复前的版本是 `sha-6064cdb`，更早的上传重试版本是 `sha-087cf9c`。
 
 ## 2026-09-16 生图链路修复

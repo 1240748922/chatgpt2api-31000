@@ -199,7 +199,12 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/version")
     async def get_version():
-        return {"version": app_version}
+        return {
+            "version": app_version,
+            "build_version": config.build_version,
+            "image_tag": config.image_tag,
+            "build_time": config.build_time,
+        }
 
     @router.get("/api/system/update-status", response_model=UpdateStatusView)
     async def get_update_status(

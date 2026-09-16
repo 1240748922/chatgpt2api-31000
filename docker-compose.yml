@@ -31,6 +31,11 @@ x-app: &app
     DATABASE_MAX_OVERFLOW: 4
     DATABASE_POOL_TIMEOUT_SECONDS: 10
     CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-change-me}
+    # /version exposes these values so a deployment can be verified without
+    # guessing from the source checkout or the Docker image cache.
+    CHATGPT2API_IMAGE_TAG: ${CHATGPT2API_IMAGE_TAG:-sha-eb4cf61}
+    CHATGPT2API_BUILD_VERSION: ${CHATGPT2API_BUILD_VERSION:-${CHATGPT2API_IMAGE_TAG:-sha-eb4cf61}}
+    CHATGPT2API_BUILD_TIME: ${CHATGPT2API_BUILD_TIME:-unknown}
     CHATGPT2API_THREAD_TOKENS: 160
     CHATGPT2API_IMAGE_THREAD_TOKENS: 140
     CHATGPT2API_IMAGE_QUEUE_LIMIT: 40

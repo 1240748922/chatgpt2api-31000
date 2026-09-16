@@ -15,14 +15,14 @@
 | 版本用途 | 应用镜像 | 说明 |
 | --- | --- | --- |
 | 稳定版（默认） | `sha-f6a3f02` | 新维护方案之前、已补齐 Sharp 运行依赖的版本 |
-| 当前修复版（main 默认） | `sha-7d8a8a3` | 额度耗尽自动换号、超分/后处理耗时记录、账号清理操作、系统设置可调每实例 1–512 个超分并发；保留生图 SSE、图片任务输出和初始化连接重试修复 |
+| 当前修复版（main 默认） | `sha-ca94823` | 上传/额度限制不消耗普通重试次数；修复跨实例导入被单账号写入隐藏、空池缓存刷新滞后和上传冷却丢失；保留超分耗时与可调超分并发等功能 |
 | 上一版阶段诊断修复 | `sha-6064cdb` | 超时阶段与耗时归属修复、换号错误隔离、轮询状态诊断 |
 | 更早的上传重试版 | `sha-087cf9c` | 上传受限自动换号、90 秒生图流与 120 秒轮询窗口、注册代理检查 |
 | 上一版维护与超分版 | `sha-281017a` | 本次修复之前的维护与 CPU 超分方案 |
 | 上一版维护修复镜像 | `sha-26d613e` | 按生图负载延后维护、低库存放行补号和 Sharp 依赖修复 |
 
 先前创建的 `stable-20260913` 标签误把新方案当成稳定版，已弃用；不要用它回退旧方案。为避免已拉取标签的电脑和服务器产生歧义，不重写该标签，改用上面的新稳定标签。
-`main` 保留新方案代码，Compose 默认运行 `sha-7d8a8a3`。直接用源码启动或自行构建 `main` 也会运行新方案；需要旧方案源码时使用 `stable-before-maintenance-sharp-20260914`。
+`main` 保留新方案代码，Compose 默认运行 `sha-ca94823`。直接用源码启动或自行构建 `main` 也会运行新方案；需要旧方案源码时使用 `stable-before-maintenance-sharp-20260914`。
 如果之前已经在服务器 `.env` 中写了 `CHATGPT2API_IMAGE_TAG=sha-f1648e6`，本次 `git pull` 不会覆盖它，必须手动改为 `sha-f6a3f02` 才会回到旧方案。
 
 Git 标签保存源码和部署文件；GHCR 镜像保存已构建的应用。回退运行版本需要切换镜像，单独 `git pull` 或回退 Python 文件不够。
@@ -30,7 +30,7 @@ Git 标签保存源码和部署文件；GHCR 镜像保存已构建的应用。�
 
 ## 运行版本确认
 
-应用的 `/version` 接口现在同时返回源码应用版本、实际运行镜像标签和可选的人工构建标识。这样可以确认服务器是否已经运行了目标容器，而不是只看到固定的应用版本 `3.2.3`。
+应用的 `/version` 接口返回应用版本及环境变量提供的镜像标签、构建标识。这些部署标识便于查看，但不是镜像内容的独立证明；确认代码版本应同时检查运行容器的 OCI revision 标签。
 
 默认情况下，`build_version` 会跟随 `CHATGPT2API_IMAGE_TAG`。需要给一次部署加上容易识别的标识时，在服务器 `.env` 中增加或修改：
 
@@ -46,7 +46,15 @@ curl -s http://127.0.0.1:31000/version
 docker compose --env-file .env images
 ```
 
-返回内容中的 `build_version`、`image_tag` 和 `build_time` 就是当前实际响应请求的应用容器信息。`CHATGPT2API_BUILD_VERSION` 只用于标识，不会改变镜像选择；镜像仍由 `CHATGPT2API_IMAGE_TAG` 决定。
+返回内容中的 `build_version`、`image_tag` 和 `build_time` 来自响应容器的环境变量。`CHATGPT2API_BUILD_VERSION` 只用于标识，不会改变镜像选择；镜像仍由 `CHATGPT2API_IMAGE_TAG` 决定。验证当前修复版时，下列命令应在每个 app 容器输出 `ca94823e0b2a920dbd1f923f9a3afb2ef17465f5`：
+
+```bash
+for service in app0 app1 app2 app3 app4 app5 app6 app7; do
+  docker inspect "$(docker compose --env-file .env ps -q "$service")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+本次先推送应用提交并单独构建 `sha-ca94823`，再推送 Compose 版本锁定提交。不要把两个提交合并在一次推送里，却默认认为父提交也生成了同名镜像；普通 `push main` 构建只针对推送后的 HEAD。
 
 不设置 `CHATGPT2API_IMAGE_TAG` 时，日常更新跟随仓库 Compose 默认版本。需要暂停升级或回退时才在 `.env` 中显式指定标签；恢复自动跟随时删除该行。本次链路修复前的版本是 `sha-6064cdb`，更早的上传重试版本是 `sha-087cf9c`。
 
@@ -69,7 +77,7 @@ PYTHONPATH="$PWD/src_extract:$PWD/GPT-Register-Tool-main" python -m pytest -q sr
 
 上述测试验证了具体代码缺陷。尚未在云服务器上部署这版进行真实上游压测，不等于所有上游网络超时都会消失。
 
-当前镜像 `sha-7d8a8a3` 会由本次提交触发 GitHub Actions 构建；请先等待 Actions 显示成功再拉取。如果 `.env` 锁定旧标签，需要改为这个标签，或删除 `CHATGPT2API_IMAGE_TAG` 行后跟随仓库默认值，再拉取并重建。
+当前镜像为 `sha-ca94823`，对应 [GitHub Actions 构建](https://github.com/1240748922/chatgpt2api-31000/actions/runs/35131263333)。如果 `.env` 锁定旧标签，需要改为这个标签，或删除 `CHATGPT2API_IMAGE_TAG` 行后跟随仓库默认值，再拉取并重建。本次额外修复和回放说明见 [性能审查](./PERFORMANCE_AUDIT.md)，全套 97 项 Python 测试、前端运行检查和 Compose 配置检查通过；未在用户云服务器执行真实上游压测。
 
 ## 1. 按需把当前应用锁定
 

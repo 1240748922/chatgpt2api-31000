@@ -101,9 +101,9 @@ def test_free_plan_image_limit_sse_message_rotates_credentials():
     assert failure.switch_account is True
 
 
-@pytest.mark.parametrize("code", ["insufficient_quota"])
-def test_other_quota_aliases_remain_terminal(code):
-    assert image_failure(code).switch_account is False
+@pytest.mark.parametrize("code", ["insufficient_quota", "quota_exhausted"])
+def test_quota_aliases_rotate_credentials(code):
+    assert image_failure(code).switch_account is True
 
 
 def test_reference_upload_429_rotates_to_another_account():

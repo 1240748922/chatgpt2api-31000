@@ -2164,7 +2164,7 @@ def _generate_single_image(
         # retry cap; attempted_tokens prevents selecting the same account
         # again after a token refresh/alias rotation. The request deadline is
         # still the hard upper bound, so this cannot become an unbounded job.
-        quota_retry = failure.code == "image_quota_exhausted"
+        quota_retry = failure.code in {"image_quota_exhausted", "insufficient_quota"}
         attempt_limit = None if quota_retry else max_account_attempts
         if (
             failure.code == "task_interrupted"
@@ -2413,7 +2413,10 @@ def _generate_single_image(
                 "attempted_account_count": len(image_attempts) + 1,
                 "max_account_attempts": (
                     None
-                    if previous_attempt.get("failure_code") == "image_quota_exhausted"
+                    if previous_attempt.get("failure_code") in {
+                        "image_quota_exhausted",
+                        "insufficient_quota",
+                    }
                     else max_account_attempts
                 ),
                 "index": index,
@@ -2429,7 +2432,10 @@ def _generate_single_image(
                     account_switch_count=len(image_attempts),
                     max_account_attempts=(
                         None
-                        if previous_attempt.get("failure_code") == "image_quota_exhausted"
+                        if previous_attempt.get("failure_code") in {
+                            "image_quota_exhausted",
+                            "insufficient_quota",
+                        }
                         else max_account_attempts
                     ),
                     index=index,

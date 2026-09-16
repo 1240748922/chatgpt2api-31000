@@ -43,7 +43,11 @@ class ImageFailure:
         # account-local. A request can succeed immediately with another
         # account, so these failures must enter the cross-account retry loop.
         # Other 429s may represent a request-level limit and remain terminal.
-        if self.code in {"file_upload_throttled", "image_quota_exhausted"}:
+        if self.code in {
+            "file_upload_throttled",
+            "image_quota_exhausted",
+            "insufficient_quota",
+        }:
             return True
         return self.outcome == "failure" and self.status_code != 429
 

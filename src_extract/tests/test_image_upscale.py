@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from services import image_upscale_service as upscale
+from contracts.settings_specification import numeric_setting_spec
 
 
 def test_fsrcnn_model_is_pinned_and_present() -> None:
@@ -52,3 +53,12 @@ def test_fsrcnn_inference_leases_are_parallel_and_returned_on_error(monkeypatch)
         with upscale._lease_fsrcnn_model(SimpleNamespace()):
             raise RuntimeError("inference failed")
     assert models.qsize() == 2
+
+
+def test_upscale_concurrency_is_runtime_configurable(monkeypatch):
+    spec = numeric_setting_spec("image_upscale_concurrency")
+    assert spec.default == 64
+    assert spec.maximum == 512
+    monkeypatch.setattr(upscale.config, "reload_if_changed", lambda: None)
+    monkeypatch.setitem(upscale.config.data, "image_upscale_concurrency", 137)
+    assert upscale.image_upscale_snapshot()["limit"] == 137

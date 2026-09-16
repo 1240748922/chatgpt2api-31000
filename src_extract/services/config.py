@@ -602,6 +602,14 @@ class ConfigStore:
         )
 
     @property
+    def image_upscale_concurrency(self) -> int:
+        self.reload_if_changed()
+        value = self.data.get("image_upscale_concurrency")
+        if value is None:
+            value = os.getenv("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY")
+        return normalize_integer_setting("image_upscale_concurrency", value)
+
+    @property
     def image_account_retry_enabled(self) -> bool:
         self.reload_if_changed()
         return _normalize_bool(self.data.get("image_account_retry_enabled"), True)
@@ -768,6 +776,7 @@ class ConfigStore:
             data["image_poll_interval_secs"] = self.image_poll_interval_secs
             data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
             data["image_account_concurrency"] = self.image_account_concurrency
+            data["image_upscale_concurrency"] = self.image_upscale_concurrency
             data["account_processing_concurrency"] = self.account_processing_concurrency
             data["account_import_concurrency"] = self.account_import_concurrency
             data["account_quota_sync_concurrency"] = self.account_quota_sync_concurrency

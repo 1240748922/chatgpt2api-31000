@@ -24,10 +24,8 @@ _FSRCNN_MODEL = Path(__file__).resolve().parents[1] / "models" / "FSRCNN_x2.pb"
 # Keep post-processing from becoming the bottleneck for image traffic. This is
 # per API replica; the deployment can lower it through the environment when
 # CPU saturation is observed.
-_UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 8, 1, 96)
-_UPSCALE_SLOTS = threading.BoundedSemaphore(_UPSCALE_CONCURRENCY)
-_FSRCNN_CONCURRENCY = env_int("CHATGPT2API_FSRCNN_CONCURRENCY", 4, 1, 16)
-_FSRCNN_SLOTS = threading.BoundedSemaphore(_FSRCNN_CONCURRENCY)
+_UPSCALE_CONCURRENCY = env_int("CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY", 64, 1, 512)
+_FSRCNN_CONCURRENCY = env_int("CHATGPT2API_FSRCNN_CONCURRENCY", 64, 1, 512)
 _FSRCNN_MODELS = LifoQueue(maxsize=_FSRCNN_CONCURRENCY)
 _FSRCNN_INIT_LOCK = threading.Lock()
 _FSRCNN_RUNTIME_READY = False
@@ -38,31 +36,46 @@ _MAX_TARGET_DIMENSION = 8192
 
 
 def image_upscale_snapshot() -> dict[str, int]:
-    limit = _FSRCNN_CONCURRENCY if config.image_upscale_engine == "fsrcnn_x2" else _UPSCALE_CONCURRENCY
+    limit = config.image_upscale_concurrency
     with _UPSCALE_STATE_LOCK:
         return {"limit": limit, "active": _UPSCALE_ACTIVE, "waiting": _UPSCALE_WAITING}
 
 
 class _UpscaleSlot:
-    def __init__(self, slots: threading.BoundedSemaphore = _UPSCALE_SLOTS) -> None:
-        self._slots = slots
+    """Dynamic per-replica gate controlled by the system settings page."""
+
+    def __init__(self) -> None:
+        self._started = 0.0
+        self._acquired = False
 
     def __enter__(self) -> int:
         global _UPSCALE_ACTIVE, _UPSCALE_WAITING
-        started = time.perf_counter()
+        self._started = time.perf_counter()
         with _UPSCALE_STATE_LOCK:
             _UPSCALE_WAITING += 1
-        self._slots.acquire()
-        with _UPSCALE_STATE_LOCK:
-            _UPSCALE_WAITING -= 1
-            _UPSCALE_ACTIVE += 1
-        return int((time.perf_counter() - started) * 1000)
+        try:
+            while True:
+                limit = config.image_upscale_concurrency
+                with _UPSCALE_STATE_LOCK:
+                    if _UPSCALE_ACTIVE < limit:
+                        _UPSCALE_WAITING -= 1
+                        _UPSCALE_ACTIVE += 1
+                        self._acquired = True
+                        break
+                time.sleep(0.05)
+        except BaseException:
+            with _UPSCALE_STATE_LOCK:
+                if not self._acquired:
+                    _UPSCALE_WAITING -= 1
+            raise
+        return int((time.perf_counter() - self._started) * 1000)
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         global _UPSCALE_ACTIVE
+        if not self._acquired:
+            return
         with _UPSCALE_STATE_LOCK:
             _UPSCALE_ACTIVE -= 1
-        self._slots.release()
 
 
 def _target_size(value: object) -> tuple[int, int] | None:
@@ -197,8 +210,7 @@ def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
         return image_data
 
     engine = config.image_upscale_engine
-    slots = _FSRCNN_SLOTS if engine == "fsrcnn_x2" else _UPSCALE_SLOTS
-    with _UpscaleSlot(slots) as queue_ms:
+    with _UpscaleSlot() as queue_ms:
         upscale_started = time.perf_counter()
         try:
             if engine == "sharp_lanczos3":

@@ -44,6 +44,9 @@ NUMERIC_SETTING_SPECS = MappingProxyType({
         kind="float",
     ),
     "image_account_concurrency": NumericSettingSpec(1, 1, 3),
+    # Per API replica. This is a post-processing gate and does not reduce the
+    # upstream image generation worker pool.
+    "image_upscale_concurrency": NumericSettingSpec(64, 1, 512),
     "account_processing_concurrency": NumericSettingSpec(30, 1, 100),
     "account_import_concurrency": NumericSettingSpec(30, 1, 100),
     "account_quota_sync_concurrency": NumericSettingSpec(20, 1, 100),

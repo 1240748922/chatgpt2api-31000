@@ -222,11 +222,11 @@ CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 
 这项扫描只在 `app0` 的生命周期维护线程运行，8 个实例不会重复扫描同一批账号。生图请求仍优先使用已确认有额度的账号，其次使用近期成功过的未知账号，最后才尝试冷的未知账号。
 
-无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，默认每个 API 实例并发为 8；放大失败会返回原图，不会让生图请求失败。可通过以下变量调整独立的超分并发：
+无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，系统设置中的“超分并发数”默认每个 API 实例为 64，最大 512；保存后动态生效。放大失败会返回原图，不会让生图请求失败。也可通过以下变量提供未保存设置时的默认值：
 
 ```env
-CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY=8
-CHATGPT2API_FSRCNN_CONCURRENCY=8
+CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY=64
+CHATGPT2API_FSRCNN_CONCURRENCY=64
 ```
 
 如需调整门槛，在服务器 `.env` 中设置：
@@ -563,12 +563,12 @@ CHATGPT2API_MAINTENANCE_RETRY_SECONDS=30
 CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY=2
 CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 CHATGPT2API_UPLOAD_COOLDOWN_SECONDS=900
-CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY=8
-CHATGPT2API_FSRCNN_CONCURRENCY=8
+CHATGPT2API_IMAGE_UPSCALE_CONCURRENCY=64
+CHATGPT2API_FSRCNN_CONCURRENCY=64
 CHATGPT2API_FSRCNN_THREADS=1
 ```
 
-FSRCNN 的并发数是每实例可同时处理的任务数，线程数是 OpenCV 的计算线程设置。8 个实例各并发 8 不代表服务器就能无代价地同时超分 64 张大图，应结合 CPU 和内存监控评估；如果 CPU 长时间接近满载，可在 `.env` 中将两个并发值改为 4 或 6。
+超分并发数是每实例可同时处理的任务数，线程数是 OpenCV 的计算线程设置。8 个实例各并发 64 允许最多 512 个超分任务进入处理，但不代表 CPU 可以无代价地同时计算 512 张大图；应结合实时监控中的“活跃/排队”以及服务器 CPU、内存评估。系统设置保存的数量优先于 `.env` 默认值；如果 CPU 长时间满载，直接在系统设置中调低即可。
 
 ### 上传受限与生图限流
 

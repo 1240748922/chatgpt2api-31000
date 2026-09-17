@@ -1,5 +1,22 @@
 # 生图链路性能审查
 
+## 2026-09-17：恢复日志详情、删除预览和超分耗时拆分
+
+- **日志详情 HTTP 500 已复现**：上一版在时间线视图增加 `postprocess`，却遗漏 `RequestTimelineCategory` / `RequestTimelineLegendCategory` 的响应模型定义。只要详情包含时间线图例，即使没有超分也可能校验失败；列表不使用这份详情模型，因此列表正常而详情失败。补齐分类后，隔离 SQLite 保存 → 列表读取 → 详情接口响应校验 → 浏览器详情抽屉全流程通过，旧日志无需迁移。
+- **补充真正的 API 回归**：原测试仅验证时间线构造函数，未验证 FastAPI 的响应序列化。本次覆盖有/无后处理的已保存日志、不存在的日志、全部时间线分类及实时监控详情，防止再次漏改接口契约。
+- **账号删除预览**：账号管理的异常/没额度删除操作及设置保存后的清理提示共用分页预览，展示账号、状态、剩余额度，默认每页 50 条。接口投影仅处理当前页，不进行上游额度查询，不返回 AT/RT/Cookie；未知额度显示“未知”，不会因未知而进入没额度清理。取消不删除，确认仍按当前清理条件重新筛选；确认范围是全部符合条件的账号，不仅本页。
+- **超分计时**：保留 `upscale_ms` 总耗时，增加 `upscale_queue_ms` 和 `upscale_exec_ms`；处理耗时包含编码及引擎回退。`postprocess_ms` 用作时间线总段，不能与超分子项再次相加。使用合成的 31 秒上游 + 200 秒排队 + 5 秒计算/回退 + 2 秒保存，验证详情显示总计 238 秒且没有重复统计。此合成数据不是用户服务器性能测量。
+- 浏览器冷启动还发现头部脚本在 `body` 尚未创建时读取 `classList` 的错误，已增加保护。没有修改生图或超分并发数量，也没有缩短上游超时以伪装性能改善。
+
+新版本能恢复查看历史日志；新增超分细分仅对新请求有效。用户截图中的多次尝试已占据分钟级时间，需要从恢复后的实际请求详情继续区分上游生成/轮询、账号等待、超分排队与计算；本次没有取得服务器原始详情，因此不把高延迟归因于超分，也不声称云端长尾已解决。
+
+复现（仓库根目录，Linux）：
+
+```bash
+PYTHONPATH="$PWD/src_extract:$PWD/GPT-Register-Tool-main" python -m pytest -q src_extract/tests/test_log_detail_api.py src_extract/tests/test_image_postprocess_diagnostics.py src_extract/tests/test_account_cleanup_actions.py
+node src_extract/tests/test_web_runtime.cjs
+```
+
 ## 2026-09-17：上传 429 重试和跨实例账号可见性
 
 本次离线回放确认并修复了以下问题：

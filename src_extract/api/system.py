@@ -131,6 +131,8 @@ class AccountCleanupRequest(BaseModel):
     auto_remove_invalid_accounts: bool | None = None
     auto_remove_rate_limited_accounts: bool | None = None
     remove_quota_exhausted: bool | None = None
+    preview_limit: int = Field(default=50, ge=1, le=200)
+    preview_offset: int = Field(default=0, ge=0)
 
 
 def _clean_text(value: object) -> str:
@@ -170,7 +172,9 @@ def _account_cleanup_payload(body: AccountCleanupRequest | None = None, *, dry_r
         "remove_quota_exhausted": body.remove_quota_exhausted,
     }
     if dry_run:
-        return account_service.preview_auto_remove_accounts(**kwargs)
+        return account_service.preview_auto_remove_accounts(
+            **kwargs, limit=body.preview_limit, offset=body.preview_offset,
+        )
     return account_service.cleanup_auto_remove_accounts(**kwargs)
 
 

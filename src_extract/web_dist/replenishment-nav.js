@@ -522,6 +522,7 @@
     return window.location.hash.includes("/settings") && window.location.hash.includes("tab=replenishment");
   }
   function syncShellTitle() {
+    if (!document.body) return; // This script is also loaded from <head>.
     const title = document.querySelector(".shell-header p.truncate");
     const settingsLink = [...document.querySelectorAll("#app-sidebar-navigation a")].find((link) => /#\/settings$/.test(link.getAttribute("href") || ""));
     if (settingsLink) settingsLink.setAttribute("data-register-settings-link", "true");

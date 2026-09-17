@@ -80,8 +80,49 @@ async function testLogPolling() {
   assert(dot.className.includes('error'));
 }
 
+function testShellTitleBeforeBodyExists() {
+  const source = fs.readFileSync(path.join(assets, 'replenishment-nav.js'), 'utf8');
+  const start = source.indexOf('  function syncShellTitle()');
+  const end = source.indexOf('  const titleObserver', start);
+  assert(start >= 0 && end > start);
+  const context = {document: {body: null}};
+  vm.createContext(context);
+  vm.runInContext(source.slice(start, end) + ';syncShellTitle();', context);
+}
+
+async function testCleanupActionRequiresPreviewConfirmation() {
+  const source = fs.readFileSync(path.join(assets, 'assets/Accounts-CQrrBRkk.js'), 'utf8');
+  const start = source.indexOf('async function v(u){const payload=u===');
+  const end = source.indexOf('function m(u){', start);
+  assert(start >= 0 && end > start);
+  let confirmed = false, calls = 0, refreshed = 0;
+  const options = [];
+  const context = {
+    confirmAccountCleanup: async ({loadPreview, options: payload}) => {
+      options.push(payload); await loadPreview(payload); return confirmed;
+    },
+    Q: {previewAccountCleanup: async () => ({items: []}), runAccountCleanup: async () => {calls++; return {total_removed: 2};}},
+    toast: {success: () => {}},
+    e: {loadData: async () => {refreshed++;}, setError: (_, error) => {throw error;}},
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(start, end), context);
+  await context.v('cleanup-invalid');
+  assert.equal(calls, 0, 'cancel does not delete');
+  confirmed = true;
+  await context.v('cleanup-quota');
+  assert.equal(calls, 1);
+  assert.equal(refreshed, 1);
+  assert.equal(options[1].remove_quota_exhausted, true);
+  assert.equal(options[1].auto_remove_invalid_accounts, false);
+  assert(fs.readFileSync(path.join(assets, 'assets/Settings-CYv60EF8.js'), 'utf8')
+    .includes('initialPreview:L,loadPreview:opts=>re.previewAccountCleanup(opts)'));
+}
+
 (async () => {
   await testAuthentication();
   await testLogPolling();
-  console.log('PASS: auth identity, shared requests, log polling, launch logs and scroll retention');
+  testShellTitleBeforeBodyExists();
+  await testCleanupActionRequiresPreviewConfirmation();
+  console.log('PASS: auth, log polling, scroll retention, early page load and cleanup confirmation');
 })().catch(error => {console.error(error); process.exitCode = 1;});

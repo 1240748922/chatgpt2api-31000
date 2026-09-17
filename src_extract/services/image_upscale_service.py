@@ -199,7 +199,11 @@ def _fsrcnn_x2(image_data: bytes, target: tuple[int, int]) -> bytes:
     return output.tobytes()
 
 
-def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
+def upscale_image_if_needed(
+    image_data: bytes, requested_size: object, *, timings: dict[str, int] | None = None,
+) -> bytes:
+    if timings is not None:
+        timings.update(upscale_queue_ms=0, upscale_exec_ms=0)
     if not image_data or not config.image_upscale_enabled:
         return image_data
     target = _target_size(requested_size)
@@ -211,6 +215,8 @@ def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
 
     engine = config.image_upscale_engine
     with _UpscaleSlot() as queue_ms:
+        if timings is not None:
+            timings["upscale_queue_ms"] = queue_ms
         upscale_started = time.perf_counter()
         try:
             if engine == "sharp_lanczos3":
@@ -251,3 +257,6 @@ def upscale_image_if_needed(image_data: bytes, requested_size: object) -> bytes:
                 "error": diagnostic_excerpt(exc, 500),
             })
             return image_data
+        finally:
+            if timings is not None:
+                timings["upscale_exec_ms"] = max(0, int((time.perf_counter() - upscale_started) * 1000))

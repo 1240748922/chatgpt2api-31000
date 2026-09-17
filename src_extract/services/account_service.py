@@ -2700,6 +2700,7 @@ class AccountService:
             for item in self._accounts.values()
             if remove_quota_exhausted
                and item.get("status") != "禁用"
+               and (not remove_invalid or item.get("status") != "异常")
                and (not remove_rate_limited or item.get("status") != "限流")
                and not bool(item.get("image_quota_unknown"))
                and int(item.get("quota") or 0) <= 0
@@ -2713,6 +2714,8 @@ class AccountService:
         remove_invalid: bool | None = None,
         remove_rate_limited: bool | None = None,
         remove_quota_exhausted: bool | None = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
         self._refresh_accounts_snapshot_if_stale()
         remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
@@ -2722,12 +2725,36 @@ class AccountService:
             else bool(remove_rate_limited)
         )
         remove_quota_exhausted = bool(remove_quota_exhausted)
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
         with self._lock:
             invalid_tokens, rate_limited_tokens, quota_exhausted_tokens = self._auto_remove_tokens_locked(
                 remove_invalid=remove_invalid,
                 remove_rate_limited=remove_rate_limited,
                 remove_quota_exhausted=remove_quota_exhausted,
             )
+            targets = [*invalid_tokens, *rate_limited_tokens, *quota_exhausted_tokens]
+            page_accounts = [dict(self._accounts[token]) for token in targets[offset:offset + limit]]
+        # Project only this page outside the account lock. Never return AT/RT,
+        # cookies or raw auth diagnostics in a deletion preview.
+        from services.account_view import account_row
+        items = []
+        for account in page_accounts:
+            row = account_row(
+                account,
+                available=self._is_image_account_available(account),
+                unlimited_quota=self._is_unlimited_image_quota_account(account),
+            )
+            items.append({
+                "id": row["id"] or self._management_id_for_token(account["access_token"]),
+                "email": row["email"],
+                "status": row["backend_status"],
+                "status_label": row["status_label"],
+                "quota": row["quota_remaining"],
+                "quota_label": row["quota_label"],
+                "quota_unknown": row["quota_unknown"],
+                "file_upload_limited": row["file_upload_limited"],
+            })
         invalid = len(invalid_tokens)
         rate_limited = len(rate_limited_tokens)
         quota_exhausted = len(quota_exhausted_tokens)
@@ -2737,6 +2764,10 @@ class AccountService:
             "rate_limited": rate_limited,
             "quota_exhausted": quota_exhausted,
             "total_removed": invalid + rate_limited + quota_exhausted,
+            "items": items,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(items) < len(targets),
             "auto_remove_invalid_accounts": remove_invalid,
             "auto_remove_rate_limited_accounts": remove_rate_limited,
             "remove_quota_exhausted": remove_quota_exhausted,

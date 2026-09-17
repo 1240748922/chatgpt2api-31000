@@ -522,6 +522,8 @@ def format_image_result(
     image_urls: list[str] = []
     processing_metrics = {
         "upscale_ms": 0,
+        "upscale_queue_ms": 0,
+        "upscale_exec_ms": 0,
         "storage_ms": 0,
         "postprocess_ms": 0,
     }
@@ -533,14 +535,18 @@ def format_image_result(
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
         upscale_started = time.perf_counter()
-        image_bytes = upscale_image_if_needed(image_bytes, requested_size)
+        upscale_timings: dict[str, int] = {}
+        image_bytes = upscale_image_if_needed(image_bytes, requested_size, timings=upscale_timings)
         upscale_ms = _elapsed_ms(upscale_started)
         processing_metrics["upscale_ms"] += upscale_ms
+        for key, value in upscale_timings.items():
+            processing_metrics[key] += value
         if monitor_request is not None and monitor_request.trace_image_perf:
             _monitor_image_stage(
                 monitor_request,
                 "image_upscale",
                 upscale_ms=upscale_ms,
+                **upscale_timings,
                 index=index,
                 total=total,
             )

@@ -221,6 +221,9 @@ stubbed; selection, slot leasing, token rotation and database CAS are real.
     from services.protocol import conversation as protocol
 
     reader, writer = databases
+    # Keep exercising the legacy full-collection CAS/reload fallback here;
+    # targeted credential CAS has separate continuous-write regressions.
+    monkeypatch.setattr(reader, "mutate_accounts_checked", None, raising=False)
     reader.replace_accounts([{
         "access_token": "old-test-token", "refresh_token": "test-refresh",
         "status": "正常", "quota": 8, "image_quota_unknown": False,

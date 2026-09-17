@@ -1,5 +1,23 @@
 # 生图链路性能审查
 
+## 2026-09-18：账号写入版本冲突在取号阶段提前返回 503
+
+日志 `303b8cbe506f4545` 用时 31.425 秒，尚无生图尝试，原始错误为 `stale accounts storage revision: expected 'accounts:305817', actual 'accounts:305818'`。这与上一版修复的快照读取异常不同：读取成功后，保存账号时的全池版本校验仍会被其他账号的更新打断。
+
+- **复现路径**：取号 → token 刷新 → 保存新 token → 其他实例更新另一个账号 → 全池 CAS 冲突。旧实现内部最多尝试 12 次，每次冲突还会重新读取和合并全量账号；最终异常未被取号恢复分支处理，被外层包装为 `no_available_account`。这些是存储层重试，不是已经向上游提交过的生图尝试，所以日志的 `image_attempts` 仍为空。
+- **写入修复**：token 更新和刷新错误记录只保存当前账号涉及的 AT 行，token 轮换同时保护旧 AT 和新 AT。数据库在同一写事务内比较这些行的真实内容，并原子写入；其他账号的额度更新、导入或删除不再使本次保存失败。确实改到了同一个账号时仍重新读取、合并并校验凭证代际；远程删除、新凭证和已占用的目标 AT 不会被旧刷新覆盖。其他管理操作的全池 CAS 规则不变。
+- **保持缓存正确性**：单账号写入回执的版本不能当作完整账号快照版本，不会隐藏其他实例的新导入；也不会把别的账号尚未落库的额度变化当成已经保存。真正冲突后的重试使用原始 JSON 基线，避免缺少默认字段的历史账号反复触发无效冲突。
+- **取号恢复**：残余写入冲突会释放当前账号槽位、排除本次已尝试候选并继续取号，容器日志记录 `image_account_selection_retry / account_write_conflict`。不将账号标记为失效，不消耗上游生图错误重试次数；仍遵守请求截止时间和候选去重，不无限循环，也不绕过额度/上传冷却。
+- **验证**：旧版在持续无关写入的确定性回放中抛出同型异常；新版一次定向写入、零次全量快照重载即可返回模拟图片结果。17 项新增回归覆盖真实 SQLite/WAL 事务、同账号额度合并、远程删除/凭证更换/目标冲突、历史 JSON 默认字段、原子批量回滚、未持久化状态隔离、换候选恢复和截止时间。完整 158 项 Python 测试、前端运行检查及 Compose 配置检查通过。
+
+本次没有修改数据格式、生图或超分并发，也没有缩短超时或自动注册账号。上游响应使用模拟数据，未连接用户服务器或执行 PostgreSQL 实机压测；不能据此声称所有取号延迟或网络超时都已消除。
+
+复现（仓库根目录，Linux）：
+
+```bash
+PYTHONPATH="$PWD/src_extract:$PWD/GPT-Register-Tool-main" python -m pytest -q src_extract/tests/test_account_write_contention.py src_extract/tests/test_database_snapshot_concurrency.py src_extract/tests/test_image_pool_refresh.py
+```
+
 ## 2026-09-18：账号快照并发读取导致的假空池 503
 
 日志 `75c640a4fe53498b` 在取号阶段耗时 5.179 秒后失败，`image_attempts=[]`，原始错误为 `accounts changed repeatedly while loading its snapshot`。这不是已确认的账号额度耗尽或上游生图失败，而是本地数据库快照读取失败，被生图入口的 `RuntimeError` 分支包装成 `no_available_account`。

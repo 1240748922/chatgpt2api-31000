@@ -844,19 +844,37 @@ class AccountService:
         *,
         expected_credential_generation: _CredentialGeneration | None = None,
         conflict_existing_tokens: set[str] | None = None,
+        account_tokens: set[str] | None = None,
     ) -> bool:
         last_conflict: StorageRevisionConflictError | None = None
+        checked_writer = (
+            getattr(self.storage, "mutate_accounts_checked", None)
+            if account_tokens is not None else None
+        )
+        # A reload may normalize legacy JSON without immediately persisting
+        # those defaults. Keep the exact raw baseline for the next row CAS.
+        checked_baselines: dict[str, dict] | None = None
         for attempt in range(self._STORAGE_MUTATION_MAX_ATTEMPTS):
+            baseline = self._persisted_accounts
+            desired = self._accounts
+            if account_tokens is not None:
+                baseline = {key: baseline[key] for key in account_tokens if key in baseline}
+                desired = {key: desired[key] for key in account_tokens if key in desired}
             mutation = self._account_mutation(
-                self._persisted_accounts,
-                self._accounts,
+                baseline,
+                desired,
                 self._accounts_revision,
             )
             if not mutation.upserts and not mutation.delete_keys:
                 self._prune_token_aliases_locked()
                 return True
             try:
-                result = self.storage.mutate_accounts(mutation)
+                if callable(checked_writer):
+                    source = checked_baselines if checked_baselines is not None else baseline
+                    keys = {*(item["access_token"] for item in mutation.upserts), *mutation.delete_keys}
+                    result = checked_writer(mutation, expected_items={key: source.get(key) for key in keys})
+                else:
+                    result = self.storage.mutate_accounts(mutation)
             except StorageRevisionConflictError as exc:
                 last_conflict = exc
                 if attempt + 1 >= self._STORAGE_MUTATION_MAX_ATTEMPTS:
@@ -865,6 +883,12 @@ class AccountService:
                 time.sleep(min(0.5, 0.02 * (2 ** min(attempt, 4)) + random.uniform(0.0, 0.04)))
                 try:
                     snapshot = self.storage.load_accounts_snapshot()
+                    if callable(checked_writer):
+                        checked_baselines = {
+                            str(item["access_token"]): item
+                            for item in snapshot.items
+                            if isinstance(item, dict) and item.get("access_token") in account_tokens
+                        }
                     remote, _ = self._normalize_loaded_accounts(
                         snapshot.items,
                         recover_interrupted_checks=False,
@@ -878,8 +902,13 @@ class AccountService:
                     if expected_credential_generation is not None:
                         expected_access_token = expected_credential_generation[0]
                         remote_account = remote.get(expected_access_token)
+                        local_rotation = self._rotated_account_token(
+                            self._accounts, self._persisted_accounts, expected_access_token,
+                            self._persisted_accounts.get(expected_access_token) or {},
+                        )
                         if (
                             remote_account is None
+                            or (local_rotation is not None and local_rotation in remote)
                             or self._credential_generation(
                                 expected_access_token,
                                 remote_account,
@@ -909,9 +938,19 @@ class AccountService:
             except Exception:
                 self._restore_accounts_after_save_error()
                 raise
-            self._persisted_accounts = deepcopy(self._accounts)
-            self._accounts_revision = result.revision
-            self._account_snapshot_checked_at = time.monotonic()
+            if account_tokens is None:
+                self._persisted_accounts = deepcopy(self._accounts)
+                self._accounts_revision = result.revision
+                self._account_snapshot_checked_at = time.monotonic()
+            else:
+                for key in account_tokens:
+                    if key in self._accounts:
+                        self._persisted_accounts[key] = deepcopy(self._accounts[key])
+                    else:
+                        self._persisted_accounts.pop(key, None)
+                # A targeted save has not loaded other replicas' imports or
+                # state changes. Keep the previous collection revision/TTL,
+                # and do not acknowledge other locally pending image results.
             self._prune_token_aliases_locked()
             return True
         assert last_conflict is not None
@@ -1370,6 +1409,7 @@ class AccountService:
             self._accounts[resolved] = account
             saved = self._save_accounts(
                 expected_credential_generation=expected_generation,
+                account_tokens={resolved} if expected_generation is not None else None,
             )
             if not saved:
                 return False
@@ -1631,10 +1671,13 @@ class AccountService:
             self._accounts[new_token] = account
             saved = self._save_accounts(
                 expected_credential_generation=expected_generation,
+                account_tokens={old_token, new_token},
             )
             final_token = (
                 new_token
-                if new_token in self._accounts
+                if new_token in self._accounts and (
+                    self._accounts[new_token].get("management_id") == current.get("management_id")
+                )
                 else next(
                     (
                         token
@@ -2363,13 +2406,20 @@ class AccountService:
                         "image request deadline exceeded during token maintenance",
                     )
                 return active_token
-            except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError, TimeoutError):
+            except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
+                    TimeoutError, StorageRevisionConflictError) as exc:
                 # A stale/expired credential must not turn a large healthy pool
                 # into a customer-visible no_available_account. Release this
                 # lease, exclude the account for this request, and immediately
                 # obtain another candidate while the request deadline remains.
                 self.release_image_slot(access_token)
                 attempted_tokens.add(access_token)
+                if isinstance(exc, StorageRevisionConflictError):
+                    logger.warning({
+                        "event": "image_account_selection_retry",
+                        "reason": "account_write_conflict",
+                        "excluded_count": len(attempted_tokens),
+                    })
                 if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                     raise ImageAccountSelectionError(
                         "deadline_exceeded",

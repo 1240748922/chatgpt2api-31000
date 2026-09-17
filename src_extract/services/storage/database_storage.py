@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy import Column, Integer, String, Text, select, text, true
 from sqlalchemy.exc import IntegrityError, NoResultFound
@@ -253,6 +253,8 @@ class DatabaseStorageBackend(StorageBackend):
         self,
         collection: StorageCollection,
         mutation: StorageMutation,
+        *,
+        expected_items: Mapping[str, dict[str, Any] | None] | None = None,
     ) -> StorageMutationResult:
         upserts, delete_keys = normalize_mutation(collection, mutation)
         model, model_key = self._spec(collection)
@@ -261,23 +263,47 @@ class DatabaseStorageBackend(StorageBackend):
             *(item_key(collection, item) for item in upserts),
             *delete_keys,
         }
+        if expected_items is not None:
+            if set(expected_items) != target_keys:
+                raise ValueError("checked mutation requires a baseline for every affected key")
+            for key, item in expected_items.items():
+                if item is not None and item_key(collection, item) != key:
+                    raise ValueError("checked mutation baseline identity mismatch")
 
         session = self.Session()
         try:
             self._begin_write(session)
             revision_row = self._locked_revision(session, collection)
             current_revision = self._revision_value(collection, revision_row.version)
-            self._check_revision(
-                collection,
-                mutation.expected_revision,
-                current_revision,
-            )
+            if expected_items is None:
+                self._check_revision(
+                    collection,
+                    mutation.expected_revision,
+                    current_revision,
+                )
             rows = (
                 session.query(model).filter(key_column.in_(target_keys)).all()
                 if target_keys
                 else []
             )
             existing = {str(getattr(row, model_key)): row for row in rows}
+            if expected_items is not None:
+                # Guard the actual rows being changed, under the same writer
+                # transaction/lock as every other mutation. An unrelated quota
+                # update/import must not invalidate a credential save. Missing
+                # keys are explicit expectations too, protecting token rotation
+                # from clobbering an existing destination or resurrecting a
+                # remotely deleted account.
+                for key, expected in expected_items.items():
+                    row = existing.get(key)
+                    matches = (
+                        row is None if expected is None
+                        else row is not None and self._deserialize(row.data) == expected
+                    )
+                    if not matches:
+                        raise StorageRevisionConflictError(
+                            collection, mutation.expected_revision or "checked rows", current_revision,
+                        )
             inserted = 0
             updated = 0
             deleted = 0
@@ -316,6 +342,20 @@ class DatabaseStorageBackend(StorageBackend):
 
     def mutate_accounts(self, mutation: StorageMutation) -> StorageMutationResult:
         return self._mutate("accounts", mutation)
+
+    def mutate_accounts_checked(
+        self,
+        mutation: StorageMutation,
+        *,
+        expected_items: Mapping[str, dict[str, Any] | None],
+    ) -> StorageMutationResult:
+        """CAS on affected account rows instead of the whole collection revision.
+
+        The returned revision is a write receipt, NOT a full account snapshot.
+        Callers must not advance a cached collection revision from this result.
+        Unconditional writes and full-collection CAS retain their old semantics.
+        """
+        return self._mutate("accounts", mutation, expected_items=expected_items)
 
     def mutate_auth_keys(self, mutation: StorageMutation) -> StorageMutationResult:
         return self._mutate("auth_keys", mutation)

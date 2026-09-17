@@ -20,7 +20,7 @@ from sqlalchemy import make_url
 
 from services.application_database import database_backend_name
 from services.config import DATA_DIR, config
-from services.image_storage_service import IMAGE_INDEX_FILE
+from services.image_storage_service import image_storage_service
 from services.image_tags_service import TAGS_FILE
 from services.storage.coordination_repository import BackupExecutionStateRepository
 
@@ -522,7 +522,7 @@ class BackupService:
             )
             if include.get("image_tasks"):
                 self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
-                self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+                self._add_bytes_to_archive(archive, "data/image_index.json", _json_bytes(image_storage_service.export_index()))
             if include.get("editable_files"):
                 self._add_directory_to_archive(archive, DATA_DIR / "files", "data/files")
             if include.get("images"):

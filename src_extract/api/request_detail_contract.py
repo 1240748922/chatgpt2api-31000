@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 RequestPresentationTone = Literal["success", "danger", "warning", "info", "muted"]
 RequestTimelineTone = Literal["info", "warning", "danger"]
-RequestTimelineCategory = Literal["entry", "prepare", "upstream", "resolve", "download", "postprocess"]
+RequestTimelineCategory = Literal["entry", "prepare", "upstream", "resolve", "download", "postprocess", "untracked"]
 RequestTimelineLegendCategory = Literal[
     "entry",
     "prepare",
@@ -15,6 +15,7 @@ RequestTimelineLegendCategory = Literal[
     "resolve",
     "download",
     "postprocess",
+    "untracked",
     "state",
 ]
 

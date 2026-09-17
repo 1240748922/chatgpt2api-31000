@@ -370,14 +370,17 @@ def save_image_bytes(
         base_url: str | None = None,
         *,
         deadline_monotonic: float | None = None,
+        timings: dict[str, int] | None = None,
 ) -> str:
     last_error: Exception | None = None
     for attempt in range(2):
+        attempt_timings: dict[str, int] = {}
         try:
             return image_storage_service.save(
                 image_data,
                 base_url,
                 deadline_monotonic=deadline_monotonic,
+                timings=attempt_timings,
             ).url
         except ImageFailureError as exc:
             if exc.failure.code == "task_interrupted":
@@ -385,13 +388,18 @@ def save_image_bytes(
             last_error = exc
         except Exception as exc:
             last_error = exc
+        finally:
+            if timings is not None:
+                for key, value in attempt_timings.items():
+                    timings[key] = timings.get(key, 0) + value
         logger.warning({
             "event": "image_result_storage_retry" if attempt == 0 else "image_result_storage_failed",
             "attempt": attempt + 1,
             "error": diagnostic_excerpt(repr(last_error), 500),
         })
     raise ImageDownloadError(
-        f"image result storage failed: {diagnostic_excerpt(last_error, 500)}"
+        f"image result storage failed: {diagnostic_excerpt(last_error, 500)}",
+        failure=image_failure("image_storage_failed"),
     ) from last_error
 
 
@@ -551,21 +559,29 @@ def format_image_result(
                 total=total,
             )
         storage_started = time.perf_counter()
-        stored_url = save_image_bytes(
-            image_bytes,
-            base_url,
-            deadline_monotonic=deadline_monotonic,
-        )
-        storage_ms = _elapsed_ms(storage_started)
-        processing_metrics["storage_ms"] += storage_ms
-        if monitor_request is not None and monitor_request.trace_image_perf:
-            _monitor_image_stage(
-                monitor_request,
-                "image_storage",
-                storage_ms=storage_ms,
-                index=index,
-                total=total,
+        storage_timings: dict[str, int] = {}
+        storage_ok = False
+        try:
+            stored_url = save_image_bytes(
+                image_bytes,
+                base_url,
+                deadline_monotonic=deadline_monotonic,
+                timings=storage_timings,
             )
+            storage_ok = True
+        finally:
+            processing_metrics["storage_ms"] += _elapsed_ms(storage_started)
+            for key, value in storage_timings.items():
+                processing_metrics[key] = processing_metrics.get(key, 0) + value
+            processing_metrics["postprocess_ms"] = _elapsed_ms(postprocess_started)
+            if monitor_request is not None and monitor_request.trace_image_perf:
+                _monitor_image_stage(
+                    monitor_request,
+                    "image_storage" if storage_ok else "image_storage_failed",
+                    **processing_metrics,
+                    index=index,
+                    total=total,
+                )
         if stored_url:
             image_urls.append(stored_url)
         # Keep the local URL alongside the requested representation so clients
@@ -591,7 +607,7 @@ def format_image_result(
         result["_image_urls"] = image_urls
     if message and not data:
         result["message"] = message
-    if any(processing_metrics.values()):
+    if data or any(processing_metrics.values()):
         result["_image_processing_metrics"] = processing_metrics
     return result
 
@@ -2811,7 +2827,7 @@ def _generate_single_image(
                 False,
                 failure=failure,
                 error=image_error,
-                quota_consumed=(failure.code == "image_download_failed"),
+                quota_consumed=(failure.scope == "delivery"),
             )
             attach_attempts(image_error)
             if retry_with_different_account(failure, image_error):

@@ -19,6 +19,7 @@ from services.config import DATA_DIR, config
 from services.image_failure import ImageFailureError, image_failure
 from services.json_file import read_json_object, write_json_file
 from services.storage.file_lock import interprocess_lock
+from services.storage.image_index_journal import ImageIndexJournal, ImageIndexSnapshot, atomic_publish
 from utils.timezone import beijing_datetime_from_timestamp, beijing_now, beijing_now_str
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
@@ -236,6 +237,7 @@ class ImageStorageService:
         self._item_lock_dir = index_file.with_suffix(index_file.suffix + ".item-locks")
         self._sync_file_lock = index_file.with_suffix(index_file.suffix + ".sync.lock")
         self._remote_delete_file = index_file.with_suffix(index_file.suffix + ".remote-deletes.json")
+        self._journal = ImageIndexJournal(index_file)
 
     @contextmanager
     def _index_guard(self) -> Iterator[None]:
@@ -245,13 +247,24 @@ class ImageStorageService:
 
     def _item_lock_path(self, rel: str) -> Path:
         safe_rel = normalize_image_relative_path(rel)
-        stripe = hashlib.sha256(safe_rel.encode("utf-8")).hexdigest()[:2]
-        return self._item_lock_dir / f"{stripe}.lock"
+        digest = hashlib.sha256(safe_rel.encode("utf-8")).hexdigest()
+        # Unrelated assets must not queue behind a slow sync/delete on one of
+        # only 256 stripes. Never unlink live lock files (inode split-lock race).
+        return self._item_lock_dir / digest[:2] / f"{digest}.lock"
 
     @contextmanager
-    def _item_guard(self, rel: str) -> Iterator[None]:
-        with interprocess_lock(self._item_lock_path(rel)):
-            yield
+    def _item_guard(self, rel: str, *, timings: dict[str, int] | None = None) -> Iterator[None]:
+        started = time.perf_counter()
+        acquired = False
+        try:
+            with interprocess_lock(self._item_lock_path(rel)):
+                acquired = True
+                if timings is not None:
+                    timings["storage_lock_ms"] = int((time.perf_counter() - started) * 1000)
+                yield
+        finally:
+            if not acquired and timings is not None:
+                timings["storage_lock_ms"] = int((time.perf_counter() - started) * 1000)
 
     @contextmanager
     def _item_guards(self, rels: list[str] | dict[str, object]) -> Iterator[None]:
@@ -269,10 +282,7 @@ class ImageStorageService:
 
     def _load_index(self) -> dict[str, dict[str, object]]:
         raw = _read_json_object(self.index_file)
-        items = raw.get("items")
-        if not isinstance(items, dict):
-            return {}
-        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+        return self._journal.overlay(raw)
 
     def _load_clean_index(self) -> dict[str, dict[str, object]]:
         items = self._load_index()
@@ -287,10 +297,30 @@ class ImageStorageService:
             if "webdav" not in item and storage in {"webdav", "both"}:
                 item["webdav"] = True
             clean[rel] = item
-        return clean
+        return ImageIndexSnapshot(clean, pending_files=getattr(items, "pending_files", ()))
 
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
-        _write_json_object(self.index_file, {"items": items})
+        files = getattr(items, "pending_files", ())
+        _write_json_object(self.index_file, {
+            "items": items,
+            "journal_applied": [path.name for path in files],
+        })
+        self._journal.acknowledge(files)
+
+    def compact_index(self) -> int:
+        """Merge pending metadata before rollback or legacy JSON-only export."""
+        with self._index_guard():
+            items = self._load_clean_index()
+            count = len(items.pending_files)
+            if count:
+                self._save_index(items)
+            return count
+
+    def export_index(self) -> dict[str, object]:
+        # A backup must not copy an old JSON then race journal compaction while
+        # copying pending files. Capture one merged catalog under its lock.
+        with self._index_guard():
+            return {"items": dict(self._load_clean_index())}
 
     @staticmethod
     def _new_generation() -> str:
@@ -406,8 +436,9 @@ class ImageStorageService:
         )
 
     def make_relative_path(self, image_data: bytes) -> str:
-        file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        # Every save owns a fresh identity, even identical bytes in one second.
+        # This also makes immutable journal replay unambiguous.
+        filename = f"{int(time.time())}_{uuid4().hex}.png"
         now = beijing_now()
         relative_dir = Path(now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
@@ -418,10 +449,11 @@ class ImageStorageService:
         base_url: str | None = None,
         *,
         deadline_monotonic: float | None = None,
+        timings: dict[str, int] | None = None,
     ) -> StoredImage:
         _raise_if_save_deadline_elapsed(deadline_monotonic)
         rel = self.make_relative_path(image_data)
-        with self._item_guard(rel):
+        with self._item_guard(rel, timings=timings):
             # Once the physical mutation starts, finish the catalog commit so a
             # deadline cannot leave an unindexed local or remote asset behind.
             _raise_if_save_deadline_elapsed(deadline_monotonic)
@@ -434,17 +466,24 @@ class ImageStorageService:
 
             if mode in {"local", "both"}:
                 path = image_local_path(rel)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(image_data)
+                started = time.perf_counter()
+                try:
+                    atomic_publish(path, image_data)
+                finally:
+                    if timings is not None:
+                        timings["storage_write_ms"] = int((time.perf_counter() - started) * 1000)
                 stored_local = True
 
             if mode in {"webdav", "both"}:
                 client = WebDAVClient(self.settings())
+                started = time.perf_counter()
                 try:
                     remote_url = client.put(rel, image_data)
                     stored_webdav = True
                 finally:
                     client.session.close()
+                    if timings is not None:
+                        timings["storage_remote_ms"] = int((time.perf_counter() - started) * 1000)
 
             dimensions = _image_dimensions(image_data)
             item = {
@@ -462,14 +501,12 @@ class ImageStorageService:
             }
             if dimensions:
                 item["width"], item["height"] = dimensions
-            with self._index_guard():
-                items = self._load_clean_index()
-                items[rel] = item
-                self._save_index(items)
-                pending = self._load_remote_delete_pending()
-                if rel in pending:
-                    pending.pop(rel, None)
-                    self._save_remote_delete_pending(pending)
+            started = time.perf_counter()
+            try:
+                self._journal.publish(item)
+            finally:
+                if timings is not None:
+                    timings["storage_catalog_ms"] = int((time.perf_counter() - started) * 1000)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -544,7 +581,8 @@ class ImageStorageService:
         if not remote_rels:
             return existing
 
-        items = self._load_clean_index()
+        with self._index_guard():
+            items = self._load_clean_index()
         existing.update(
             safe_rel
             for safe_rel in remote_rels
@@ -779,7 +817,7 @@ class ImageStorageService:
                     "path": rel,
                     "url": self._public_url(rel, base_url),
                 })
-            if changed:
+            if changed or getattr(indexed, "pending_files", ()):
                 self._save_index(indexed)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items

@@ -24,7 +24,7 @@ def test_image_postprocess_metrics_include_upscale_and_storage(monkeypatch):
         monitor_attempt=1,
     )
     monkeypatch.setattr(conversation, "upscale_image_if_needed", lambda data, size, **kw: data + b"-upscaled")
-    monkeypatch.setattr(conversation, "save_image_bytes", lambda data, base_url, deadline_monotonic=None: "https://example.test/image.png")
+    monkeypatch.setattr(conversation, "save_image_bytes", lambda data, base_url, **kw: "https://example.test/image.png")
 
     result = conversation.format_image_result(
         [{"b64_json": base64.b64encode(b"image").decode("ascii")}],

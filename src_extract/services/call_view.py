@@ -38,6 +38,7 @@ _IMAGE_FAILURE_LABELS = {
     "no_image_generated": "未生成图片",
     "unsupported_model": "模型不支持生图",
     "image_download_failed": "图片下载失败",
+    "image_storage_failed": "图片保存失败",
     "task_interrupted": "图片任务被中断",
     "no_available_account": "暂无可用账号",
     "insufficient_quota": "图片额度不足",
@@ -473,6 +474,7 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
             timings,
             monitor.get("events"),
             image_count=1,
+            wall_duration_ms=duration_ms,
         ),
     }
     return summary
@@ -777,7 +779,7 @@ def build_call_detail(item: Mapping[str, Any]) -> dict[str, Any]:
     detail = _detail(item)
     monitor = _record(detail.get("monitor"))
     summary = build_call_summary(item)
-    attempts = [build_attempt_summary(value) for value in _attempt_items(item)]
+    attempts = [build_attempt_summary(value) for value in _restore_last_postprocess_metrics(item)]
     timings = call_timings_ms(item)
     image_urls = call_image_urls(item)
     return {
@@ -821,3 +823,31 @@ def build_call_detail(item: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "raw_detail": detail,
     }
+
+
+def _restore_last_postprocess_metrics(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Recover old omissions for a proven final attempt, never request maxima."""
+    from services.image_postprocess_metrics import POSTPROCESS_METRIC_LABELS
+
+    monitor = _record(_detail(item).get("monitor"))
+    endings = {}
+    for event in monitor.get("events") or []:
+        if isinstance(event, Mapping) and event.get("event") == "image_single_done" and event.get("status") == "success":
+            endings[_int(event.get("index"))] = _int(event.get("attempt"))
+    images = _record(monitor.get("images"))
+    result = []
+    for raw in _attempt_items(item):
+        value = dict(raw)
+        slot = _int(value.get("slot"))
+        image = _record(images.get(str(slot)))
+        if (value.get("status") == "success" and endings.get(slot) == _int(value.get("attempt"))
+                and image.get("stage") == "image_single_done" and image.get("status") == "success"):
+            attempt_monitor = dict(_record(value.get("monitor")))
+            metrics = dict(_record(attempt_monitor.get("metrics")))
+            for key, metric in _record(image.get("metrics")).items():
+                if key in POSTPROCESS_METRIC_LABELS and key not in metrics:
+                    metrics[key] = metric
+            attempt_monitor["metrics"] = metrics
+            value["monitor"] = attempt_monitor
+        result.append(value)
+    return result

@@ -46,6 +46,10 @@ class ImageFailure:
 
     @property
     def switch_account(self) -> bool:
+        if self.code == "image_storage_failed":
+            # The bytes already exist; a different account cannot fix our disk
+            # or catalog. Delivery retries reuse those bytes instead.
+            return False
         # Both upload throttles and confirmed image quota exhaustion are
         # account-local. A request can succeed immediately with another
         # account, so these failures must enter the cross-account retry loop.
@@ -143,6 +147,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
         "request", None, False, 400, "invalid_request_error",
     ),
     "image_download_failed": FailurePolicy(
+        "delivery", None, False, 502, "server_error",
+    ),
+    "image_storage_failed": FailurePolicy(
         "delivery", None, False, 502, "server_error",
     ),
     "task_interrupted": FailurePolicy(
@@ -522,7 +529,7 @@ def _failure_priority(code: str) -> int:
         return 7
     if normalized in {"file_upload_throttled", "upstream_rate_limited"}:
         return 6
-    if normalized == "image_download_failed":
+    if normalized in {"image_download_failed", "image_storage_failed"}:
         return 5
     if normalized in TEXT_REVIEW_FAILURE_CODES and normalized != "upstream_text_reply":
         return 4

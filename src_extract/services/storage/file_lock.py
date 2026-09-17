@@ -6,10 +6,11 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Iterator
+from weakref import WeakValueDictionary
 
 
 _LOCKS_GUARD = threading.Lock()
-_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_LOCKS = WeakValueDictionary()
 
 
 def _process_lock(path: Path) -> threading.Lock:

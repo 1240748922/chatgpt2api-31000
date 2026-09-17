@@ -128,3 +128,11 @@ def test_retry_toggle_and_request_level_failures_remain_terminal(retry_flow, cod
         retry_flow.run([code, None])
     assert len(retry_flow.selected) == 1
     assert retry_flow.service._image_inflight == {}
+
+
+def test_local_storage_failure_does_not_regenerate_on_another_account(retry_flow):
+    with pytest.raises(ImageGenerationError) as caught:
+        retry_flow.run(["image_storage_failed", None])
+    assert caught.value.failure.code == "image_storage_failed"
+    assert len(retry_flow.selected) == 1
+    assert retry_flow.service._image_inflight == {}

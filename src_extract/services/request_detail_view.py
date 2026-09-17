@@ -12,6 +12,7 @@ _TIMELINE_CATEGORIES = (
     ("resolve", "结果处理"),
     ("download", "图片下载"),
     ("postprocess", "图片后处理"),
+    ("untracked", "其他 / 未细分"),
 )
 
 _TIMELINE_STEPS = (
@@ -45,7 +46,12 @@ _TIMELINE_STEPS = (
     ("upscale_queue_ms", "超分排队", "postprocess", "等待本实例超分处理槽位"),
     ("upscale_exec_ms", "超分处理", "postprocess", "超分计算、编码及可能的回退耗时"),
     ("storage_ms", "保存图片", "postprocess", "本地或远程图片存储"),
+    ("storage_lock_ms", "图片锁等待", "postprocess", "等待当前图片的读写互斥锁"),
+    ("storage_write_ms", "图片文件写入", "postprocess", "完整文件写入与原子发布"),
+    ("storage_remote_ms", "远程存储上传", "postprocess", "WebDAV 目录准备与上传"),
+    ("storage_catalog_ms", "图片索引提交", "postprocess", "持久化当前图片元数据，不重写全量索引"),
     ("postprocess_ms", "后处理总计", "postprocess", "超分与保存图片"),
+    ("untracked_ms", "其他 / 未细分耗时", "untracked", "总耗时减去不重复计算的已记录阶段；缺失的历史计时不能推定为超分"),
 )
 
 _TIMELINE_SEGMENTS = (
@@ -323,6 +329,7 @@ def build_request_timeline_presentation(
     *,
     image_count: int = 0,
     request_shape: object = None,
+    wall_duration_ms: int = 0,
 ) -> dict[str, Any]:
     phase_metrics = {
         "uploading": "upload_ms", "bootstrapping": "bootstrap_ms",
@@ -355,6 +362,15 @@ def build_request_timeline_presentation(
             "tone": tone,
         })
 
+    timings = dict(timings)
+    remaining = max(0, wall_duration_ms - sum(segment["value_ms"] for segment in segments))
+    if remaining:
+        timings["untracked_ms"] = remaining
+        segments.append({
+            "key": "untracked", "label": "其他 / 未细分", "category": "untracked",
+            "value_ms": remaining, "value_text": format_request_duration(remaining),
+            "tone": "warning" if remaining >= 1000 else "info",
+        })
     steps_by_category: dict[str, list[dict[str, Any]]] = {}
     for key, label, category, description in _TIMELINE_STEPS:
         value_ms = _int(timings.get(key))
@@ -515,6 +531,7 @@ def build_request_detail_core(
                 events,
                 image_count=image_count,
                 request_shape=request_shape,
+                wall_duration_ms=duration_ms,
             )
         ),
     }

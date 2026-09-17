@@ -7,6 +7,7 @@ from threading import Lock, active_count
 from typing import Any
 
 from services.call_view import build_call_summary
+from services.image_postprocess_metrics import POSTPROCESS_METRIC_LABELS
 from services.runtime_configuration import DEFAULT_THREAD_TOKENS, env_int
 from services.account_processing import account_processing_limiter
 from utils.timezone import beijing_from_timestamp, beijing_now_str
@@ -169,6 +170,10 @@ METRIC_LABELS = {
 }
 
 
+METRIC_LABELS.update(POSTPROCESS_METRIC_LABELS)
+STAGE_LABELS["image_storage_failed"] = "图片保存失败"
+
+
 class RealtimeMonitorService:
     def __init__(self) -> None:
         completed_limit = env_int("CHATGPT2API_MONITOR_COMPLETED_LIMIT", 500, 50, 5000)
@@ -248,7 +253,9 @@ class RealtimeMonitorService:
             record["stage_label"] = STAGE_LABELS.get(event, event)
             record["updated_at"] = beijing_now_str()
             self._merge_stage_data(record, data)
-            self._events.append(self._event(call_id, event, record, data))
+            payload = self._event(call_id, event, record, data)
+            self._accumulate_attempt_event(record.setdefault("_attempt_monitors", {}), payload)
+            self._events.append(payload)
 
     def capture_image_attempts(self, call_id: str, attempts: object) -> None:
         call_id = str(call_id or "").strip()
@@ -325,7 +332,7 @@ class RealtimeMonitorService:
                 self._merge_metric_dict(record.setdefault("perf", {}), perf)
             all_events = [dict(item) for item in self._events if item.get("call_id") == call_id]
             self._merge_captured_image_attempts(detail, record.pop("_image_attempts", None))
-            self._attach_image_attempt_monitors(detail, all_events)
+            self._attach_image_attempt_monitors(detail, all_events, record.pop("_attempt_monitors", None))
             events = all_events[-60:]
             call_summary = build_call_summary(
                 {
@@ -483,6 +490,11 @@ class RealtimeMonitorService:
         return self._public_record(record)
 
     def _merge_stage_data(self, record: dict[str, Any], data: dict[str, Any]) -> None:
+        if record.get("stage") == "image_single_done" and data.get("status") == "success":
+            image = record.get("images", {}).get(str(data.get("index") or ""))
+            if isinstance(image, dict):
+                for key in (*RAW_DIAGNOSTIC_FIELDS, *CANONICAL_FAILURE_FIELDS, "public_error", "account_failure"):
+                    image.pop(key, None)
         if record.get("stage") == "image_getting_account":
             # Prior attempts stay in the event history, never in the current
             # attempt's error fields. Empty values must also clear old errors.
@@ -639,36 +651,16 @@ class RealtimeMonitorService:
         self,
         detail: dict[str, Any],
         events: list[dict[str, Any]],
+        snapshots: dict | None = None,
     ) -> None:
         attempts = detail.get("image_attempts")
         if not isinstance(attempts, list):
             return
 
-        snapshots: dict[tuple[int, int], dict[str, Any]] = {}
-        for event in events:
-            slot = _int_ms(event.get("index"))
-            attempt_number = _int_ms(event.get("attempt"))
-            if slot <= 0 or attempt_number <= 0:
-                continue
-            snapshot = snapshots.setdefault(
-                (slot, attempt_number),
-                {"metrics": {}, "events": []},
-            )
-            metric_data = {
-                key: value
-                for key, value in event.items()
-                if str(key).endswith("_ms")
-            }
-            self._merge_metric_dict(snapshot["metrics"], metric_data)
-            compact_event = {
-                key: value
-                for key, value in event.items()
-                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS}
-                or key in {"public_error", "account_failure", "switched_account"}
-                or (str(key).endswith("_ms") and _int_ms(value) > 0)
-            }
-            if compact_event:
-                snapshot["events"].append(compact_event)
+        if snapshots is None:
+            snapshots = {}
+            for event in events:
+                self._accumulate_attempt_event(snapshots, event)
 
         enriched: list[Any] = []
         for value in attempts:
@@ -679,14 +671,14 @@ class RealtimeMonitorService:
             key = (_int_ms(item.get("slot")), _int_ms(item.get("attempt")))
             snapshot = snapshots.get(key)
             if snapshot:
-                monitor: dict[str, Any] = {}
+                monitor: dict[str, Any] = dict(item.get("monitor") or {})
                 metrics = {
                     name: _int_ms(metric)
                     for name, metric in snapshot["metrics"].items()
                     if str(name).endswith("_ms") and _int_ms(metric) > 0
                 }
                 if metrics:
-                    monitor["metrics"] = metrics
+                    self._merge_metric_dict(monitor.setdefault("metrics", {}), metrics)
                 attempt_events = snapshot["events"][-40:]
                 if attempt_events:
                     monitor["events"] = attempt_events
@@ -694,6 +686,21 @@ class RealtimeMonitorService:
                     item["monitor"] = monitor
             enriched.append(item)
         detail["image_attempts"] = enriched
+
+    def _accumulate_attempt_event(self, snapshots: dict, event: dict) -> None:
+        slot, number = _int_ms(event.get("index")), _int_ms(event.get("attempt"))
+        if slot <= 0 or number <= 0:
+            return
+        snapshot = snapshots.setdefault((slot, number), {"metrics": {}, "events": []})
+        self._merge_metric_dict(snapshot["metrics"], event)
+        compact = {
+            key: value for key, value in event.items()
+            if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS,
+                       "public_error", "account_failure", "switched_account"}
+            or (str(key).endswith("_ms") and _int_ms(value) > 0)
+        }
+        snapshot["events"].append(compact)
+        del snapshot["events"][:-40]
 
     @staticmethod
     def _merge_captured_image_attempts(detail: dict[str, Any], captured: object) -> None:
@@ -940,6 +947,7 @@ class RealtimeMonitorService:
     def _copy_record(self, record: dict[str, Any]) -> dict[str, Any]:
         copied = dict(record)
         copied.pop("_image_attempts", None)
+        copied.pop("_attempt_monitors", None)
         copied["metrics"] = dict(record.get("metrics") or {})
         copied["perf"] = dict(record.get("perf") or {})
         images = record.get("images")
@@ -1001,6 +1009,7 @@ class RealtimeMonitorService:
                 "poll_request_ms",
                 "resolve_ms",
                 "download_ms",
+                *POSTPROCESS_METRIC_LABELS,
                 "response_ms",
                 "stream_ms",
                 "total_ms",

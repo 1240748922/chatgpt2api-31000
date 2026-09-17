@@ -219,6 +219,15 @@ class MonitorEventView(StrictMonitorModel):
     poll_request_ms: int | None = None
     resolve_ms: int | None = None
     download_ms: int | None = None
+    upscale_ms: int | None = None
+    upscale_queue_ms: int | None = None
+    upscale_exec_ms: int | None = None
+    storage_ms: int | None = None
+    storage_lock_ms: int | None = None
+    storage_write_ms: int | None = None
+    storage_remote_ms: int | None = None
+    storage_catalog_ms: int | None = None
+    postprocess_ms: int | None = None
     response_ms: int | None = None
     stream_ms: int | None = None
     total_ms: int | None = None

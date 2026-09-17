@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from services.request_detail_view import request_proxy_source_label, request_status_presentation
+from services.image_postprocess_metrics import POSTPROCESS_METRIC_LABELS
 
 
 MONITOR_SCHEMA_VERSION = 1
@@ -289,6 +290,12 @@ BOOLEAN_FIELDS = {
     "returned_result",
     "returned_message",
 }
+
+EVENT_FIELDS.update(POSTPROCESS_METRIC_LABELS)
+EVENT_METRIC_PAIRS += tuple((label, key) for key, label in POSTPROCESS_METRIC_LABELS.items())
+SLOW_METRIC_PAIRS += tuple(POSTPROCESS_METRIC_LABELS.items())
+DIGEST_METRIC_PAIRS += (("超分", "upscale_ms"), ("保存", "storage_ms"))
+LINEAR_STAGE_KEYS += ("postprocess_ms",)
 
 
 def _mapping(value: object) -> Mapping[str, Any]:

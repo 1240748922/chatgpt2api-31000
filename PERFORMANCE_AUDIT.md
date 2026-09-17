@@ -1,5 +1,23 @@
 # 生图链路性能审查
 
+## 2026-09-18：账号快照并发读取导致的假空池 503
+
+日志 `75c640a4fe53498b` 在取号阶段耗时 5.179 秒后失败，`image_attempts=[]`，原始错误为 `accounts changed repeatedly while loading its snapshot`。这不是已确认的账号额度耗尽或上游生图失败，而是本地数据库快照读取失败，被生图入口的 `RuntimeError` 分支包装成 `no_available_account`。
+
+- **根因**：数据库适配器分别查询版本、全量账号、版本，最多尝试三轮。PostgreSQL 默认 READ COMMITTED 下，同一个 Session 的不同语句可以看到不同的已提交状态；导入、额度回写等持续更新会让三轮都版本不一致。大量 JSON 解码也延长了前后两次版本查询之间的窗口。
+- **修复**：账号数据和版本使用同一条 SELECT 读取，利用数据库语句快照保持一致；左连接保证空集合仍有版本。不等待写入停止，不加写锁，不改数据库结构。使用原始列而非构造全部 ORM 对象，并在 JSON 解码前归还连接。
+- **并发安全**：读取开始之后的新导入可以留给下一次刷新，但绝不把较新的版本号贴到较旧的数据上。原有 CAS 写入校验、凭证代际检查、跨实例导入可见性及上传冷却合并规则不变。
+- **入口回归**：取号 → token 刷新 → CAS 冲突 → 重读快照期间三次其他实例写入 → 图片结果返回。旧实现确定性抛出同型的 `ImageGenerationError`；新实现成功取得更新后的 token，只有一次生图尝试，槽位正确释放，其他实例导入的账号及状态保留。测试中的 token 交换和上游图片响应是模拟，不使用真实账号。
+- **测试**：17 项新增回归覆盖 accounts/auth_keys、空集合并发插入、持续写入、解码期间更新、旧版本 CAS 拒绝覆盖、损坏数据、缺失版本、四读一写并行事务和真实账号选择流程。完整 141 项 Python 测试、前端运行检查及 Compose 配置检查通过。
+
+本地数据库验证使用隔离的 SQLite/WAL 独立连接与真实事务；未在用户服务器或 PostgreSQL 实例执行压测。修复针对这条明确的快照错误，不意味着真正空池、数据库连接故障或上游 429/超时也会消失。没有降低生图/超分并发，也没有改动上一版图片存储优化。
+
+复现（仓库根目录，Linux）：
+
+```bash
+PYTHONPATH="$PWD/src_extract:$PWD/GPT-Register-Tool-main" python -m pytest -q src_extract/tests/test_database_snapshot_concurrency.py src_extract/tests/test_image_pool_refresh.py
+```
+
 ## 2026-09-17：保存图片锁竞争（219.606 秒请求）
 
 用户原始日志已明确定位，而非根据截图猜测：

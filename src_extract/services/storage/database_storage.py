@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence
 
-from sqlalchemy import Column, Integer, String, Text, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import Column, Integer, String, Text, select, text, true
+from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import sessionmaker
 
 from services.application_database import (
@@ -125,33 +125,33 @@ class DatabaseStorageBackend(StorageBackend):
 
     def _load_snapshot(self, collection: StorageCollection) -> StorageSnapshot:
         model, _ = self._spec(collection)
-        for _ in range(3):
-            session = self.Session()
-            try:
-                before = session.execute(
-                    select(StorageRevisionModel.version).where(
-                        StorageRevisionModel.collection == collection
-                    )
-                ).scalar_one()
-                rows = session.query(model).order_by(model.id.asc()).all()
-                items = [
-                    item
-                    for row in rows
-                    if (item := self._deserialize(row.data)) is not None
-                ]
-                after = session.execute(
-                    select(StorageRevisionModel.version)
-                    .where(StorageRevisionModel.collection == collection)
-                    .execution_options(populate_existing=True)
-                ).scalar_one()
-                if before == after:
-                    return StorageSnapshot(
-                        items=items,
-                        revision=self._revision_value(collection, after),
-                    )
-            finally:
-                session.close()
-        raise RuntimeError(f"{collection} changed repeatedly while loading its snapshot")
+        # PostgreSQL READ COMMITTED gives each statement a new snapshot, not
+        # each Session. Separate revision/rows/revision reads can therefore
+        # starve under continuous quota writes or imports. One SELECT observes
+        # the rows and their CAS revision together on PostgreSQL and SQLite,
+        # without locking writers or requiring a quiet interval. The left join
+        # preserves the revision even when the collection is empty.
+        statement = (
+            select(StorageRevisionModel.version, model.data)
+            .select_from(StorageRevisionModel)
+            .outerjoin(model, true())
+            .where(StorageRevisionModel.collection == collection)
+            .order_by(model.id.asc())
+        )
+        with self.Session() as session:
+            rows = session.execute(statement).all()
+        if not rows:
+            raise NoResultFound(f"missing {collection} storage revision")
+        # Return the connection before decoding a potentially large collection.
+        # Never attach a subsequently fetched revision to these older payloads.
+        return StorageSnapshot(
+            items=[
+                item
+                for _version, data in rows
+                if data is not None and (item := self._deserialize(data)) is not None
+            ],
+            revision=self._revision_value(collection, rows[0][0]),
+        )
 
     def load_accounts_snapshot(self) -> StorageSnapshot:
         return self._load_snapshot("accounts")

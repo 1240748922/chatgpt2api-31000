@@ -85,8 +85,8 @@ async function testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection() {
   let first=true;
   f.api.post=async(url,body)=>{f.posts.push({url,body});if(first){first=false;throw new Error('network interrupted');}return {job:f.job};};
   const args={accounts:[{access_token:'synthetic'}],syncAfterImport:false,targetGroupId:''};
-  assert.equal(await f.controller.submit(args),false);
   assert.equal(await f.controller.submit(args),true);
+  assert.equal(f.posts.length,2);
   assert.equal(f.posts[0].body.request_key,f.posts[1].body.request_key);
   assert.equal(f.posts[1].body.target_group_id,'');
   await flush();

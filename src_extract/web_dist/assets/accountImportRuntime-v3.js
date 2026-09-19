@@ -116,11 +116,12 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
   const update = changes => { state = {...state, ...changes}; if (active) onUpdate(state); };
   const remember = id => { try { storage?.setItem(key, id); } catch (_) {} };
   const readRemembered = () => { try { return storage?.getItem(key); } catch (_) { return null; } };
-  const message = error => {
+  const isTransientError = error => {
     const status = Number(error?.response?.status || error?.status || 0);
-    if ([502, 503, 504].includes(status) || /network|timeout|连接|超时/i.test(error?.message || "")) {
-      return "连接暂时中断，正在自动重试…";
-    }
+    return [408, 425, 429, 500, 502, 503, 504].includes(status) || /network|timeout|连接|超时/i.test(error?.message || "");
+  };
+  const message = error => {
+    if (isTransientError(error)) return "连接暂时中断，正在自动重试…";
     return typeof error?.response?.data?.detail?.error === "string" ? error.response.data.detail.error : error?.message || "连接失败，请重试";
   };
   const refreshAccounts = job => {
@@ -169,7 +170,18 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
     try {
       const content = JSON.stringify({accounts, sync_after_import: syncAfterImport, target_group_id: targetGroupId});
       if (!request || request.content !== content) request = {content, key: requestKey()};
-      const {job} = await api.post("/api/account-import-jobs", {...JSON.parse(content), request_key: request.key});
+      let response;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          response = await api.post("/api/account-import-jobs", {...JSON.parse(content), request_key: request.key});
+          break;
+        } catch (error) {
+          if (!isTransientError(error) || attempt === 2) throw error;
+          update({notice: `连接暂时中断，正在重试导入（${attempt + 1}/2）…`});
+          await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+        }
+      }
+      const {job} = response;
       request = null; remember(job.id);
       if (!active) return true;
       historyEpoch++; // an older history fetch must not replace the new selection

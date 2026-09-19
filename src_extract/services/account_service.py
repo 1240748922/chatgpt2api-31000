@@ -2724,6 +2724,22 @@ class AccountService:
                 result.append(account)
             return result
 
+    def account_group_counts(self) -> dict[str, int]:
+        """Count account groups without copying full credential records.
+
+        The account-management page requests group metadata alongside its first
+        page.  Copying every account here is needlessly expensive for large
+        pools because the caller only needs ``group_id`` counts.
+        """
+        self._refresh_accounts_snapshot_if_stale()
+        counts: dict[str, int] = {}
+        with self._lock:
+            for item in self._accounts.values():
+                group_id = str(item.get("group_id") or "").strip()
+                if group_id:
+                    counts[group_id] = counts.get(group_id, 0) + 1
+        return counts
+
     def list_accounts_page(
             self,
             *,

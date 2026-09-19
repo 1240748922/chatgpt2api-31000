@@ -236,7 +236,7 @@ CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 CHATGPT2API_IMPORT_BATCH_SIZE=250
 ```
 
-3.2.5 已把本地 AT、RT、Session JSON、CPA JSON 和 Sub2API JSON 导入整合回原窗口，使用原后台登录及“目标分组”选项，无需另填密钥。支持逐行 AT/RT、TXT/JSON 多文件、单个账号对象、账号数组、`accounts`/`items`/`results`/`data` 包装及嵌套 `credentials`/`auth` 凭证。AT 模式也识别 `rt.` 前缀；其他格式的 RT 请选“导入 Refresh Token”。JSON 同时带有效 AT 和 RT 时直接入库，只有 RT 时先兑换。
+3.2.6 在 3.2.5 的基础上把账号组统计改为只读取 `group_id`，不再为每次打开账号管理复制整个账号池的凭证对象；大号池首次加载更快。另已把本地 AT、RT、Session JSON、CPA JSON 和 Sub2API JSON 导入整合回原窗口，使用原后台登录及“目标分组”选项，无需另填密钥。支持逐行 AT/RT、TXT/JSON 多文件、单个账号对象、账号数组、`accounts`/`items`/`results`/`data` 包装及嵌套 `credentials`/`auth` 凭证。AT 模式也识别 `rt.` 前缀；其他格式的 RT 请选“导入 Refresh Token”。JSON 同时带有效 AT 和 RT 时直接入库，只有 RT 时先兑换。
 
 AT 入库、RT 兑换、额度同步由独立后台工作线程处理，RT 请求使用系统设置中已有的“导入并发数”（`account_import_concurrency`），额度同步使用 `account_quota_sync_concurrency`。分块读取、SQL 批量插入和复用账号指纹减少本地开销；RT 仍需等待上游 OAuth 响应。本地普通导入跳过已存在账号，保留其状态与额度；需要覆盖备份内的凭证、状态和配置时仍用“导入完整备份文件”。OAuth 登录与远程 CPA/Sub2API 导入的流程保持原有行为。
 
@@ -244,7 +244,7 @@ AT 入库、RT 兑换、额度同步由独立后台工作线程处理，RT 请�
 
 任务状态也可通过 `GET /api/account-import-jobs` 查看，增量日志使用 `GET /api/account-import-jobs/{id}/events?after=0`（响应 `next_cursor` 供下次查询）。日志不返回 token、代理凭证或原始上游错误。已完成任务清理导入内容副本，只保留计数和日志。旧版已提交任务可以续传；数据库自动新增导入分块、RT 结果和日志表，不修改原账号表或系统设置。
 
-升级需要同时更新镜像、`docker-compose.yml` 与 `nginx.conf`，确保 `/api/account-import-jobs` 路由至 importer；仅刷新页面不会升级后端。确认运行 `/version` 显示 `3.2.5`，原账号导入窗口出现“导入 Refresh Token”和“导入任务与日志”，并检查容器镜像 revision。旧 `/account-import.html` 只做跳转，不再维护第二套导入界面；已有任务继续保留。排查服务启动问题可用 `docker compose --env-file .env logs importer`。
+升级需要同时更新镜像、`docker-compose.yml` 与 `nginx.conf`，确保 `/api/account-import-jobs` 路由至 importer；仅刷新页面不会升级后端。确认运行 `/version` 显示 `3.2.6`，原账号导入窗口出现“导入 Refresh Token”和“导入任务与日志”，并检查容器镜像 revision。旧 `/account-import.html` 只做跳转，不再维护第二套导入界面；已有任务继续保留。排查服务启动问题可用 `docker compose --env-file .env logs importer`。
 
 无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，系统设置中的“超分并发数”默认每个 API 实例为 64，最大 512；保存后动态生效。放大失败会返回原图，不会让生图请求失败。也可通过以下变量提供未保存设置时的默认值：
 

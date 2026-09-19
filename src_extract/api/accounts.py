@@ -292,12 +292,18 @@ def _target_account_group_id(value: str | None) -> str | None:
 
 
 def _account_group_payload(groups: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    accounts = account_service.list_accounts()
-    counts: dict[str, int] = {}
-    for account in accounts:
-        group_id = _clean_text(account.get("group_id"))
-        if group_id:
-            counts[group_id] = counts.get(group_id, 0) + 1
+    count_groups = getattr(account_service, "account_group_counts", None)
+    if callable(count_groups):
+        counts = count_groups()
+    else:
+        # Compatibility for lightweight account-service test doubles and older
+        # deployments that do not yet expose the optimized count method.
+        accounts = account_service.list_accounts()
+        counts = {}
+        for account in accounts:
+            group_id = _clean_text(account.get("group_id"))
+            if group_id:
+                counts[group_id] = counts.get(group_id, 0) + 1
     proxy_groups = [
         group.model_dump(mode="json")
         for group in proxy_management_service.list_groups().groups

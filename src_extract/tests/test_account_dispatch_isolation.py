@@ -65,6 +65,16 @@ def test_slow_database_does_not_hold_dispatch_lock(pool, monkeypatch, operation)
         request.result(timeout=5)
 
 
+def test_account_group_counts_does_not_materialize_full_account_records(pool, monkeypatch):
+    service, _db, _remote = pool
+    service._accounts["healthy"]["group_id"] = "primary"
+    service._accounts["other"]["group_id"] = "primary"
+    service._accounts["third"] = {"access_token": "third", "group_id": "secondary"}
+    monkeypatch.setattr(service, "list_accounts", lambda: pytest.fail("must not copy account records"))
+
+    assert service.account_group_counts() == {"primary": 2, "secondary": 1}
+
+
 def test_completion_during_same_account_update_is_merged_once(pool, monkeypatch):
     service, db, _ = pool
     entered, release = Event(), Event()

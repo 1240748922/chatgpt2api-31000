@@ -36,6 +36,8 @@ def replica(monkeypatch):
                 self.acquire()
     service = AccountService.__new__(AccountService)
     service._lock = Lock()
+    service._write_lock = Lock()
+    service._write_baseline = None
     service._image_slot_condition = AdvancingCondition(service._lock)
     service._account_snapshot_refresh_lock = Lock()
     service._account_snapshot_refresh_dispatch_lock = Lock()
@@ -125,7 +127,7 @@ def test_changed_pool_schedules_only_one_reload_for_many_waiters(replica):
         list(executor.map(lambda _: replica.service._refresh_accounts_snapshot_if_stale(
             allow_full_reload=False), range(100)))
     assert len(replica.pending) == 1
-    assert replica.state.checks == 1
+    assert replica.state.checks == 0  # revision I/O now runs in the background too
     replica.pending.pop()()
     assert replica.state.reads == 1
     assert replica.service._account_snapshot_refresh_scheduled is False

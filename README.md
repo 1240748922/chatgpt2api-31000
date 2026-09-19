@@ -1,6 +1,6 @@
 # chatgpt2api 31000 本地离线包
 
-本包对应服务器上的 31000 服务：8 个 API 实例（app0-app7）+ Nginx 网关 + PostgreSQL。`data/` 和服务器 PostgreSQL 数据卷均未导出，首次启动会使用全新的空数据库。
+本包对应服务器上的 31000 服务：8 个 API 实例（app0-app7）+ 独立账号 importer + Nginx 网关 + PostgreSQL。`data/` 和服务器 PostgreSQL 数据卷均未导出，首次启动会使用全新的空数据库。
 
 ## 云服务器部署教程
 
@@ -30,6 +30,8 @@ Compose 默认锁定 `sha-8d9d51e`；如果 `.env` 没有设置 `CHATGPT2API_IMA
    ```
 
 服务入口为 `http://localhost:31000`。如需公网或其他端口，修改 `docker-compose.yml` 的 ports。
+
+大批量导号使用独立入口 `http://localhost:31000/account-import.html`。它按批次保存并显示可恢复进度，导号不会占用 app0-app7 的生图请求处理线程；额度同步可在页面中单独勾选。批次大小可通过 `.env` 的 `CHATGPT2API_IMPORT_BATCH_SIZE` 调整。
 
 `.env` 中的密钥是本地占位值，请在正式使用前修改 `CHATGPT2API_AUTH_KEY`、`CHATGPT2API_MONITOR_CLUSTER_SECRET` 和 `POSTGRES_PASSWORD`；修改后重新创建容器（`docker compose up -d --force-recreate`）。
 

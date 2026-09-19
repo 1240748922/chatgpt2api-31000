@@ -2,7 +2,7 @@
 
 本文用于将 `chatgpt2api-31000` 部署到 Linux 云服务器，方便以后在 GitHub 页面直接查看。
 
-当前部署结构为：8 个 API 实例（`app0` 到 `app7`）+ Nginx 网关 + PostgreSQL + 注册工具。
+当前部署结构为：8 个 API 实例（`app0` 到 `app7`）+ 独立账号 importer + Nginx 网关 + PostgreSQL + 注册工具。
 
 ## 0. 先理解两个 Token
 
@@ -229,6 +229,14 @@ CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 ```
 
 这项扫描只在 `app0` 的生命周期维护线程运行，8 个实例不会重复扫描同一批账号。生图请求仍优先使用已确认有额度的账号，其次使用近期成功过的未知账号，最后才尝试冷的未知账号。
+
+大批量导号使用独立的 `importer` 容器和入口 `http://服务器:31000/account-import.html`。导入任务写入 PostgreSQL 的 `account_ingest_jobs`，默认每批保存 250 个账号；每批提交后立即进入账号池，进程重启会从最近一次已提交的批次继续。导入 worker 不在 `app0` 到 `app7` 中运行，因此不会占用生图实例的账号维护线程。可在 `.env` 调整批次大小：
+
+```env
+CHATGPT2API_IMPORT_BATCH_SIZE=250
+```
+
+页面使用管理员 Bearer 密钥提交 JSON 数组或逐行 token。任务状态也可通过 `GET /api/account-import-jobs` 查看；需要排查导入时查看 `docker compose --env-file .env logs importer`，不要把完整账号内容写入公开日志。
 
 无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，系统设置中的“超分并发数”默认每个 API 实例为 64，最大 512；保存后动态生效。放大失败会返回原图，不会让生图请求失败。也可通过以下变量提供未保存设置时的默认值：
 

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>批量导入账号</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101317; color: #eef2f7; }
+    main { max-width: 900px; margin: 32px auto; padding: 0 18px; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    p { color: #aeb8c5; line-height: 1.6; }
+    label { display: block; margin: 18px 0 7px; color: #cbd5e1; }
+    input, textarea, button { box-sizing: border-box; width: 100%; border: 1px solid #374151; border-radius: 8px; background: #171b21; color: #eef2f7; padding: 10px 12px; font: inherit; }
+    textarea { min-height: 260px; resize: vertical; font-family: ui-monospace, monospace; }
+    button { width: auto; cursor: pointer; background: #2563eb; border-color: #2563eb; margin-top: 16px; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .row input[type=file] { width: auto; }
+    .status { margin-top: 22px; padding: 14px; border: 1px solid #374151; border-radius: 8px; white-space: pre-wrap; font-family: ui-monospace, monospace; }
+    .hint { font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>批量导入账号</h1>
+  <p>此入口把账号按批次保存到数据库，保存后即可被生图调度；额度同步是独立阶段，不会占用 app0–app7 的请求处理线程。</p>
+  <label for="auth">管理员密钥</label>
+  <input id="auth" type="password" autocomplete="off" placeholder="仅在本页面内存中使用">
+  <label for="payload">账号内容</label>
+  <textarea id="payload" placeholder='支持 JSON 数组，例如 [{"access_token":"...","refresh_token":"..."}]；也支持每行一个 access_token'></textarea>
+  <div class="row">
+    <input id="file" type="file" accept=".json,.txt,application/json,text/plain">
+    <label class="hint"><input id="sync" type="checkbox"> 导入完成后独立同步额度</label>
+  </div>
+  <button id="submit">开始导入</button>
+  <div id="status" class="status">尚未提交任务</div>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let timer = 0;
+  $("file").addEventListener("change", async () => {
+    const file = $("file").files[0];
+    if (file) $("payload").value = await file.text();
+  });
+  function headers() {
+    const key = $("auth").value.trim();
+    return {"Content-Type": "application/json", "Authorization": `Bearer ${key}`};
+  }
+  function parseInput(text) {
+    const value = text.trim();
+    if (!value) throw new Error("请先选择或粘贴账号内容");
+    try {
+      const parsed = JSON.parse(value);
+      const accounts = Array.isArray(parsed) ? parsed : Array.isArray(parsed.accounts) ? parsed.accounts : [];
+      const tokens = Array.isArray(parsed.tokens) ? parsed.tokens : [];
+      if (accounts.length || tokens.length) return {accounts, tokens};
+    } catch (_) {}
+    const tokens = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!tokens.length) throw new Error("没有识别到账号");
+    return {tokens};
+  }
+  function show(job) {
+    const done = job.done ? "已完成" : job.status;
+    $("status").textContent = `${done}\n任务: ${job.id}\n已保存: ${job.saved}/${job.total}\n新增: ${job.added}，跳过: ${job.skipped}\n额度同步: ${job.synced}，失败: ${job.sync_failed}` + (job.error_code ? `\n错误: ${job.error_code}` : "");
+  }
+  async function poll(id) {
+    clearTimeout(timer);
+    const response = await fetch(`/api/account-import-jobs/${encodeURIComponent(id)}`, {headers: headers()});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail?.error || data.detail || "读取任务失败");
+    show(data.job);
+    if (!data.job.done) timer = setTimeout(() => poll(id).catch((error) => { $("status").textContent = error.message; }), 1500);
+    else $("submit").disabled = false;
+  }
+  $("submit").addEventListener("click", async () => {
+    $("submit").disabled = true;
+    try {
+      const body = {...parseInput($("payload").value), sync_after_import: $("sync").checked};
+      const response = await fetch("/api/account-import-jobs", {method: "POST", headers: headers(), body: JSON.stringify(body)});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail?.error || data.detail || "提交任务失败");
+      await poll(data.job.id);
+    } catch (error) {
+      $("status").textContent = error.message;
+      $("submit").disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

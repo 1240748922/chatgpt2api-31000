@@ -8,6 +8,7 @@ import random
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -180,6 +181,10 @@ class AccountService:
         self.storage = storage_backend
         self._proxy_reference_mutation = proxy_reference_mutation
         self._lock = Lock()
+        # Serialize mutations, NOT account reads/leases. Database I/O must never
+        # hold the short-lived dispatch lock shared by foreground image requests.
+        self._write_lock = Lock()
+        self._write_baseline: dict[str, dict] | None = None
         self._oauth_refresh_flights_lock = Lock()
         self._oauth_refresh_flights: dict[_CredentialGeneration, Future[str]] = {}
         self._image_slot_condition = Condition(self._lock)
@@ -215,6 +220,16 @@ class AccountService:
         self._image_failure_refresh_started_at: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
+
+    @contextmanager
+    def _account_write(self):
+        with self._write_lock:
+            with self._image_slot_condition:
+                self._write_baseline = dict(self._accounts)
+                try:
+                    yield
+                finally:
+                    self._write_baseline = None
 
     def _get_cumulative_file(self) -> Path:
         storage_path = getattr(self.storage, "file_path", None)
@@ -485,10 +500,14 @@ class AccountService:
                 return False
 
         if not allow_full_reload:
-            with self._account_snapshot_refresh_dispatch_lock:
-                if self._account_snapshot_refresh_scheduled:
-                    return False
+            # Even a revision SELECT can wait for the DB pool. Foreground
+            # dispatch must never perform that I/O itself.
+            self._schedule_accounts_snapshot_refresh(max_age_seconds=max_age_seconds)
+            return False
         if not self._account_snapshot_refresh_lock.acquire(blocking=wait_for_refresh):
+            return False
+        if not self._write_lock.acquire(blocking=wait_for_refresh):
+            self._account_snapshot_refresh_lock.release()
             return False
         try:
             with self._lock:
@@ -566,6 +585,7 @@ class AccountService:
                 )
                 return True
         finally:
+            self._write_lock.release()
             self._account_snapshot_refresh_lock.release()
 
     def _schedule_accounts_snapshot_refresh(self, *, max_age_seconds: float | None = None) -> None:
@@ -845,116 +865,138 @@ class AccountService:
         expected_credential_generation: _CredentialGeneration | None = None,
         conflict_existing_tokens: set[str] | None = None,
         account_tokens: set[str] | None = None,
+        skip_new_conflicts: bool = False,
     ) -> bool:
-        last_conflict: StorageRevisionConflictError | None = None
-        checked_writer = (
-            getattr(self.storage, "mutate_accounts_checked", None)
-            if account_tokens is not None else None
-        )
-        # A reload may normalize legacy JSON without immediately persisting
-        # those defaults. Keep the exact raw baseline for the next row CAS.
-        checked_baselines: dict[str, dict] | None = None
-        for attempt in range(self._STORAGE_MUTATION_MAX_ATTEMPTS):
-            baseline = self._persisted_accounts
-            desired = self._accounts
-            if account_tokens is not None:
-                baseline = {key: baseline[key] for key in account_tokens if key in baseline}
-                desired = {key: desired[key] for key in account_tokens if key in desired}
-            mutation = self._account_mutation(
-                baseline,
-                desired,
-                self._accounts_revision,
-            )
-            if not mutation.upserts and not mutation.delete_keys:
-                self._prune_token_aliases_locked()
-                return True
-            try:
-                if callable(checked_writer):
-                    source = checked_baselines if checked_baselines is not None else baseline
-                    keys = {*(item["access_token"] for item in mutation.upserts), *mutation.delete_keys}
-                    result = checked_writer(mutation, expected_items={key: source.get(key) for key in keys})
-                else:
-                    result = self.storage.mutate_accounts(mutation)
-            except StorageRevisionConflictError as exc:
-                last_conflict = exc
-                if attempt + 1 >= self._STORAGE_MUTATION_MAX_ATTEMPTS:
-                    self._restore_accounts_after_save_error()
-                    raise
-                time.sleep(min(0.5, 0.02 * (2 ** min(attempt, 4)) + random.uniform(0.0, 0.04)))
-                try:
-                    snapshot = self.storage.load_accounts_snapshot()
-                    if callable(checked_writer):
-                        checked_baselines = {
-                            str(item["access_token"]): item
-                            for item in snapshot.items
-                            if isinstance(item, dict) and item.get("access_token") in account_tokens
-                        }
-                    remote, _ = self._normalize_loaded_accounts(
-                        snapshot.items,
-                        recover_interrupted_checks=False,
-                    )
-                    if conflict_existing_tokens is not None:
-                        conflict_existing_tokens.update(
-                            token
-                            for token in self._accounts
-                            if token not in self._persisted_accounts and token in remote
-                        )
-                    if expected_credential_generation is not None:
-                        expected_access_token = expected_credential_generation[0]
-                        remote_account = remote.get(expected_access_token)
-                        local_rotation = self._rotated_account_token(
-                            self._accounts, self._persisted_accounts, expected_access_token,
-                            self._persisted_accounts.get(expected_access_token) or {},
-                        )
-                        if (
-                            remote_account is None
-                            or (local_rotation is not None and local_rotation in remote)
-                            or self._credential_generation(
-                                expected_access_token,
-                                remote_account,
-                            )
-                            != expected_credential_generation
-                        ):
-                            self._apply_account_view_locked(
-                                remote,
-                                persisted_accounts=remote,
-                                revision=snapshot.revision,
-                            )
-                            return False
-                    merged = self._merge_accounts_after_conflict(
-                        self._persisted_accounts,
-                        self._accounts,
-                        remote,
-                    )
-                    self._apply_account_view_locked(
-                        merged,
-                        persisted_accounts=remote,
-                        revision=snapshot.revision,
-                    )
-                except Exception:
-                    self._restore_accounts_after_save_error()
-                    raise
-                continue
-            except Exception:
-                self._restore_accounts_after_save_error()
-                raise
-            if account_tokens is None:
-                self._persisted_accounts = deepcopy(self._accounts)
-                self._accounts_revision = result.revision
-                self._account_snapshot_checked_at = time.monotonic()
+        """Commit staged rows with no dispatch lock held across I/O or retries.
+
+        Writers enter _account_write before changing the local view. While the
+        database is busy, readers see the pre-write view; image completions may
+        still update it. Their deltas are merged exactly once after commit.
+        """
+        persisted = dict(self._persisted_accounts)
+        staged = dict(self._accounts)
+        before = dict(self._write_baseline if self._write_baseline is not None else staged)
+        keys = set(account_tokens) if account_tokens is not None else {
+            key for key in persisted.keys() | staged.keys()
+            if persisted.get(key) != staged.get(key)
+        }
+        intent = dict(persisted)
+        for key in keys:
+            if key in staged:
+                intent[key] = staged[key]
             else:
-                for key in account_tokens:
-                    if key in self._accounts:
-                        self._persisted_accounts[key] = deepcopy(self._accounts[key])
-                    else:
-                        self._persisted_accounts.pop(key, None)
-                # A targeted save has not loaded other replicas' imports or
-                # state changes. Keep the previous collection revision/TTL,
-                # and do not acknowledge other locally pending image results.
+                intent.pop(key, None)
+        baseline = {key: persisted[key] for key in keys if key in persisted}
+        desired = {key: intent[key] for key in keys if key in intent}
+        if baseline == desired:
             self._prune_token_aliases_locked()
             return True
-        assert last_conflict is not None
-        raise last_conflict
+        checked = getattr(self.storage, "mutate_accounts_checked", None)
+        # Explicit None retains the legacy whole-collection CAS path for other
+        # adapters and callers, but all normal application mutations are scoped.
+        checked = checked if account_tokens is not None else None
+        revision = self._accounts_revision
+        committed = dict(baseline)
+        saved = False
+        self._accounts = dict(before)
+        self._lock.release()
+        try:
+            for attempt in range(self._STORAGE_MUTATION_MAX_ATTEMPTS):
+                mutation = self._account_mutation(baseline, desired, revision)
+                if not mutation.upserts and not mutation.delete_keys:
+                    committed, saved = dict(desired), True
+                    break
+                try:
+                    if callable(checked):
+                        changed_keys = {*(row["access_token"] for row in mutation.upserts), *mutation.delete_keys}
+                        checked(mutation, expected_items={key: baseline.get(key) for key in changed_keys})
+                    else:
+                        self.storage.mutate_accounts(mutation)
+                    committed, saved = dict(desired), True
+                    break
+                except StorageRevisionConflictError:
+                    # Read/normalize/merge in the writer, never under the lock
+                    # needed by account selection, metadata reads and completion.
+                    snapshot = self.storage.load_accounts_snapshot()
+                    raw = {str(row["access_token"]): row for row in snapshot.items if row.get("access_token")}
+                    remote, _ = self._normalize_loaded_accounts(snapshot.items, recover_interrupted_checks=False)
+                    if conflict_existing_tokens is not None:
+                        conflict_existing_tokens.update(key for key in keys if key not in persisted and key in remote)
+                    if expected_credential_generation is not None:
+                        old = expected_credential_generation[0]
+                        rotation = self._rotated_account_token(intent, persisted, old, persisted.get(old) or {})
+                        if (old not in remote
+                            or (rotation is not None and rotation in remote)
+                            or self._credential_generation(old, remote[old]) != expected_credential_generation):
+                            # Include a remotely rotated identity so aliases and
+                            # active leases can follow the authoritative winner.
+                            management_id = str((persisted.get(old) or {}).get("management_id") or "")
+                            keys.update(key for key, row in remote.items()
+                                        if management_id and row.get("management_id") == management_id)
+                            committed = {key: raw[key] for key in keys if key in raw}
+                            break
+                    merged = self._merge_accounts_after_conflict(persisted, intent, remote)
+                    if skip_new_conflicts:
+                        for key in keys:
+                            if key not in persisted and key in remote:
+                                merged[key] = remote[key]
+                    changed = self._account_mutation(remote, merged, snapshot.revision)
+                    keys.update(row["access_token"] for row in changed.upserts)
+                    keys.update(changed.delete_keys)
+                    baseline = {key: raw[key] for key in keys if key in raw}
+                    desired = {key: merged[key] for key in keys if key in merged}
+                    committed = dict(baseline)
+                    revision = snapshot.revision
+                    if attempt + 1 >= self._STORAGE_MUTATION_MAX_ATTEMPTS:
+                        raise
+                    time.sleep(min(0.5, 0.02 * (2 ** min(attempt, 4)) + random.uniform(0, 0.04)))
+        except Exception:
+            # A commit may have succeeded before the connection failed. Restore
+            # the authoritative rows where possible, not an uncommitted import.
+            try:
+                snapshot = self.storage.load_accounts_snapshot()
+                committed = {str(row["access_token"]): row for row in snapshot.items
+                             if row.get("access_token") in keys}
+            except Exception:
+                committed = {key: persisted[key] for key in keys if key in persisted}
+            raise
+        finally:
+            self._lock.acquire()
+            view = dict(self._accounts)
+            rotation_ids = {row.get("management_id") for key, row in committed.items() if key not in before}
+            before_by_id = {row.get("management_id"): key for key, row in before.items()
+                            if row.get("management_id") in rotation_ids} if rotation_ids else {}
+            for key in keys:
+                row = committed.get(key)
+                if row is None:
+                    view.pop(key, None)
+                    self._persisted_accounts.pop(key, None)
+                    continue
+                old_key = key if key in before else before_by_id.get(row.get("management_id"), key)
+                old, live = before.get(old_key), self._accounts.get(old_key)
+                normalized = self._normalize_account(row) or dict(row)
+                if old is not None and live is not None and old != live:
+                    if self._credential_generation(old_key, old) == self._credential_generation(key, normalized):
+                        normalized = self._merge_account_fields(old, live, normalized)
+                    elif saved and old_key != key:
+                        # Carry usage across our own rotation, never a stale auth
+                        # rejection from the old credential generation.
+                        usage = dict(old)
+                        for field in ("success", "fail", "quota", "last_used_at", "last_image_success_at"):
+                            if field in live:
+                                usage[field] = live[field]
+                        normalized = self._merge_account_fields(old, usage, normalized)
+                view[key] = normalized
+                self._persisted_accounts[key] = deepcopy(row)
+            rotations = self._passive_token_rotations_locked(view) if any(key in self._accounts and key not in view for key in keys) else []
+            self._accounts = view
+            for new_token, aliases in rotations:
+                self._move_account_runtime_token_locked(new_token, aliases)
+            # A partial write is not a full snapshot. Advancing its revision
+            # would hide imports/deletions committed by other replicas.
+            self._prune_token_aliases_locked()
+            self._image_slot_condition.notify_all()
+        return saved
 
     @staticmethod
     def _is_account_selectable(
@@ -1384,7 +1426,7 @@ class AccountService:
         terminal: bool = False,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
+        with self._account_write():
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
@@ -1611,7 +1653,7 @@ class AccountService:
             str(expected_refresh_token or "").strip(),
             str(expected_last_token_refresh_at or "").strip(),
         )
-        with self._image_slot_condition:
+        with self._account_write():
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
@@ -2188,115 +2230,51 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None,
             requires_file_upload: bool = False,
     ) -> tuple[str | None, int, int, int]:
-        """Find one image token without allocating a full candidate list.
+        """Round-robin with quota priority; stop at the first best candidate.
 
-        The caller holds ``_image_slot_condition``.  The old implementation built
-        a ready-token list and then a second available-token list on every image
-        request.  With a large pool that created unnecessary allocations and
-        temporary references on the hot path.
+        Previously every successful lease decoded/checked the entire pool under
+        the dispatch lock. A short key snapshot is cheap; only validate as many
+        rows as needed. Exhaustion still scans all rows for accurate outcomes.
         """
-        now_epoch = time.time()
-        max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        account_count = len(self._accounts)
-        if account_count == 0:
+        keys = tuple(self._accounts)
+        count = len(keys)
+        if not count:
             return None, 0, 0, 0
-
-        cursor = self._image_index % account_count
-        selected_token: str | None = None
-        selected_ordinal: int | None = None
-        selected_known_quota_token: str | None = None
-        selected_known_quota_ordinal: int | None = None
-        selected_warm_unknown_token: str | None = None
-        selected_warm_unknown_ordinal: int | None = None
-        first_available_token: str | None = None
-        first_available_ordinal: int | None = None
-        first_known_quota_token: str | None = None
-        first_known_quota_ordinal: int | None = None
-        first_warm_unknown_token: str | None = None
-        first_warm_unknown_ordinal: int | None = None
-        ready_count = 0
-        matched_count = 0
-        limited_count = 0
-
-        for ordinal, item in enumerate(self._accounts.values()):
-            token = item.get("access_token") or ""
-            if not token or token in excluded_tokens:
+        now = time.time()
+        limit = max(1, int(config.image_account_concurrency or 1))
+        cursor = self._image_index % count
+        first_available = first_warm = None
+        ready = matched = limited = 0
+        for offset in range(count):
+            ordinal = (cursor + offset) % count
+            token = keys[ordinal]
+            item = self._accounts[token]
+            if token in excluded_tokens or not self._image_account_belongs_to_instance(item):
                 continue
-            if not self._image_account_belongs_to_instance(item):
+            if not (self._account_matches_plan_type(item, plan_type)
+                    and self._account_matches_any_plan_type(item, plan_types)
+                    and self._account_matches_source_type(item, source_type)):
                 continue
-            if not (
-                self._account_matches_plan_type(item, plan_type)
-                and self._account_matches_any_plan_type(item, plan_types)
-                and self._account_matches_source_type(item, source_type)
+            matched += 1
+            limited += int(item.get("status") == "限流")
+            if not self._is_image_account_available(item) or (requires_file_upload and upload_blocked(item, now)):
+                continue
+            ready += 1
+            if int(self._image_inflight.get(token, 0)) >= limit:
+                continue
+            if self._is_unlimited_image_quota_account(item) or (
+                not item.get("image_quota_unknown") and int(item.get("quota") or 0) > 0
             ):
-                continue
-
-            matched_count += 1
-            if str(item.get("status") or "") == "限流":
-                limited_count += 1
-            if not self._is_image_account_available(item):
-                continue
-            if requires_file_upload and upload_blocked(item, now_epoch):
-                continue
-            ready_count += 1
-            if int(self._image_inflight.get(token, 0)) >= max_concurrency:
-                continue
-
-            known_quota = (
-                self._is_unlimited_image_quota_account(item)
-                or (
-                    not bool(item.get("image_quota_unknown"))
-                    and int(item.get("quota") or 0) > 0
-                )
-            )
-            if first_available_token is None:
-                first_available_token = token
-                first_available_ordinal = ordinal
-            if known_quota and first_known_quota_token is None:
-                first_known_quota_token = token
-                first_known_quota_ordinal = ordinal
-            warm_unknown = bool(item.get("image_quota_unknown")) and bool(
-                item.get("last_image_success_at")
-            )
-            if warm_unknown and first_warm_unknown_token is None:
-                first_warm_unknown_token = token
-                first_warm_unknown_ordinal = ordinal
-            if selected_token is None and ordinal >= cursor:
-                selected_token = token
-                selected_ordinal = ordinal
-            if (
-                known_quota
-                and selected_known_quota_token is None
-                and ordinal >= cursor
-            ):
-                selected_known_quota_token = token
-                selected_known_quota_ordinal = ordinal
-            if (
-                warm_unknown
-                and selected_warm_unknown_token is None
-                and ordinal >= cursor
-            ):
-                selected_warm_unknown_token = token
-                selected_warm_unknown_ordinal = ordinal
-
-        if selected_known_quota_token is not None:
-            selected_token = selected_known_quota_token
-            selected_ordinal = selected_known_quota_ordinal
-        elif first_known_quota_token is not None:
-            selected_token = first_known_quota_token
-            selected_ordinal = first_known_quota_ordinal
-        elif selected_warm_unknown_token is not None:
-            selected_token = selected_warm_unknown_token
-            selected_ordinal = selected_warm_unknown_ordinal
-        elif first_warm_unknown_token is not None:
-            selected_token = first_warm_unknown_token
-            selected_ordinal = first_warm_unknown_ordinal
-        elif selected_token is None:
-            selected_token = first_available_token
-            selected_ordinal = first_available_ordinal
-        if selected_token is not None and selected_ordinal is not None:
-            self._image_index = (selected_ordinal + 1) % account_count
-        return selected_token, ready_count, matched_count, limited_count
+                self._image_index = (ordinal + 1) % count
+                return token, ready, matched, limited
+            if first_available is None:
+                first_available = (token, ordinal)
+            if first_warm is None and item.get("image_quota_unknown") and item.get("last_image_success_at"):
+                first_warm = (token, ordinal)
+        chosen = first_warm or first_available
+        if chosen:
+            self._image_index = (chosen[1] + 1) % count
+        return chosen[0] if chosen else None, ready, matched, limited
 
     def _no_ready_candidate_error(
             self,
@@ -2458,7 +2436,7 @@ class AccountService:
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
-        with self._lock:
+        with self._account_write():
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -2469,7 +2447,7 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._save_accounts(account_tokens={access_token})
 
     def remove_invalid_token(
         self,
@@ -3207,6 +3185,7 @@ class AccountService:
         *,
         restore: bool = False,
         return_item_results: bool = False,
+        skip_existing: bool = False,
     ) -> dict:
         source_items = list(items)
         payloads: list[dict] = []
@@ -3223,6 +3202,7 @@ class AccountService:
             return_items=return_items,
             preserve_lifecycle=restore,
             return_item_results=return_item_results,
+                skip_existing=skip_existing,
         )
         if return_item_results:
             aligned_results = ["invalid"] * len(source_items)
@@ -3251,6 +3231,7 @@ class AccountService:
         *,
         preserve_lifecycle: bool = False,
         return_item_results: bool = False,
+        skip_existing: bool = False,
     ) -> dict:
         proxy_payload_indices = [
             index
@@ -3267,6 +3248,7 @@ class AccountService:
                 return_items=return_items,
                 preserve_lifecycle=preserve_lifecycle,
                 return_item_results=return_item_results,
+                skip_existing=skip_existing,
             )
 
         references = [
@@ -3289,6 +3271,7 @@ class AccountService:
                 return_items=return_items,
                 preserve_lifecycle=preserve_lifecycle,
                 return_item_results=return_item_results,
+                skip_existing=skip_existing,
             )
 
         return self._run_proxy_assignment_mutation(references, persist)
@@ -3300,6 +3283,7 @@ class AccountService:
         *,
         preserve_lifecycle: bool = False,
         return_item_results: bool = False,
+        skip_existing: bool = False,
     ) -> dict:
         deduped: dict[str, dict] = {}
         input_tokens: list[str] = []
@@ -3324,7 +3308,7 @@ class AccountService:
                 result["item_results"] = []
             return result
 
-        with self._lock:
+        with self._account_write():
             added = 0
             skipped = len(input_tokens) - len(deduped)
             outcomes_by_token: dict[str, str] = {}
@@ -3350,6 +3334,10 @@ class AccountService:
                     outcomes_by_token[access_token] = "skipped"
                     continue
                 current = self._accounts.get(access_token)
+                if current is not None and skip_existing:
+                    skipped += 1
+                    outcomes_by_token[access_token] = "skipped"
+                    continue
                 if current is None:
                     fingerprint = self._access_token_fingerprint(access_token)
                     if fingerprint in token_fingerprint_owners:
@@ -3399,6 +3387,8 @@ class AccountService:
             conflict_existing_tokens: set[str] = set()
             self._save_accounts(
                 conflict_existing_tokens=conflict_existing_tokens,
+                account_tokens={token for token in deduped if not skip_existing or outcomes_by_token.get(token) == "added"},
+                skip_new_conflicts=skip_existing,
             )
             for access_token in conflict_existing_tokens:
                 if outcomes_by_token.get(access_token) != "added":
@@ -3500,7 +3490,7 @@ class AccountService:
             "prepare_accounts",
             len(requested_tokens),
         )
-        with self._lock:
+        with self._account_write():
             target_tokens: list[str] = []
             candidate_ids: list[str] = []
             missing_tokens: list[str] = []
@@ -3527,7 +3517,7 @@ class AccountService:
                     "save_accounts",
                     removed,
                 )
-                self._save_accounts()
+                self._save_accounts(account_tokens=target_set)
                 self._remove_account_runtime_state_locked(target_set)
                 self._add_account_log_best_effort(
                     f"删除 {removed} 个账号",
@@ -3643,7 +3633,7 @@ class AccountService:
             len(requested_tokens),
         )
 
-        with self._lock:
+        with self._account_write():
             requested: list[tuple[str, str]] = []
             missing_tokens: list[str] = []
             auto_remove_events: list[tuple[str, str]] = []
@@ -3690,7 +3680,7 @@ class AccountService:
                     "save_accounts",
                     len(requested),
                 )
-                self._save_accounts()
+                self._save_accounts(account_tokens=seen_tokens)
 
             existing_ids = {
                 str(account.get("management_id") or "").strip().lower()
@@ -3790,7 +3780,7 @@ class AccountService:
         expected_remote_check_marker: _RemoteCheckMarker | None = None,
         preserve_disabled: bool = False,
     ) -> dict | None:
-        with self._lock:
+        with self._account_write():
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -3881,6 +3871,7 @@ class AccountService:
                 self._accounts.pop(access_token, None)
                 saved = self._save_accounts(
                     expected_credential_generation=expected_generation,
+                    account_tokens={access_token, next_access_token},
                 )
                 if not saved:
                     return None
@@ -3902,6 +3893,7 @@ class AccountService:
             self._accounts[next_access_token] = account
             saved = self._save_accounts(
                 expected_credential_generation=expected_generation,
+                    account_tokens={access_token, next_access_token},
             )
             if not saved:
                 return None
@@ -3965,7 +3957,7 @@ class AccountService:
         expected_remote_check_marker: _RemoteCheckMarker | None = None,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
+        with self._account_write():
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -4011,6 +4003,7 @@ class AccountService:
                 self._accounts[access_token] = account
                 saved = self._save_accounts(
                     expected_credential_generation=expected_generation,
+                    account_tokens={access_token},
                 )
                 if not saved:
                     return False
@@ -4038,7 +4031,7 @@ class AccountService:
     ) -> bool:
         _ = quiet
         now = datetime.now(timezone.utc)
-        with self._lock:
+        with self._account_write():
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -4115,6 +4108,7 @@ class AccountService:
                 self._accounts[access_token] = account
             saved = self._save_accounts(
                 expected_credential_generation=expected_generation,
+                account_tokens={access_token},
             )
             if not saved:
                 return False
@@ -4207,7 +4201,7 @@ class AccountService:
         if not access_token:
             return False
         now = datetime.now(timezone.utc).isoformat()
-        with self._image_slot_condition:
+        with self._account_write():
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -4236,6 +4230,7 @@ class AccountService:
             self._accounts[access_token] = account
             saved = self._save_accounts(
                 expected_credential_generation=expected_generation,
+                account_tokens={access_token},
             )
             if not saved:
                 return False
@@ -4626,7 +4621,7 @@ class AccountService:
         now = datetime.now(timezone.utc)
         should_verify_after_failure = False
         consumed_quota = success if quota_consumed is None else bool(quota_consumed)
-        with self._image_slot_condition:
+        with (self._image_slot_condition if defer_persistence else self._account_write()):
             access_token = self._resolve_access_token_locked(access_token)
             self._release_image_slot_locked(access_token)
             try:
@@ -4697,6 +4692,7 @@ class AccountService:
                 else:
                     saved = self._save_accounts(
                         expected_credential_generation=expected_generation,
+                        account_tokens={access_token},
                     )
                     if not saved:
                         should_verify_after_failure = False
@@ -4751,42 +4747,24 @@ class AccountService:
                 self._image_result_persist_dirty = False
                 pending = dict(self._image_result_persist_pending)
                 self._image_result_persist_pending.clear()
-
-            failed: dict[str, dict] = {}
-            for access_token, account in pending.items():
+            failed = {}
+            for token in pending:
                 try:
-                    # Image-result writes are keyed row mutations. Do not use
-                    # the collection CAS here: a burst across replicas would
-                    # otherwise force every loser to reload all 37k accounts.
-                    self.storage.mutate_accounts(
-                        StorageMutation(upserts=(account,))
-                    )
+                    with self._account_write():
+                        # Always commit the latest live row. A queued older row
+                        # must not resurrect a deleted/rotated account or undo a
+                        # newer quota/auth update by another replica.
+                        active = self._resolve_access_token_locked(token)
+                        if active not in self._accounts:
+                            continue
+                        self._save_accounts(account_tokens={active})
                 except Exception:
-                    failed[access_token] = account
+                    failed[token] = pending[token]
                     logger.exception("image account persistence failed")
-                    continue
-
-                with self._image_slot_condition:
-                    current = self._accounts.get(access_token)
-                    if current == account:
-                        self._persisted_accounts[access_token] = deepcopy(account)
-                        # A keyed write does not load the collection. Its new
-                        # revision may also include unseen imports/deletions
-                        # from another replica. Only a full snapshot (or CAS
-                        # against the known revision) can advance our view.
-
-            retry_pending: dict[str, dict] = {}
-            with self._image_slot_condition:
-                for access_token, account in failed.items():
-                    current = self._accounts.get(access_token)
-                    if current == account:
-                        retry_pending[access_token] = account
-            if retry_pending:
-                with self._image_result_persist_lock:
-                    self._image_result_persist_pending.update(retry_pending)
-
             if failed:
                 with self._image_result_persist_lock:
+                    for token, row in failed.items():
+                        self._image_result_persist_pending.setdefault(token, row)
                     self._image_result_persist_scheduled = False
                 return
 

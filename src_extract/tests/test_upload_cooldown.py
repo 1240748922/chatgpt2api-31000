@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from threading import Condition
+from threading import Condition, Lock
 
 import pytest
 
@@ -18,6 +18,8 @@ from utils.helper import UpstreamHTTPError, parse_retry_after
 def test_upload_429_records_only_upload_cooldown(monkeypatch):
     service = AccountService.__new__(AccountService)
     service._image_slot_condition = Condition()
+    service._write_lock = Lock()
+    service._write_baseline = None
     service._accounts = OrderedDict(token={
         "access_token": "token", "status": "正常", "quota": 8,
         "image_quota_unknown": False, "last_remote_checked_at": datetime.now(timezone.utc).isoformat(),

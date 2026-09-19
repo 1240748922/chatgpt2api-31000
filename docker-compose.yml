@@ -50,6 +50,10 @@ x-app: &app
     CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY: ${CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY:-2}
     CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE: ${CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE:-50}
     CHATGPT2API_ACCOUNT_SHARD_COUNT: 8
+    # Account ingestion runs in the dedicated importer service below so that
+    # large imports never consume the public app's maintenance worker.
+    CHATGPT2API_IMPORT_WORKER_ENABLED: 0
+    CHATGPT2API_IMPORT_BATCH_SIZE: ${CHATGPT2API_IMPORT_BATCH_SIZE:-250}
     # Background account maintenance yields while image traffic is active.
     # These values do not change the image worker-pool concurrency.
     CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX: ${CHATGPT2API_MAINTENANCE_IMAGE_ACTIVE_MAX:-2}
@@ -86,6 +90,25 @@ services:
   app6: {<<: *app, environment: {<<: *env, CHATGPT2API_ACCOUNT_SHARD_INDEX: 6}}
   app7: {<<: *app, environment: {<<: *env, CHATGPT2API_ACCOUNT_SHARD_INDEX: 7}}
 
+  importer:
+    <<: *app
+    command:
+      - /app/.venv/bin/python
+      - -m
+      - uvicorn
+      - import_main:app
+      - --app-dir
+      - /app/src_extract
+      - --host
+      - 0.0.0.0
+      - --port
+      - "80"
+    environment:
+      <<: *env
+      CHATGPT2API_IMPORT_WORKER_ENABLED: 1
+    # The importer exposes only the authenticated import API and its own
+    # health/version endpoint; it has no image-generation routes.
+
   gateway:
     image: nginx:1.29-alpine
     restart: unless-stopped
@@ -96,7 +119,7 @@ services:
       - /bin/sh
       - -c
       - |
-        for app in app0 app1 app2 app3 app4 app5 app6 app7; do
+        for app in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
           until wget -q -O /dev/null "http://$${app}/version"; do
             sleep 1
           done
@@ -117,6 +140,7 @@ services:
       app5: {condition: service_healthy}
       app6: {condition: service_healthy}
       app7: {condition: service_healthy}
+      importer: {condition: service_healthy}
 
 networks:
   frontend:

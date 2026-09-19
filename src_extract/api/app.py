@@ -9,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, image_tasks, prompts, system
+from api import accounts, ai, image_tasks, prompts, system, account_ingest
 from api.errors import install_exception_handlers
 from api.support import (
     resolve_web_asset,
@@ -56,6 +56,11 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         _configure_threadpool()
         singleton_background = account_shard_settings()[1] == 0
+        import_service = None
+        if singleton_background and env_int("CHATGPT2API_IMPORT_WORKER_ENABLED", 1, 0, 1):
+            from services.account_ingest_service import get_account_ingest_service
+            import_service = await run_in_threadpool(get_account_ingest_service)
+            import_service.start()
         if singleton_background:
             start_genbox_push_service()
             image_task_service.start()
@@ -108,6 +113,8 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            if import_service is not None:
+                await run_in_threadpool(import_service.stop)
             if thread is not None:
                 thread.join(timeout=1)
             if replenishment_thread is not None:
@@ -143,6 +150,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
+    app.include_router(account_ingest.create_router())
     app.include_router(image_tasks.create_router())
     app.include_router(prompts.create_router())
     app.include_router(system.create_router(app_version))

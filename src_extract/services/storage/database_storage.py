@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import Column, Integer, String, Text, select, text, true
@@ -22,6 +24,23 @@ from services.storage.base import (
     StorageSnapshot,
 )
 from services.storage.mutation import item_key, normalize_items, normalize_mutation
+
+
+_account_commit_hook = ContextVar("account_commit_hook", default=None)
+
+
+@contextmanager
+def account_commit_hook(callback, backend):
+    """Attach a durable import checkpoint to this worker's account transaction.
+
+    Context-local, never shared with other request/maintenance threads. A lost
+    job lease raises before writing, rolling back both rows and checkpoint.
+    """
+    token = _account_commit_hook.set((backend, callback))
+    try:
+        yield
+    finally:
+        _account_commit_hook.reset(token)
 
 
 class AccountModel(DatabaseBase):
@@ -281,6 +300,10 @@ class DatabaseStorageBackend(StorageBackend):
                     mutation.expected_revision,
                     current_revision,
                 )
+            hook_context = _account_commit_hook.get() if collection == "accounts" else None
+            hook = hook_context[1] if hook_context and hook_context[0] is self else None
+            if hook is not None:
+                hook(session, "before", mutation, None)
             rows = (
                 session.query(model).filter(key_column.in_(target_keys)).all()
                 if target_keys
@@ -304,6 +327,7 @@ class DatabaseStorageBackend(StorageBackend):
                         raise StorageRevisionConflictError(
                             collection, mutation.expected_revision or "checked rows", current_revision,
                         )
+            inserted_keys = []
             inserted = 0
             updated = 0
             deleted = 0
@@ -321,12 +345,15 @@ class DatabaseStorageBackend(StorageBackend):
                 if row is None:
                     session.add(model(**{model_key: key}, data=serialized))
                     inserted += 1
+                    inserted_keys.append(key)
                 elif self._deserialize(row.data) != item:
                     row.data = serialized
                     updated += 1
 
             if inserted or updated or deleted:
                 revision_row.version += 1
+            if hook is not None:
+                hook(session, "after", mutation, {"inserted": inserted, "updated": updated, "deleted": deleted, "inserted_keys": inserted_keys})
             session.commit()
             return StorageMutationResult(
                 revision=self._revision_value(collection, revision_row.version),

@@ -2,8 +2,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
-from pathlib import Path
+from fastapi.responses import RedirectResponse
 
 from api.account_ingest import create_router
 from services.account_ingest_service import get_account_ingest_service
@@ -31,9 +30,4 @@ def version():
 
 @app.get("/account-import.html")
 def page():
-    return FileResponse(Path(__file__).parent / "web_dist" / "account-import.html")
-
-
-@app.get("/account-import.js")
-def script():
-    return FileResponse(Path(__file__).parent / "web_dist" / "account-import.js", media_type="application/javascript")
+    return RedirectResponse("/#/accounts?import=access_token", status_code=307)

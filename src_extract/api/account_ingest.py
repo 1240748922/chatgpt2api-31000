@@ -26,7 +26,7 @@ def create_router():
     async def submit(body: AccountIngestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         from api.accounts import _target_account_group_id
-        group = _target_account_group_id(body.target_group_id)
+        group = await run_in_threadpool(_target_account_group_id, body.target_group_id)
         items = [*body.accounts, *({"refresh_token" if body.token_type == "rt" or (body.token_type == "auto" and token.strip().startswith("rt.")) else "access_token": token} for token in body.tokens),
                  *({"refresh_token": token} for token in body.refresh_tokens)]
         if group is not None:

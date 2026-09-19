@@ -230,21 +230,21 @@ CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 
 这项扫描只在 `app0` 的生命周期维护线程运行，8 个实例不会重复扫描同一批账号。生图请求仍优先使用已确认有额度的账号，其次使用近期成功过的未知账号，最后才尝试冷的未知账号。
 
-大批量导号使用独立的 `importer` 容器和入口 `http://服务器:31000/account-import.html`。导入任务写入 PostgreSQL 的 `account_ingest_jobs`，默认每批保存 250 个账号；每批提交后立即进入账号池，进程重启会从最近一次已提交的批次继续。导入 worker 不在 `app0` 到 `app7` 中运行，因此不会占用生图实例的账号维护线程。可在 `.env` 调整批次大小：
+大批量导号直接在原来的 **账号管理 → 导入 / 添加** 窗口操作，后台使用独立的 `importer` 容器。导入任务写入 PostgreSQL 的 `account_ingest_jobs`，默认每批保存 250 个账号；每批提交后立即进入账号池，进程重启会从最近一次已提交的批次继续。导入 worker 不在 `app0` 到 `app7` 中运行，因此不会占用生图实例的账号维护线程。可在 `.env` 调整批次大小：
 
 ```env
 CHATGPT2API_IMPORT_BATCH_SIZE=250
 ```
 
-3.2.4 的“导入 v2”页面复用同一域名、同一端口原后台的管理员登录，无需另填密钥；接口继续验证管理员身份。可粘贴逐行 AT/RT，或多选 TXT/JSON 文件，支持单个账号对象、账号数组、`accounts`/`tokens` 包装及嵌套 `credentials`/`auth` 凭证。自动模式识别 `rt.` 前缀；其他格式的 RT 请选“RT”模式。JSON 同时带有效 AT 和 RT 时直接入库，只有 RT 时先兑换。
+3.2.5 已把本地 AT、RT、Session JSON、CPA JSON 和 Sub2API JSON 导入整合回原窗口，使用原后台登录及“目标分组”选项，无需另填密钥。支持逐行 AT/RT、TXT/JSON 多文件、单个账号对象、账号数组、`accounts`/`items`/`results`/`data` 包装及嵌套 `credentials`/`auth` 凭证。AT 模式也识别 `rt.` 前缀；其他格式的 RT 请选“导入 Refresh Token”。JSON 同时带有效 AT 和 RT 时直接入库，只有 RT 时先兑换。
 
-AT 入库、RT 兑换、额度同步由独立后台工作线程处理，RT 请求使用系统设置中已有的“导入并发数”（`account_import_concurrency`），额度同步使用 `account_quota_sync_concurrency`。分块读取、SQL 批量插入和复用账号指纹减少本地开销；RT 仍需等待上游 OAuth 响应。旧导入入口保持原行为；需要新批量路径时使用此页面。
+AT 入库、RT 兑换、额度同步由独立后台工作线程处理，RT 请求使用系统设置中已有的“导入并发数”（`account_import_concurrency`），额度同步使用 `account_quota_sync_concurrency`。分块读取、SQL 批量插入和复用账号指纹减少本地开销；RT 仍需等待上游 OAuth 响应。本地普通导入跳过已存在账号，保留其状态与额度；需要覆盖备份内的凭证、状态和配置时仍用“导入完整备份文件”。OAuth 登录与远程 CPA/Sub2API 导入的流程保持原有行为。
 
-页面能继续导入其他文件、刷新恢复任务、查看历史任务与逐批日志，数据库错误中断后可从断点重试。RT 单条兑换失败会记录条目序号和错误类型并跳过，其余账号继续；不会把失败的 RT 计为“已入库”。成功兑换后的新 RT 先持久化，入库失败重试时不用再次兑换。外部 OAuth 成功到本地首次写入之间若发生进程崩溃，无法保证外部兑换只执行一次。
+原导入窗口内能继续导入其他文件、查看历史任务与逐批日志；关闭窗口或刷新页面后可重新打开恢复查看，数据库错误中断后可从断点重试。后台额度同步默认勾选，也可取消以只入库。RT 单条兑换失败会记录条目序号和错误类型并跳过，其余账号继续；不会把失败的 RT 计为“已入库”。成功兑换后的新 RT 先持久化，入库失败重试时不用再次兑换。外部 OAuth 成功到本地首次写入之间若发生进程崩溃，无法保证外部兑换只执行一次。
 
 任务状态也可通过 `GET /api/account-import-jobs` 查看，增量日志使用 `GET /api/account-import-jobs/{id}/events?after=0`（响应 `next_cursor` 供下次查询）。日志不返回 token、代理凭证或原始上游错误。已完成任务清理导入内容副本，只保留计数和日志。旧版已提交任务可以续传；数据库自动新增导入分块、RT 结果和日志表，不修改原账号表或系统设置。
 
-升级需要同时更新镜像、`docker-compose.yml` 与 `nginx.conf`，确保 `/account-import.html`、`/account-import.js` 和 `/api/account-import-jobs` 都路由至 importer；仅刷新页面不会升级后端。确认运行 `/version` 显示 `3.2.4`、页面显示“导入 v2”，并检查容器镜像 revision。排查服务启动问题可用 `docker compose --env-file .env logs importer`。
+升级需要同时更新镜像、`docker-compose.yml` 与 `nginx.conf`，确保 `/api/account-import-jobs` 路由至 importer；仅刷新页面不会升级后端。确认运行 `/version` 显示 `3.2.5`，原账号导入窗口出现“导入 Refresh Token”和“导入任务与日志”，并检查容器镜像 revision。旧 `/account-import.html` 只做跳转，不再维护第二套导入界面；已有任务继续保留。排查服务启动问题可用 `docker compose --env-file .env logs importer`。
 
 无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，系统设置中的“超分并发数”默认每个 API 实例为 64，最大 512；保存后动态生效。放大失败会返回原图，不会让生图请求失败。也可通过以下变量提供未保存设置时的默认值：
 

@@ -284,7 +284,9 @@ def _target_account_group_id(value: str | None) -> str | None:
     group_id = _account_group_id(value)
     if not group_id:
         return ""
-    if not any(group.get("id") == group_id for group in _account_group_payload()["groups"]):
+    # Validation only needs configured group IDs. Building the management
+    # projection scans/copies the whole account pool and resolves proxies.
+    if not any(_account_group_id(group.get("id")) == group_id for group in _config_dict_list("account_groups")):
         raise HTTPException(status_code=400, detail={"error": "account group not found"})
     return group_id
 

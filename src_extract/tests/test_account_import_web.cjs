@@ -3,60 +3,148 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {Blob} = require('node:buffer');
-const script = path.resolve(__dirname, '../web_dist/account-import.js');
-const {parseInput} = require(script);
+const assets = path.resolve(__dirname, '../web_dist/assets');
+const source = fs.readFileSync(path.join(assets, 'accountImportRuntime-v3.js'), 'utf8');
+const context = {Blob, setTimeout, clearTimeout, Date};
+vm.createContext(context);
+vm.runInContext(source.replace(/export /g, '') + '\nthis.runtime={parseInput,readImportInputs,createImportController,formatEvent};', context);
+const {parseInput, readImportInputs, createImportController, formatEvent} = context.runtime;
+const plain = object => JSON.parse(JSON.stringify(object));
+const flush = () => new Promise(resolve => setImmediate(resolve));
 
-assert.deepEqual(parseInput('at-one\r\nrt.1.two'), [{access_token:'at-one'}, {refresh_token:'rt.1.two'}]);
-assert.deepEqual(parseInput('opaque-refresh', 'rt'), [{refresh_token:'opaque-refresh'}]);
-assert.deepEqual(parseInput('{"access_token":"at","refresh_token":"rt"}'), [{access_token:'at', refresh_token:'rt'}]);
-assert.deepEqual(parseInput('{"credentials":{"accessToken":"at"}}'), [{credentials:{accessToken:'at'}}]);
-assert.equal(parseInput('{"accounts":[{"refreshToken":"rt"}],"tokens":["at"],"refresh_tokens":["opaque"]}').length, 3);
-assert.throws(() => parseInput('{broken-json'), /JSON 格式错误/);
-assert.throws(() => parseInput('{"foo":"bar"}'), /缺少/);
-
-async function testPage({unauthorized = false} = {}) {
-  const elements = new Map();
-  const element = id => {
-    if (!elements.has(id)) elements.set(id, {value: id === 'mode' ? 'auto' : '', hidden: true, files: [], textContent: '', checked: false,
-      addEventListener(name, fn) { this[name] = fn; }, replaceChildren() {}, append() {}});
-    return elements.get(id);
-  };
-  let posted, getCalls = 0;
-  const job = {id:'test-id', status:'completed', total:2, processed:2, saved:2, added:2, skipped:0,
-    created_at:1, updated_at:2, done:true, synced:0, sync_failed:0};
-  const context = {
-    document: {getElementById: element, createElement: () => ({})}, Blob,
-    localStorage: {getItem: key => key === 'chatgpt2api.adminKey' ? 'fake-shared-admin' : null, setItem() {}},
-    crypto: {getRandomValues: array => array.fill(42)}, setTimeout: () => 1, clearTimeout() {},
-    fetch: async (url, options) => {
-      assert.equal(options.headers.Authorization, 'Bearer fake-shared-admin', 'reuse main console auth');
-      if (unauthorized) return {status:401, ok:false};
-      if (options.method === 'POST') { posted = JSON.parse(options.body); return {ok:true, json:async()=>({job})}; }
-      getCalls++;
-      const data = url.includes('/events?') ? {events:[{id:1,time:1,code:'batch_saved',start:1,end:2,saved:2,added:2,duration_ms:123}],next_cursor:1}
-        : url.endsWith('/test-id') ? {job} : {jobs:posted ? [job] : []};
-      return {ok:true, json:async()=>data};
-    },
-  };
-  vm.runInNewContext(fs.readFileSync(script, 'utf8'), context);
-  await new Promise(resolve => setImmediate(resolve));
-  if (unauthorized) {
-    assert.equal(element('login').hidden, false);
-    assert.equal(element('submit').disabled, true);
-    return;
-  }
-  assert.equal(element('submit').disabled, false);
-  element('file').files = [
-    {name:'first.json', size:30, text:async()=>'[{"access_token":"synthetic-at"}]'},
-    {name:'second.txt', size:15, text:async()=>'rt.synthetic'},
-  ];
-  await element('submit').click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(posted.accounts.length, 2);
-  assert.equal(posted.accounts[1].refresh_token, 'rt.synthetic');
-  assert(posted.request_key);
-  assert.match(element('logs').textContent, /耗时 0.12 秒/);
-  assert.match(element('saved').textContent, /2 \/ 2/);
-  assert(getCalls >= 3);
+async function testInputs() {
+  assert.deepEqual(plain(parseInput('at-one\r\n# note\nrt.1.two')), [{access_token:'at-one'}, {refresh_token:'rt.1.two'}]);
+  assert.deepEqual(plain(parseInput('opaque-refresh', 'refresh_token')), [{refresh_token:'opaque-refresh'}]);
+  assert.deepEqual(plain(parseInput('{"credentials":{"accessToken":"at"}}')), [{credentials:{accessToken:'at'}}]);
+  assert.equal(parseInput('{"data":{"items":[{"refreshToken":"rt"}]}}')[0].refreshToken, 'rt');
+  assert.equal(parseInput('{"accounts":[{"access_token":"at"}],"tokens":["at2"],"refresh_tokens":["opaque"]}').length, 3);
+  assert.throws(() => parseInput('{broken-json'), /JSON 格式错误/);
+  assert.throws(() => parseInput('{"foo":"bar"}'), /缺少/);
+  assert.throws(() => parseInput('{"refresh_tokens":[{}]}'), /无效 RT/);
+  const files = [{name:'first.json', size:50, text:async()=>'[{"auth":{"accessToken":"synthetic-at"},"group_id":"source-group","proxy":"direct"}]'},
+    {name:'second.json', size:30, text:async()=>'[{"refresh_token":"rt.synthetic"}]'}];
+  const parsed = await readImportInputs({text:'', files, mode:'cpa_json'});
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].source_type, 'codex');
+  assert.equal(parsed[0].group_id, 'source-group');
+  assert.equal(parsed[0].proxy, 'direct');
+  assert.equal(parsed[1].refresh_token, 'rt.synthetic');
+  assert.equal((await readImportInputs({files:[{name:'a.txt',size:5,text:async()=>'rt.s'}], mode:'refresh_token'}))[0].refresh_token, 'rt.s');
+  await assert.rejects(readImportInputs({files:[{name:'a.json',size:100000000,text:async()=>{throw new Error('must not read');}}]}), /64 MiB/);
+  assert.match(formatEvent({time:1,code:'batch_saved',start:1,end:2,saved:2,added:2,duration_ms:123}), /0.12 秒/);
 }
-(async () => { await testPage(); await testPage({unauthorized:true}); console.log('account import UI: parsing, multi-file submission, shared login, progress/logs passed'); })().catch(error => {console.error(error);process.exitCode=1;});
+
+function fixture(options={}) {
+  let state, changed=0, counter=0;
+  const scheduled = new Map(), saved = new Map(), posts=[];
+  const job = {id:'job-one', status:'saving', total:2, processed:1, saved:1, added:1, skipped:0,
+    created_at:1, updated_at:2, done:false, synced:0, sync_failed:0};
+  const api = {
+    get: async url => url.includes('/events?') ? {events:[{id:1,time:1,code:'batch_saved',start:1,end:1,saved:1,added:1,duration_ms:123}],next_cursor:1}
+      : url.endsWith('/job-one') ? {job} : {jobs:[job]},
+    post: async (url, body) => {posts.push({url,body});return {job};},
+  };
+  const controller = createImportController({api, onUpdate:value=>{state=value;},onAccountsChanged:()=>{changed++;},
+    storage:{getItem:key=>saved.get(key), setItem:(key,value)=>saved.set(key,value)},
+    schedule:fn=>{scheduled.set(++counter,fn);return counter;},cancel:id=>scheduled.delete(id),
+    requestKey:()=>`request-${++counter}`, ...options});
+  return {controller, api, job, scheduled, saved, posts, state:()=>state, changed:()=>changed};
+}
+
+async function testSubmissionAndResume() {
+  const f=fixture();
+  await f.controller.history();
+  assert.equal(f.state().selected,'job-one');
+  assert.equal(f.scheduled.size,1);
+  assert.equal(f.state().events.length,1);
+  await f.controller.submit({accounts:[{access_token:'synthetic'}],targetGroupId:'chosen-group'});
+  await flush();
+  assert.equal(f.posts[0].url,'/api/account-import-jobs');
+  assert.equal(f.posts[0].body.target_group_id,'chosen-group');
+  assert.equal(f.posts[0].body.sync_after_import,true);
+  assert(f.posts[0].body.request_key);
+  assert.equal(f.saved.get('chatgpt2api.importJob'),'job-one');
+  assert(!JSON.stringify([...f.saved]).includes('synthetic'));
+  assert.equal(f.state().busy,false, 'a running background job must allow another import');
+  f.controller.stop();
+  assert.equal(f.scheduled.size,0);
+  f.job.status='completed';f.job.done=true;f.job.saved=2;f.job.processed=2;
+  f.controller.resume();await flush();
+  assert.equal(f.state().job.status,'completed');
+  assert.equal(f.scheduled.size,0);
+  assert(f.changed() > 0, 'refresh the account list after inserts and completion');
+  f.controller.stop();
+}
+
+async function testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection() {
+  const f=fixture();
+  let first=true;
+  f.api.post=async(url,body)=>{f.posts.push({url,body});if(first){first=false;throw new Error('network interrupted');}return {job:f.job};};
+  const args={accounts:[{access_token:'synthetic'}],syncAfterImport:false,targetGroupId:''};
+  assert.equal(await f.controller.submit(args),false);
+  assert.equal(await f.controller.submit(args),true);
+  assert.equal(f.posts[0].body.request_key,f.posts[1].body.request_key);
+  assert.equal(f.posts[1].body.target_group_id,'');
+  await flush();
+  let finish;
+  f.api.get=url=>new Promise(resolve=>{if(url.includes('/events?'))resolve({events:[],next_cursor:0});else finish=resolve;});
+  const reading=f.controller.select('job-one');
+  f.controller.stop();
+  finish({job:{...f.job,status:'failed'}});
+  await reading;
+  assert.notEqual(f.state().job.status,'failed');
+  assert.equal(f.scheduled.size,0);
+}
+
+async function testLogPagingAndReconnection() {
+  const f=fixture();let page=0;
+  f.job.done=true;f.job.status='completed';
+  f.api.get=async url=>url.includes('/events?')
+    ? {events:page++===0 ? Array.from({length:100},(_,i)=>({id:i+1,time:1,code:'completed'})) : [{id:101,time:1,code:'completed'}],next_cursor:page===1?100:101}
+    : {job:f.job};
+  await f.controller.select('job-one');
+  assert.equal(f.scheduled.size,1, 'drain logs even if job is completed');
+  const next=[...f.scheduled.values()][0];f.scheduled.clear();await next();
+  assert.equal(f.state().events.length,101);
+  assert.equal(f.scheduled.size,0);
+  f.api.get=async()=>{throw Object.assign(new Error('expired login'),{response:{status:401}});};
+  await f.controller.select('job-one');
+  assert.equal(f.scheduled.size,0,'do not poll forever after logout');
+  assert.equal(f.state().connection,'expired login');
+  f.controller.stop();
+}
+
+async function testOriginalModalAndBackupRestore() {
+  const bundle=fs.readFileSync(path.join(assets,'Accounts-CQrrBRkk.js'),'utf8');
+  assert(bundle.includes('localImportModes.includes(t($))?i(LocalAccountImportPanel'));
+  assert(bundle.includes('targetGroupId:Gt.value'));
+  assert(bundle.includes('onAccountsChanged:()=>t(Zt)({silentErrorToast:!0})'));
+  assert(bundle.includes('value:"refresh_token"'));
+  assert(bundle.includes('t($)==="oauth_login"?'));
+  assert(bundle.includes('t($)==="backup_json"?'));
+  assert(bundle.includes('t($)==="remote_cpa"?'));
+  assert(bundle.includes('t($)==="sub2api"?'));
+  const calls=[];
+  const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
+  const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},
+    Q:{importAccounts:async(accounts,source,options)=>{calls.push({accounts,source,options});return {added:1,skipped:0,updated_ids:[],events:[]};}},
+    Jo:{finishOAuthLogin:async(...args)=>{calls.push({oauth:args});return {added:1,skipped:0,updated_ids:[],events:[]};}}};
+  vm.createContext(scope);
+  vm.runInContext(bundle.slice(bundle.indexOf('function bs('),bundle.indexOf('function on(e)')),scope);
+  const model=scope.tn({bulkProgress:bulk,loadData:async()=>{},setError:(_,error)=>{throw error;},normalizeErrorMessage:error=>error.message});
+  model.importMode.value='backup_json';
+  await model.importLocalAccountFiles([{name:'backup.json',text:async()=>'[{"access_token":"synthetic","quota":0,"status":"禁用","proxy":"direct","group_id":"original"}]'}]);
+  assert.equal(calls[0].options.restore,true,'backup keeps full restore semantics');
+  assert.equal(calls[0].options.syncAfterImport,false);
+  assert.equal(calls[0].accounts[0].status,'禁用');
+  assert.equal(calls[0].accounts[0].quota,0);
+  model.oauthSessionId.value='session';model.oauthCallbackText.value='code';model.importTargetGroupValue.value='chosen';
+  await model.finishOAuthLogin();
+  assert.deepEqual(plain(calls[1].oauth),['session','code','chosen']);
+}
+
+(async()=>{
+  await testInputs();await testSubmissionAndResume();await testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection();
+  await testLogPagingAndReconnection();await testOriginalModalAndBackupRestore();
+  console.log('PASS: original modal integration, AT/RT/JSON files, target groups, async progress/logs, resume/idempotency, backup/OAuth compatibility');
+})().catch(error=>{console.error(error);process.exitCode=1;});

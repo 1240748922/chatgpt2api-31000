@@ -339,3 +339,31 @@ def test_quota_none_result_counts_as_failed_check(ingest, monkeypatch):
     service.claim("sync", "sync")
     result = service.sync_batch(job["id"], "sync")
     assert result["checked"] == result["sync_failed"] == 1
+
+
+@pytest.mark.parametrize("target,expected", [(None, "source"), ("", ""), ("chosen", "chosen")])
+def test_original_import_target_group_and_source_settings_survive_async_save(ingest, monkeypatch, target, expected):
+    from api import account_ingest as api, accounts as accounts_api
+    service, db = ingest
+    monkeypatch.setattr(api, "get_account_ingest_service", lambda: service)
+    monkeypatch.setattr(api, "require_admin", lambda *a: None)
+    monkeypatch.setattr(accounts_api, "_config_dict_list", lambda key: [{"id": "chosen"}])
+    def must_not_scan():
+        raise AssertionError("group validation must not scan the account pool")
+    monkeypatch.setattr(accounts_api, "_account_group_payload", must_not_scan)
+    app = FastAPI()
+    app.include_router(api.create_router())
+    client = TestClient(app)
+    account = {"auth": {"accessToken": "nested-at", "refreshToken": "nested-rt"},
+               "source_type": "codex", "group_id": "source", "proxy": "direct", "notes": "keep source settings"}
+    response = client.post("/api/account-import-jobs", json={"accounts": [account], "target_group_id": target})
+    assert response.status_code == 202
+    job_id = response.json()["job"]["id"]
+    service.claim("save", "worker")
+    service.save_batch(job_id, "worker")
+    saved = db.load_accounts()[0]
+    assert saved["group_id"] == expected
+    assert saved["source_type"] == "codex" and saved["proxy"] == "direct"
+    assert saved["notes"] == "keep source settings" and saved["refresh_token"] == "nested-rt"
+    response = client.post("/api/account-import-jobs", json={"accounts": [account], "target_group_id": "missing"})
+    assert response.status_code == 400

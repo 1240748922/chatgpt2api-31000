@@ -1,29 +1,6 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>批量导入账号</title>
-<style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif}body{margin:0;background:#101317;color:#eef2f7}main{max-width:1040px;margin:32px auto;padding:0 20px 40px}h1{font-size:26px;margin:0}h2{font-size:18px;margin:0 0 16px}p{color:#aeb8c5;line-height:1.6}a{color:#93b5ff}.top,.row{display:flex;gap:16px;align-items:center;flex-wrap:wrap}.top{justify-content:space-between}.badge{font-size:12px;color:#93b5ff}section{margin-top:20px;padding:22px;border:1px solid #303b4c;border-radius:12px;background:#171b21}label{display:block;margin:14px 0 7px;color:#cbd5e1}input,textarea,button,select{box-sizing:border-box;max-width:100%;border:1px solid #43516a;border-radius:7px;background:#101317;color:#eef2f7;padding:10px 12px;font:inherit}textarea{width:100%;min-height:180px;resize:vertical;font-family:ui-monospace,monospace}button{cursor:pointer}button.primary{background:#2563eb;border-color:#2563eb}button:disabled{opacity:.55;cursor:wait}.actions{margin-top:18px}.hint,#files{font-size:13px;color:#aeb8c5}#auth-state,#notice{padding:10px 0}#notice{color:#fbbf24;white-space:pre-wrap}[hidden]{display:none!important}progress{width:100%;height:10px;accent-color:#3b82f6;margin:16px 0}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.stats span{display:block;color:#aeb8c5;font-size:13px}.stats strong{display:block;margin-top:6px;font-size:23px}#job-info{color:#aeb8c5;font-size:13px;overflow-wrap:anywhere;white-space:pre-line;line-height:1.7}#logs{margin:12px 0 0;max-height:340px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.9 ui-monospace,monospace}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}main{margin-top:20px}section{padding:16px}}
-</style>
-</head>
-<body><main>
-<div class="top"><div><h1>批量导入账号 <span class="badge">导入 v2</span></h1><p>支持 AT、RT 与 JSON 文件。账号分批入库，进度可在刷新页面后继续查看。</p></div><a href="/#/accounts">返回账号管理</a></div>
-<div id="auth-state">正在读取后台登录状态…</div><a id="login" href="/#/login" hidden>前往后台登录</a>
-<section>
-<h2>导入账号</h2>
-<div class="row"><label for="mode">内容类型</label><select id="mode"><option value="auto">自动识别 AT / RT / JSON</option><option value="at">AT · 每行一个</option><option value="rt">RT · 每行一个</option><option value="json">JSON 文件或内容</option></select></div>
-<label for="payload">粘贴内容</label><textarea id="payload" spellcheck="false" autocomplete="off" placeholder='每行一个 AT 或 RT；也可粘贴 {"access_token":"…","refresh_token":"…"} 或 JSON 数组'></textarea>
-<label for="file">或选择文件（可多选，和粘贴内容合并导入）</label><input id="file" type="file" multiple accept=".json,.txt,application/json,text/plain"><p id="files">尚未选择文件</p>
-<label><input id="sync" type="checkbox"> 入库后在后台同步账号信息与额度</label>
-<p class="hint">AT 直接入库；RT 先并发换取 AT。额度同步不阻塞下一批导入，耗时取决于上游响应。重复账号会跳过，不重置现有状态或额度。</p>
-<div class="row actions"><button id="submit" class="primary" disabled>开始导入</button><button id="reload">刷新任务列表</button></div><div id="notice" role="alert"></div>
-</section>
-<section>
-<div class="top"><h2>导入进度</h2><select id="history" aria-label="选择历史任务"><option value="">暂无任务</option></select></div>
-<div id="job-info">尚未提交任务</div><progress id="progress" max="1" value="0"></progress>
-<div class="stats"><div><span>已入库 / 总数</span><strong id="saved">0 / 0</strong></div><div><span>新增 / 跳过</span><strong id="added">0 / 0</strong></div><div><span>RT 已处理 / 失败</span><strong id="refresh">0 / 0</strong></div><div><span>额度同步成功 / 失败</span><strong id="quota">0 / 0</strong></div></div>
-<button id="retry" hidden>从断点重试中断任务</button>
-</section>
-<section><h2>导入日志</h2><p class="hint">显示批次入库、RT 兑换、额度同步及失败原因。页面保留最近 500 条，重新打开任务可读取已保存日志。</p><pre id="logs" aria-live="polite">等待导入…</pre></section>
-</main><script src="/account-import.js?v=2"></script></body></html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0;url=/#/accounts?import=access_token">
+<title>返回账号管理</title></head>
+<body><p>导入功能已合并到账号管理。<a href="/#/accounts?import=access_token">打开原账号导入窗口</a></p>
+<script>location.replace('/#/accounts?import=access_token');</script></body></html>

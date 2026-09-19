@@ -7,8 +7,8 @@ const assets = path.resolve(__dirname, '../web_dist/assets');
 const source = fs.readFileSync(path.join(assets, 'accountImportRuntime-v3.js'), 'utf8');
 const context = {Blob, setTimeout, clearTimeout, Date};
 vm.createContext(context);
-vm.runInContext(source.replace(/export /g, '') + '\nthis.runtime={parseInput,readImportInputs,createImportController,formatEvent};', context);
-const {parseInput, readImportInputs, createImportController, formatEvent} = context.runtime;
+vm.runInContext(source.replace(/export /g, '') + '\nthis.runtime={parseInput,readImportInputs,createImportController,formatEvent,collectImportItems};', context);
+const {parseInput, readImportInputs, createImportController, formatEvent, collectImportItems} = context.runtime;
 const plain = object => JSON.parse(JSON.stringify(object));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -21,6 +21,10 @@ async function testInputs() {
   assert.throws(() => parseInput('{broken-json'), /JSON 格式错误/);
   assert.throws(() => parseInput('{"foo":"bar"}'), /缺少/);
   assert.throws(() => parseInput('{"refresh_tokens":[{}]}'), /无效 RT/);
+  const itemEvents = collectImportItems([{id:7,code:'quota_batch',items:[{account_label:'person@example.com',status:'failed',stage:'quota',message:'auth_invalid'}]}]);
+  assert.equal(itemEvents[0].account_label, 'person@example.com');
+  assert.equal(itemEvents[0].status_label, '失败');
+  assert.match(formatEvent({time:1,code:'refresh_failed',item:2,account_label:'person@example.com',error_code:'refresh_token_invalid',duration_ms:10}), /person@example.com/);
   const files = [{name:'first.json', size:50, text:async()=>'[{"auth":{"accessToken":"synthetic-at"},"group_id":"source-group","proxy":"direct"}]'},
     {name:'second.json', size:30, text:async()=>'[{"refresh_token":"rt.synthetic"}]'}];
   const parsed = await readImportInputs({text:'', files, mode:'cpa_json'});
@@ -114,6 +118,22 @@ async function testLogPagingAndReconnection() {
   f.controller.stop();
 }
 
+async function testTransientGatewayErrorRetries() {
+  const f = fixture();
+  let first = true;
+  f.api.get = async url => {
+    if (first) {
+      first = false;
+      throw Object.assign(new Error('Bad Gateway'), {response:{status:502}});
+    }
+    return url.includes('/events?') ? {events:[],next_cursor:0} : {job:f.job};
+  };
+  await f.controller.select('job-one');
+  assert.equal(f.state().connection, '连接暂时中断，正在自动重试…');
+  assert.equal(f.scheduled.size, 1, 'temporary gateway failures keep polling');
+  f.controller.stop();
+}
+
 async function testOriginalModalAndBackupRestore() {
   const bundle=fs.readFileSync(path.join(assets,'Accounts-CQrrBRkk.js'),'utf8');
   assert(bundle.includes('localImportModes.includes(t($))?i(LocalAccountImportPanel'));
@@ -145,6 +165,6 @@ async function testOriginalModalAndBackupRestore() {
 
 (async()=>{
   await testInputs();await testSubmissionAndResume();await testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection();
-  await testLogPagingAndReconnection();await testOriginalModalAndBackupRestore();
+  await testLogPagingAndReconnection();await testTransientGatewayErrorRetries();await testOriginalModalAndBackupRestore();
   console.log('PASS: original modal integration, AT/RT/JSON files, target groups, async progress/logs, resume/idempotency, backup/OAuth compatibility');
 })().catch(error=>{console.error(error);process.exitCode=1;});

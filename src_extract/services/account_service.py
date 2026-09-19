@@ -5636,6 +5636,7 @@ class AccountService:
         *,
         finalize_progress: bool = True,
         include_items: bool = False,
+        include_results: bool = False,
     ) -> dict[str, Any]:
         """Synchronize remote account metadata and image quota."""
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
@@ -5643,12 +5644,15 @@ class AccountService:
             result = {"synced": 0, "errors": []}
             if include_items:
                 result["items"] = self.list_accounts()
+            if include_results:
+                result["results"] = []
             if progress_id and finalize_progress:
                 self.finish_refresh_progress(progress_id, result)
             return result
 
         synced = 0
         errors = []
+        results = []
         max_workers = account_quota_sync_worker_count(len(access_tokens))
 
         if progress_id and self.get_refresh_progress(progress_id) is None:
@@ -5676,6 +5680,7 @@ class AccountService:
                     self.get_account(token)
                 )
                 result_account = None
+                diagnostic = {}
                 try:
                     account = future.result()
                 except (KeyboardInterrupt, SystemExit):
@@ -5684,6 +5689,7 @@ class AccountService:
                 except Exception as exc:
                     failure = classify_image_exception(exc)
                     account = self.get_account(token)
+                    diagnostic = failure.diagnostic_fields()
                     errors.append({
                         "token": anonymize_token(token),
                         "account_id": account_id,
@@ -5693,7 +5699,7 @@ class AccountService:
                             account,
                             access_token=token,
                         ),
-                        **failure.diagnostic_fields(),
+                        **diagnostic,
                     })
                     event_status = "failed"
                     event_message = self._credential_error_text(
@@ -5710,6 +5716,18 @@ class AccountService:
                     else:
                         event_status = "failed"
                         event_message = "\u8d26\u53f7\u4e0e\u989d\u5ea6\u540c\u6b65\u5931\u8d25"
+
+                if include_results:
+                    results.append({
+                        "account_id": account_id,
+                        "account_label": account_label,
+                        "status": event_status,
+                        "stage": "quota",
+                        "message": event_message,
+                        "error_code": diagnostic.get("failure_code", "") if diagnostic else (
+                            "quota_sync_failed" if event_status == "failed" else ""
+                        ),
+                    })
 
                 if progress_id:
                     self.update_refresh_progress(
@@ -5731,6 +5749,10 @@ class AccountService:
             executor.shutdown(wait=True, cancel_futures=True)
 
         result = {"synced": synced, "errors": errors}
+        if include_results:
+            # This is a safe projection for the import progress view. It never
+            # includes access/refresh tokens, cookies, proxies, or raw errors.
+            result["results"] = results
         if include_items:
             # Full account copies are expensive for large pools. Only callers
             # that explicitly need them should request this compatibility field.

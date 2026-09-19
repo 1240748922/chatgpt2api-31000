@@ -182,6 +182,54 @@ def test_conflicting_remote_insert_is_not_counted_or_overwritten(ingest, monkeyp
     assert next(row for row in db.load_accounts() if row["access_token"] == "secret-test-0")["status"] == "禁用"
 
 
+def test_import_events_project_email_and_per_account_save_status_without_credentials(ingest):
+    service, db = ingest
+    service.accounts.add_account_items([{"access_token": "existing-at", "email": "existing@example.com"}], return_items=False)
+    job = service.submit([
+        {"access_token": "new-at-secret", "email": "new@example.com"},
+        {"access_token": "existing-at", "email": "existing@example.com"},
+    ])
+    service.claim("save", "worker")
+    service.save_batch(job["id"], "worker")
+    saved_event = next(event for event in service.events(job["id"]) if event["code"] == "batch_saved")
+    assert [(item["account_label"], item["status"]) for item in saved_event["items"]] == [
+        ("new@example.com", "success"),
+        ("existing@example.com", "skipped"),
+    ]
+    serialized = json.dumps(service.events(job["id"]))
+    assert "new-at-secret" not in serialized and "existing-at" not in serialized
+
+
+def test_quota_import_event_contains_safe_per_account_results(ingest, monkeypatch):
+    service, _ = ingest
+
+    def sync(tokens, **kwargs):
+        assert kwargs["include_results"] is True
+        return {
+            "synced": 1,
+            "errors": [],
+            "results": [{
+                "account_id": "account-1",
+                "account_label": "quota@example.com",
+                "status": "success",
+                "stage": "quota",
+                "message": "账号与额度已同步",
+                "error_code": "",
+            }],
+        }
+
+    monkeypatch.setattr(service.accounts, "sync_accounts_and_quota", sync)
+    job = service.submit([{"access_token": "quota-at-secret", "email": "quota@example.com"}], sync_after_import=True)
+    service.claim("save", "save")
+    service.save_batch(job["id"], "save")
+    service.claim("sync", "sync")
+    service.sync_batch(job["id"], "sync")
+    quota_event = next(event for event in service.events(job["id"]) if event["code"] == "quota_batch")
+    assert quota_event["items"][0]["account_label"] == "quota@example.com"
+    assert quota_event["items"][0]["status"] == "success"
+    assert "quota-at-secret" not in json.dumps(quota_event)
+
+
 def test_rt_exchange_partial_failure_is_not_saved_as_an_access_token(ingest, monkeypatch):
     from services.account_service import TerminalRefreshTokenError
     service, db = ingest

@@ -316,6 +316,46 @@ class AccountIngestService:
             return "refresh_rate_limited" if exc.status_code == 429 else "refresh_upstream_error"
         return "refresh_network_error"
 
+    @staticmethod
+    def _import_account_label(item, number):
+        """Return the only identity allowed in import progress events."""
+        def find_label(value):
+            if not isinstance(value, dict):
+                return ""
+            for key in ("email", "account_email", "username"):
+                label = str(value.get(key) or "").strip()
+                if label:
+                    return label
+            for key in ("profile", "user", "account", "credentials", "credential", "auth"):
+                nested = value.get(key)
+                label = find_label(nested)
+                if label:
+                    return label
+            return ""
+
+        if isinstance(item, dict):
+            label = find_label(item)
+            if label:
+                return label[:240]
+        return f"账号 #{max(1, int(number or 0))}"
+
+    @classmethod
+    def _save_event_items(cls, items, inserted_tokens):
+        inserted_tokens = set(inserted_tokens or ())
+        projected = []
+        for index, item in enumerate(items or (), 1):
+            token = str(item.get("access_token") or "") if isinstance(item, dict) else ""
+            added = token in inserted_tokens
+            projected.append({
+                "index": index,
+                "account_label": cls._import_account_label(item, index),
+                "status": "success" if added else "skipped",
+                "stage": "save",
+                "message": "账号已入库" if added else "账号已存在，跳过重复写入",
+                "error_code": "",
+            })
+        return projected
+
     def _prepare_refresh_batch(self, job_id, owner, start, items):
         pending = [(start+i, item) for i, item in enumerate(items) if item and not item.get("access_token")]
         if not pending:
@@ -341,7 +381,16 @@ class AccountIngestService:
                     session.add(AccountIngestRefresh(job_id=job_id, offset=entry[0],
                                 payload=json.dumps(prepared or {}, ensure_ascii=False), error=error))
                     self._event(session, job_id, "refresh_failed" if error else "refresh_done",
-                                item=entry[0]+1, error_code=error, duration_ms=duration)
+                                item=entry[0]+1, account_label=self._import_account_label(entry[1], entry[0]+1),
+                                error_code=error, duration_ms=duration,
+                                items=[{
+                                    "index": entry[0]+1,
+                                    "account_label": self._import_account_label(entry[1], entry[0]+1),
+                                    "status": "failed" if error else "success",
+                                    "stage": "refresh",
+                                    "message": error or "RT 已兑换",
+                                    "error_code": error or "",
+                                }])
 
     def save_batch(self, job_id, owner, *, refresh=False):
         status = "refreshing" if refresh else "saving"
@@ -360,10 +409,11 @@ class AccountIngestService:
         began = time.monotonic()
         committed = False
 
-        def finish(session, row, ids):
+        def finish(session, row, ids, event_items=None):
             self._finish_save(row, end, ids)
             self._event(session, job_id, "batch_saved", start=start+1, end=end,
-                        saved=len(items), added=len(ids), duration_ms=int((time.monotonic()-began)*1000))
+                        saved=len(items), added=len(ids), duration_ms=int((time.monotonic()-began)*1000),
+                        items=event_items if event_items is not None else self._save_event_items(items, ids))
             if row.status == "completed":
                 self._clear_payloads(session, job_id)
                 self._event(session, job_id, "completed")
@@ -376,7 +426,7 @@ class AccountIngestService:
                 # are committed with the rows, not reconstructed after a crash.
                 inserted_keys = set(counts["inserted_keys"])
                 ids = [item["management_id"] for item in mutation.upserts if item["access_token"] in inserted_keys]
-                finish(session, row, ids)
+                finish(session, row, ids, self._save_event_items(items, inserted_keys))
                 committed = True
 
         with account_commit_hook(checkpoint, self.accounts.storage):
@@ -386,7 +436,7 @@ class AccountIngestService:
         if not committed:
             with self.transaction() as session:
                 row = self._owned(session, job_id, owner, status, start)
-                finish(session, row, [])
+                finish(session, row, [], self._save_event_items(items, set()))
         return self.get(job_id)
 
     def sync_batch(self, job_id, owner):
@@ -396,7 +446,7 @@ class AccountIngestService:
             end, items = self._batch_items(session, row, start, max(10, account_quota_sync_worker_count(row.total)*2))
             tokens = [item["access_token"] for item in items if item is not None]
         began = time.monotonic()
-        result = self.accounts.sync_accounts_and_quota(tokens, include_items=False)
+        result = self.accounts.sync_accounts_and_quota(tokens, include_items=False, include_results=True)
         synced = min(len(tokens), max(0, int(result.get("synced") or 0)))
         failed = len(tokens)-synced
         with self.transaction() as session:
@@ -409,7 +459,8 @@ class AccountIngestService:
             row.updated, row.failures, row.error = time.time(), 0, ""
             self._event(session, job_id, "quota_batch", start=start+1, end=end,
                         synced=synced, failed=failed,
-                        duration_ms=int((time.monotonic()-began)*1000))
+                        duration_ms=int((time.monotonic()-began)*1000),
+                        items=list(result.get("results") or []))
             for error in result.get("errors") or []:
                 code = error.get("failure_code")
                 safe_code = code if code in {"auth_invalid", "file_upload_throttled", "image_quota_exhausted", "no_available_account"} else "quota_sync_failed"

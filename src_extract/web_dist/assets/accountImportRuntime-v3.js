@@ -54,13 +54,50 @@ export async function readImportInputs({text = "", files = [], mode = "access_to
   return accounts.map(item => ({...item, source_type: item.source_type || source}));
 }
 
+function itemStatusLabel(status) {
+  return ({success: "成功", failed: "失败", skipped: "跳过", info: "处理中"}[status] || status || "处理中");
+}
+
+export function importEventItems(event) {
+  if (Array.isArray(event?.items) && event.items.length) {
+    return event.items.map((item, index) => ({
+      ...item,
+      account_label: item.account_label || item.email || `账号 #${index + 1}`,
+      status: item.status || "info",
+      stage: item.stage || event.code || "import",
+      message: item.message || item.error_code || "处理中",
+      status_label: itemStatusLabel(item.status),
+      event_id: event.id,
+    }));
+  }
+  if (event?.account_label || event?.item) {
+    const status = event.code === "refresh_failed" ? "failed" : event.code === "refresh_done" ? "success" : "info";
+    return [{
+      index: event.item,
+      account_label: event.account_label || `账号 #${event.item || "?"}`,
+      status,
+      stage: event.code === "refresh_failed" || event.code === "refresh_done" ? "refresh" : event.code || "import",
+      message: event.error_code || event.message || "处理中",
+      error_code: event.error_code || "",
+      status_label: itemStatusLabel(status),
+      event_id: event.id,
+    }];
+  }
+  return [];
+}
+
+export function collectImportItems(events = []) {
+  return events.flatMap(importEventItems);
+}
+
 export function formatEvent(event) {
+  const account = event.account_label ? ` · ${event.account_label}` : "";
   const message = {
     submitted: `任务已提交，共 ${event.total} 条；输入重复 ${event.duplicates} 条，RT ${event.refresh_total} 条`,
     phase_started: `开始${{save: "分批入库", refresh: "RT 兑换", sync: "额度同步"}[event.phase] || "处理"}`,
     batch_saved: `第 ${event.start}–${event.end} 条：入库 ${event.saved}，新增 ${event.added}，耗时 ${elapsed(event.duration_ms)}`,
-    refresh_done: `第 ${event.item} 条：RT 已兑换并保存凭证，耗时 ${elapsed(event.duration_ms)}`,
-    refresh_failed: `第 ${event.item} 条：${errors[event.error_code] || "RT 兑换失败"}，耗时 ${elapsed(event.duration_ms)}`,
+    refresh_done: `第 ${event.item} 条${account}：RT 已兑换并保存凭证，耗时 ${elapsed(event.duration_ms)}`,
+    refresh_failed: `第 ${event.item} 条${account}：${errors[event.error_code] || "RT 兑换失败"}，耗时 ${elapsed(event.duration_ms)}`,
     quota_batch: `第 ${event.start}–${event.end} 条：额度同步成功 ${event.synced}，失败 ${event.failed}，耗时 ${elapsed(event.duration_ms)}`,
     quota_failed: `第 ${event.start}–${event.end} 条批次：${errors[event.error_code] || "额度同步失败"}`,
     retry_scheduled: `${errors[event.error_code] || "处理失败"}，已安排重试（第 ${event.failures} 次）`,
@@ -73,13 +110,19 @@ export function formatEvent(event) {
 export function createImportController({api, onUpdate, onAccountsChanged = () => {}, storage,
   schedule = setTimeout, cancel = clearTimeout, requestKey = () => Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16)).join("-")}) {
   const key = "chatgpt2api.importJob";
-  let state = {jobs: [], job: null, events: [], selected: "", busy: false, notice: "", connection: ""};
+  let state = {jobs: [], job: null, events: [], items: [], selected: "", busy: false, notice: "", connection: ""};
   let epoch = 0, active = true, timer, cursor = 0, request = null, historyEpoch = 0;
   let lastSaved = 0, lastRefresh = 0, refreshedTerminal = "";
   const update = changes => { state = {...state, ...changes}; if (active) onUpdate(state); };
   const remember = id => { try { storage?.setItem(key, id); } catch (_) {} };
   const readRemembered = () => { try { return storage?.getItem(key); } catch (_) { return null; } };
-  const message = error => typeof error?.response?.data?.detail?.error === "string" ? error.response.data.detail.error : error?.message || "连接失败，请重试";
+  const message = error => {
+    const status = Number(error?.response?.status || error?.status || 0);
+    if ([502, 503, 504].includes(status) || /network|timeout|连接|超时/i.test(error?.message || "")) {
+      return "连接暂时中断，正在自动重试…";
+    }
+    return typeof error?.response?.data?.detail?.error === "string" ? error.response.data.detail.error : error?.message || "连接失败，请重试";
+  };
   const refreshAccounts = job => {
     const now = Date.now(), terminal = job.done && refreshedTerminal !== job.id;
     if (terminal || job.saved > lastSaved && now-lastRefresh >= 5000) {
@@ -93,8 +136,9 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
       const [data, logs] = await Promise.all([api.get(`/api/account-import-jobs/${id}`), api.get(`/api/account-import-jobs/${id}/events?after=${cursor}`)]);
       if (!active || epoch !== generation) return;
       cursor = logs.next_cursor;
+      const events = [...state.events, ...logs.events].slice(-5000);
       update({job: data.job, jobs: state.jobs.map(job => job.id === id ? data.job : job),
-        events: [...state.events, ...logs.events].slice(-500), connection: ""});
+        events, items: collectImportItems(events), connection: ""});
       refreshAccounts(data.job);
       if (!data.job.done || logs.events.length === 100) timer = schedule(() => poll(id, generation), logs.events.length === 100 ? 100 : 1500);
     } catch (error) {
@@ -106,7 +150,7 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
   function select(id) {
     cancel(timer); epoch++; cursor = 0; lastSaved = 0; lastRefresh = 0; refreshedTerminal = "";
     remember(id);
-    update({selected: id, job: state.jobs.find(job => job.id === id) || null, events: [], connection: ""});
+    update({selected: id, job: state.jobs.find(job => job.id === id) || null, events: [], items: [], connection: ""});
     if (id && active) return poll(id, epoch);
   }
   async function history(preferred) {

@@ -11,7 +11,9 @@ export default defineComponent({
   emits: ["busy-change", "accounts-changed"],
   setup(props, {emit}) {
     const text = ref(""), files = ref([]), fileInput = ref(null), sync = ref(true), reading = ref(false), validation = ref("");
-    const state = ref({jobs: [], job: null, events: [], busy: false, notice: "", connection: ""});
+    const itemFilter = ref("all"), itemSearch = ref("");
+    const itemFilter = ref("all"), itemSearch = ref("");
+    const state = ref({jobs: [], job: null, events: [], items: [], busy: false, notice: "", connection: ""});
     let disposed = false;
     const busy = computed(() => reading.value || state.value.busy);
     let storage;
@@ -40,8 +42,17 @@ export default defineComponent({
       size: "xs", variant: primary ? "primary" : "outline", onClick, disabled,
     }, {default: () => label});
     const metric = (label, value) => h("div", {class: "min-w-0"}, [h("div", {class: "text-muted-foreground text-xs"}, label), h("div", {class: "mt-1 font-medium tabular-nums text-sm"}, value)]);
+    const stageLabel = stage => ({save: "入库", refresh: "RT 兑换", quota: "额度同步"}[stage] || stage || "处理");
+    const statusClass = status => ({success: "text-emerald-600", failed: "text-red-600", skipped: "text-muted-foreground", info: "text-amber-600"}[status] || "text-muted-foreground");
     return () => {
       const current = state.value, job = current.job;
+      const allItems = current.items || [];
+      const query = itemSearch.value.trim().toLowerCase();
+      const visibleItems = allItems.filter(item =>
+        (itemFilter.value === "all" || item.status === itemFilter.value) &&
+        (!query || String(item.account_label || "").toLowerCase().includes(query))
+      );
+      const itemCounts = allItems.reduce((counts, item) => { counts[item.status] = (counts[item.status] || 0) + 1; return counts; }, {});
       return h("section", {class: "space-y-3", "aria-label": "本地账号导入"}, [
         h("div", {}, [h("h3", {class: "text-sm font-medium"}, titles[props.mode]),
           h("p", {class: "mt-1 text-xs leading-6 text-muted-foreground"}, props.mode === "refresh_token"
@@ -73,8 +84,32 @@ export default defineComponent({
             h("div", {class: "grid grid-cols-2 gap-3"}, [metric("已入库 / 总数", `${job.saved} / ${job.total}`), metric("新增 / 跳过", `${job.added} / ${job.skipped}`), metric("RT 已处理 / 失败", `${job.refresh_done || 0} / ${job.refresh_failed || 0}`), metric("额度同步成功 / 失败", `${job.synced} / ${job.sync_failed}`)]),
             job.status === "failed" ? button("从断点重试中断任务", controller.retry) : null,
           ]) : null,
-          h("pre", {class: "max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5", "aria-label": "导入日志"}, current.events.map(formatEvent).join("\n") || "暂无导入日志"),
-          h("p", {class: "text-xs text-muted-foreground"}, "显示最近 500 条日志。关闭窗口后任务继续执行，重新打开可恢复查看。"),
+          job ? h("div", {class: "rounded-xl border border-border bg-muted/20 p-3 space-y-3", "aria-label": "导入进度明细"}, [
+            h("div", {class: "flex items-center justify-between gap-3"}, [
+              h("div", {}, [h("div", {class: "text-sm font-medium"}, "账号处理明细"), h("div", {class: "text-xs text-muted-foreground mt-1"}, `成功 ${itemCounts.success || 0} · 失败 ${itemCounts.failed || 0} · 跳过 ${itemCounts.skipped || 0}`)]),
+              h("span", {class: "text-xs text-muted-foreground tabular-nums"}, `${visibleItems.length} / ${allItems.length}`),
+            ]),
+            h("div", {class: "flex flex-wrap gap-2"}, [
+              h("select", {class: "ui-input-sm text-xs", value: itemFilter.value, "aria-label": "筛选导入结果", onChange: event => {itemFilter.value = event.target.value;}}, [
+                h("option", {value: "all"}, "全部状态"), h("option", {value: "success"}, "成功"), h("option", {value: "failed"}, "失败"), h("option", {value: "skipped"}, "跳过"),
+              ]),
+              h("input", {class: "ui-input-sm min-w-48 flex-1 text-xs", value: itemSearch.value, placeholder: "按邮箱搜索", "aria-label": "搜索邮箱", onInput: event => {itemSearch.value = event.target.value;}}),
+            ]),
+            h("div", {class: "max-h-64 overflow-auto rounded-lg border border-border bg-background"}, visibleItems.length ? h("table", {class: "w-full text-xs"}, [
+              h("thead", {class: "sticky top-0 bg-muted/90 text-left text-muted-foreground"}, h("tr", {}, [h("th", {class: "px-2 py-2 font-medium"}, "邮箱 / 账号"), h("th", {class: "px-2 py-2 font-medium"}, "阶段"), h("th", {class: "px-2 py-2 font-medium"}, "状态"), h("th", {class: "px-2 py-2 font-medium"}, "结果")])),
+              h("tbody", {}, visibleItems.map((item, index) => h("tr", {key: `${item.event_id || "event"}-${item.index || index}-${index}`, class: "border-t border-border/70 align-top"}, [
+                h("td", {class: "max-w-64 break-all px-2 py-2 font-mono"}, item.account_label || "未知账号"),
+                h("td", {class: "whitespace-nowrap px-2 py-2 text-muted-foreground"}, stageLabel(item.stage)),
+                h("td", {class: `whitespace-nowrap px-2 py-2 font-medium ${statusClass(item.status)}`}, item.status_label || item.status || "处理中"),
+                h("td", {class: "min-w-56 break-words px-2 py-2 text-muted-foreground"}, item.message || item.error_code || "—"),
+              ]))),
+            ]) : h("div", {class: "p-4 text-center text-xs text-muted-foreground"}, job.done ? "暂无匹配结果" : "等待账号处理结果…")),
+          ]) : null,
+          h("details", {class: "rounded-lg border border-border bg-muted/10"}, [
+            h("summary", {class: "cursor-pointer px-3 py-2 text-xs font-medium"}, "查看原始导入日志"),
+            h("pre", {class: "max-h-48 overflow-auto whitespace-pre-wrap break-all border-t border-border p-3 text-xs leading-5", "aria-label": "导入日志"}, current.events.map(formatEvent).join("\n") || "暂无导入日志"),
+          ]),
+          h("p", {class: "text-xs text-muted-foreground"}, "导入任务在后台继续执行；临时 502/503/504 会自动重试，重新打开窗口可恢复进度。"),
         ]),
       ]);
     };

@@ -160,6 +160,12 @@ def create_app() -> FastAPI:
         asset = resolve_web_asset(full_path)
         if asset is None:
             raise HTTPException(status_code=404, detail="Not Found")
-        return FileResponse(asset)
+        # The HTML entry point contains the hashed module URLs. Keeping it
+        # fresh is essential after a frontend hotfix; otherwise a browser can
+        # keep an old entry point and never request the repaired chunks.
+        headers = None
+        if asset.name == "index.html":
+            headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+        return FileResponse(asset, headers=headers)
 
     return app

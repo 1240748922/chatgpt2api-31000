@@ -12,7 +12,6 @@ export default defineComponent({
   setup(props, {emit}) {
     const text = ref(""), files = ref([]), fileInput = ref(null), sync = ref(true), reading = ref(false), validation = ref("");
     const itemFilter = ref("all"), itemSearch = ref("");
-    const itemFilter = ref("all"), itemSearch = ref("");
     const state = ref({jobs: [], job: null, events: [], items: [], busy: false, notice: "", connection: ""});
     let disposed = false;
     const busy = computed(() => reading.value || state.value.busy);

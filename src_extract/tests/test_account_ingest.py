@@ -1,6 +1,7 @@
 """Durable import checkpoints with real SQLite transactions and isolated rows."""
 import json
 import time
+from threading import Barrier, Event
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -25,6 +26,7 @@ def ingest(tmp_path, monkeypatch):
     service = AccountIngestService(url, accounts, batch_size=3)
     yield service, db
     accounts._image_result_persist_executor.shutdown(wait=True)
+    accounts._image_failure_schedule_executor.shutdown(wait=True)
     dispose_database_engine(url)
 
 
@@ -178,3 +180,162 @@ def test_conflicting_remote_insert_is_not_counted_or_overwritten(ingest, monkeyp
     result = service.save_batch(job["id"], "worker")
     assert result["saved"] == 2 and result["added"] == 1
     assert next(row for row in db.load_accounts() if row["access_token"] == "secret-test-0")["status"] == "禁用"
+
+
+def test_rt_exchange_partial_failure_is_not_saved_as_an_access_token(ingest, monkeypatch):
+    from services.account_service import TerminalRefreshTokenError
+    service, db = ingest
+    def exchange(rt, account, **kwargs):
+        if rt == "rt.bad-secret":
+            raise TerminalRefreshTokenError(401, "invalid_grant", "secret rt.bad-secret must never escape")
+        return {"access_token": "converted-at-secret", "refresh_token": "rotated-rt-secret", "id_token": "id-secret"}
+    monkeypatch.setattr(service.accounts, "_request_access_token_refresh", exchange)
+    job = service.submit([{"access_token": "rt.good-secret"}, {"auth": {"refreshToken": "rt.bad-secret"}}, {"accessToken": "ordinary-at"}])
+    assert job["refresh_total"] == 2
+    assert service.claim("save", "save") is None
+    assert service.claim("refresh", "rt") == job["id"]
+    view = service.save_batch(job["id"], "rt", refresh=True)
+    assert view["done"] and view["processed"] == 3
+    assert view["saved"] == view["added"] == 2
+    assert view["refresh_done"] == 2 and view["refresh_failed"] == 1 and view["skipped"] == 0
+    rows = db.load_accounts()
+    assert {r["access_token"] for r in rows} == {"ordinary-at", "converted-at-secret"}
+    assert next(r for r in rows if r["access_token"] == "converted-at-secret")["refresh_token"] == "rotated-rt-secret"
+    logs = service.events(job["id"])
+    assert any(r.get("error_code") == "refresh_token_invalid" for r in logs)
+    assert "secret" not in json.dumps([view, logs])
+
+
+def test_rotated_refresh_credentials_survive_save_failure_without_second_exchange(ingest, monkeypatch):
+    service, db = ingest
+    called = []
+    def exchange(rt, *args, **kwargs):
+        called.append(rt)
+        return {"access_token": "new-at", "refresh_token": "rotated-rt"}
+    monkeypatch.setattr(service.accounts, "_request_access_token_refresh", exchange)
+    job = service.submit([{"refresh_token": "rt.original"}])
+    service.claim("refresh", "worker")
+    def crash(*a, **kw):
+        raise RuntimeError("save interrupted after OAuth returned")
+    with monkeypatch.context() as patcher:
+        patcher.setattr(service.accounts, "add_account_items", crash)
+        with pytest.raises(RuntimeError):
+            service.save_batch(job["id"], "worker", refresh=True)
+    assert not db.load_accounts()
+    expire(service, job["id"])
+    resumed = AccountIngestService(service.url, service.accounts, batch_size=1)
+    resumed.claim("refresh", "new-worker")
+    assert resumed.save_batch(job["id"], "new-worker", refresh=True)["saved"] == 1
+    assert called == ["rt.original"]
+    assert db.load_accounts()[0]["refresh_token"] == "rotated-rt"
+
+
+def test_rt_network_does_not_block_an_at_job_or_account_reads(ingest, monkeypatch):
+    service, db = ingest
+    started, release = Event(), Event()
+    def exchange(rt, *args, **kwargs):
+        assert not service.accounts._lock.locked()
+        started.set()
+        assert release.wait(10)
+        return {"access_token": "converted-at", "refresh_token": rt}
+    monkeypatch.setattr(service.accounts, "_request_access_token_refresh", exchange)
+    slow = service.submit([{"refresh_token": "rt.slow"}])
+    service.claim("refresh", "rt")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        background = pool.submit(service.save_batch, slow["id"], "rt", refresh=True)
+        try:
+            assert started.wait(3)
+            fast = service.submit([{"access_token": "fast-at"}])
+            assert service.claim("save", "at") == fast["id"]
+            assert pool.submit(service.save_batch, fast["id"], "at").result(timeout=3)["saved"] == 1
+            assert service.accounts.get_account("fast-at", refresh_snapshot=False)
+        finally:
+            release.set()
+        assert background.result(timeout=3)["saved"] == 1
+
+
+def test_rt_exchange_uses_bounded_parallelism(ingest, monkeypatch):
+    import services.account_ingest_service as module
+    service, _ = ingest
+    barrier = Barrier(2)
+    monkeypatch.setattr(module, "account_import_worker_count", lambda n: min(2, n))
+    def exchange(rt, *a, **kw):
+        barrier.wait(timeout=3)  # cannot pass if refresh is accidentally serial
+        return {"access_token": "at-" + rt, "refresh_token": rt}
+    monkeypatch.setattr(service.accounts, "_request_access_token_refresh", exchange)
+    service.batch_size = 4
+    job = service.submit([{"refresh_token": f"rt.parallel-{i}"} for i in range(4)])
+    service.claim("refresh", "rt")
+    view = service.save_batch(job["id"], "rt", refresh=True)
+    assert view["saved"] == 4 and view["refresh_failed"] == 0
+
+
+def test_new_batch_size_resumes_existing_chunks_and_old_payloads(ingest):
+    from services.account_ingest_service import AccountIngestChunk
+    service, db = ingest
+    job = service.submit(payload(7))
+    service.claim("save", "worker")
+    assert service.save_batch(job["id"], "worker")["saved"] == 3
+    service.batch_size = 2
+    assert service.save_batch(job["id"], "worker")["saved"] == 5
+    assert service.save_batch(job["id"], "worker")["saved"] == 6
+    assert service.save_batch(job["id"], "worker")["saved"] == 7
+    # An already-queued job from the previous release retains its old format.
+    old = service.submit([{"access_token": "legacy-at"}])
+    with service.transaction() as session:
+        session.query(AccountIngestChunk).filter_by(job_id=old["id"]).delete()
+        session.get(AccountIngestJob, old["id"]).payload = json.dumps([{"access_token": "legacy-at"}])
+    service.claim("save", "worker")
+    assert service.save_batch(old["id"], "worker")["saved"] == 1
+    assert len(db.load_accounts()) == 8
+
+
+def test_rt_quota_phase_checks_converted_at_and_clears_payloads(ingest, monkeypatch):
+    from services.account_ingest_service import AccountIngestChunk, AccountIngestRefresh
+    service, _ = ingest
+    monkeypatch.setattr(service.accounts, "_request_access_token_refresh", lambda *a, **kw: {"access_token": "converted-at", "refresh_token": "rotated-rt"})
+    seen = []
+    def sync(tokens, **kwargs):
+        seen.extend(tokens)
+        return {"synced": len(tokens), "errors": []}
+    monkeypatch.setattr(service.accounts, "sync_accounts_and_quota", sync)
+    job = service.submit([{"refresh_token": "rt.original"}], sync_after_import=True)
+    service.claim("refresh", "rt")
+    assert service.save_batch(job["id"], "rt", refresh=True)["status"] == "sync_pending"
+    service.claim("sync", "sync")
+    assert service.sync_batch(job["id"], "sync")["status"] == "completed"
+    assert seen == ["converted-at"]
+    with service.Session() as session:
+        assert session.query(AccountIngestChunk).filter_by(job_id=job["id"]).one().payload == "[]"
+        assert session.query(AccountIngestRefresh).filter_by(job_id=job["id"]).one().payload == "{}"
+
+
+def test_event_cursor_and_api_refresh_tokens(ingest, monkeypatch):
+    from api import account_ingest as api
+    service, _ = ingest
+    monkeypatch.setattr(api, "get_account_ingest_service", lambda: service)
+    app = FastAPI()
+    app.include_router(api.create_router())
+    client = TestClient(app)
+    assert client.get("/api/account-import-jobs/anything/events").status_code in {401, 403}
+    monkeypatch.setattr(api, "require_admin", lambda *a: None)
+    response = client.post("/api/account-import-jobs", json={"tokens": ["rt.one"], "refresh_tokens": ["rt.two"]})
+    assert response.status_code == 202 and response.json()["job"]["refresh_total"] == 2
+    job_id = response.json()["job"]["id"]
+    service.claim("refresh", "worker")
+    first = client.get(f"/api/account-import-jobs/{job_id}/events?limit=1").json()
+    second = client.get(f"/api/account-import-jobs/{job_id}/events?after={first['next_cursor']}").json()
+    assert first["events"][0]["code"] == "submitted"
+    assert second["events"][0]["code"] == "phase_started"
+    assert "rt.one" not in json.dumps([first, second])
+
+
+def test_quota_none_result_counts_as_failed_check(ingest, monkeypatch):
+    service, _ = ingest
+    monkeypatch.setattr(service.accounts, "sync_accounts_and_quota", lambda *a, **kw: {"synced": 0, "errors": []})
+    job = service.submit(payload(1), sync_after_import=True)
+    service.claim("save", "save")
+    service.save_batch(job["id"], "save")
+    service.claim("sync", "sync")
+    result = service.sync_batch(job["id"], "sync")
+    assert result["checked"] == result["sync_failed"] == 1

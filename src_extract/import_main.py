@@ -32,3 +32,8 @@ def version():
 @app.get("/account-import.html")
 def page():
     return FileResponse(Path(__file__).parent / "web_dist" / "account-import.html")
+
+
+@app.get("/account-import.js")
+def script():
+    return FileResponse(Path(__file__).parent / "web_dist" / "account-import.js", media_type="application/javascript")

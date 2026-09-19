@@ -2,11 +2,12 @@
 
 The save checkpoint commits in the SAME transaction as account rows. A crash
 cannot replay an acknowledged batch or report rows saved before they exist.
-Quota checking has a separate worker and can never hold up the next import.
+Quota checking and RT exchange have separate workers from AT ingestion.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import logging
@@ -14,13 +15,15 @@ import threading
 import time
 import uuid
 
-from sqlalchemy import Column, Float, Integer, String, Text, or_, and_, text
+from sqlalchemy import Column, Float, Integer, String, Text, or_, and_, text, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from services.application_database import DatabaseBase, initialize_application_database, resolve_database_url
 from services.storage.database_storage import account_commit_hook
 from services.runtime_configuration import env_int
+from services.account_import_credentials import extract_import_credentials
+from services.account_processing import account_import_worker_count, account_import_slot, account_quota_sync_worker_count, bounded_future_results
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,33 @@ class AccountIngestJob(DatabaseBase):
 
 class IngestConflict(ValueError):
     pass
+
+
+class AccountIngestChunk(DatabaseBase):
+    """Bounded payload reads, also compatible with jobs from before this table."""
+    __tablename__ = "account_ingest_chunks"
+    job_id = Column(String(40), primary_key=True)
+    offset = Column(Integer, primary_key=True)
+    end = Column(Integer, nullable=False)
+    refresh_total = Column(Integer, nullable=False, default=0)
+    payload = Column(Text, nullable=False)
+
+
+class AccountIngestRefresh(DatabaseBase):
+    __tablename__ = "account_ingest_refresh_results"
+    job_id = Column(String(40), primary_key=True)
+    offset = Column(Integer, primary_key=True)
+    payload = Column(Text, nullable=False)  # rotated RT persisted before account save
+    error = Column(String(80), nullable=False, default="")
+
+
+class AccountIngestEvent(DatabaseBase):
+    __tablename__ = "account_ingest_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(40), nullable=False, index=True)
+    created = Column(Float, nullable=False)
+    code = Column(String(80), nullable=False)
+    details = Column(Text, nullable=False)  # only locally constructed counts/codes
 
 
 class IngestLeaseLost(RuntimeError):
@@ -90,12 +120,17 @@ class AccountIngestService:
                 session.rollback()
                 raise
 
-    @staticmethod
-    def public(row, *, include_result=False):
+    def public(self, row, session, *, include_result=False):
+        refresh_total = session.query(func.sum(AccountIngestChunk.refresh_total)).filter_by(job_id=row.id).scalar() or 0
+        refresh_done = session.query(AccountIngestRefresh).filter_by(job_id=row.id).count()
+        failures = session.query(AccountIngestRefresh).filter_by(job_id=row.id).filter(AccountIngestRefresh.error != "")
+        failed = failures.count()
+        failed_saved = failures.filter(AccountIngestRefresh.offset < row.saved).count()
         result = {
             "id": row.id, "status": row.status, "total": row.total,
-            "saved": row.saved, "added": row.added,
-            "skipped": max(0, row.saved - row.added) + row.input_duplicates,
+            "processed": row.saved, "saved": row.saved-failed_saved, "added": row.added,
+            "skipped": max(0, row.saved - row.added-failed_saved) + row.input_duplicates,
+            "refresh_total": refresh_total, "refresh_done": refresh_done, "refresh_failed": failed,
             "checked": row.checked, "synced": row.synced, "sync_failed": row.sync_failed,
             "sync_after_import": bool(row.sync_after), "error_code": row.error,
             "created_at": row.created, "updated_at": row.updated,
@@ -105,17 +140,38 @@ class AccountIngestService:
             result["updated_ids"] = json.loads(row.updated_ids)
         return result
 
+    @staticmethod
+    def _event(session, job_id, code, **details):
+        session.add(AccountIngestEvent(job_id=job_id, created=time.time(), code=code,
+                                       details=json.dumps(details, ensure_ascii=False)))
+
+    def events(self, job_id, after=0, limit=100):
+        with self.Session() as session:
+            rows = session.query(AccountIngestEvent).filter_by(job_id=job_id).filter(
+                AccountIngestEvent.id > after).order_by(AccountIngestEvent.id).limit(limit).all()
+            return [{"id": r.id, "time": r.created, "code": r.code, **json.loads(r.details)} for r in rows]
+
     def submit(self, items, *, sync_after_import=False, request_key=None):
         if not items or len(items) > 50000:
             raise ValueError("每个任务需要 1～50000 个账号")
         # Deduplicate once, before taking any account-pool lock. Do not reset
         # existing lifecycle/quota state on re-import: this is a replenish path.
         unique = {}
-        for item in items:
-            prepared = self.accounts._prepare_account_payload(item)
-            if prepared is None:
-                raise ValueError("账号缺少 access_token")
-            unique[prepared["access_token"]] = prepared
+        for index, item in enumerate(items, 1):
+            credentials = extract_import_credentials(item)
+            at = credentials.get("access_token", "")
+            # Older clients wrapped all lines in access_token, including RTs.
+            if at.startswith("rt."):
+                credentials.pop("access_token")
+                credentials.setdefault("refresh_token", at)
+            if not credentials.get("access_token") and not credentials.get("refresh_token"):
+                raise ValueError(f"第 {index} 条缺少 AT 或 RT")
+            normalized = {k: v for k, v in item.items() if k not in {
+                "credentials", "credential", "tokens", "auth", "accessToken", "refreshToken", "idToken", "token", "access_token"}}
+            normalized.update(credentials)
+            prepared = self.accounts._prepare_account_payload(normalized) if credentials.get("access_token") else normalized
+            key = ("at", credentials["access_token"]) if credentials.get("access_token") else ("rt", credentials["refresh_token"])
+            unique[key] = prepared
         payload = json.dumps(list(unique.values()), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         if len(payload.encode()) > 64 * 1024 * 1024:
             raise ValueError("导入内容超过 64 MiB，请拆分文件")
@@ -128,36 +184,45 @@ class AccountIngestService:
                 if existing:
                     if existing.fingerprint != fingerprint:
                         raise IngestConflict("同一幂等键不能提交不同内容")
-                    return self.public(existing)
+                    return self.public(existing, session)
                 if session.query(AccountIngestJob).filter(AccountIngestJob.status.notin_(["completed", "failed"])).count() >= 100:
                     raise IngestConflict("导入队列已满，请稍后再提交")
+                values = list(unique.values())
+                has_refresh = any(not item.get("access_token") for item in values)
                 row = AccountIngestJob(
                     id=uuid.uuid4().hex, request_key=key, fingerprint=fingerprint,
-                    status="queued", created=now, updated=now, total=len(unique),
+                    status="refresh_pending" if has_refresh else "queued", created=now, updated=now, total=len(unique),
                     input_duplicates=len(items)-len(unique), sync_after=int(bool(sync_after_import)),
-                    payload=payload, updated_ids="[]", owner="", lease_until=0, retry_at=0,
+                    payload="chunked:rt" if has_refresh else "chunked:at", updated_ids="[]", owner="", lease_until=0, retry_at=0,
                     saved=0, added=0, checked=0, synced=0, sync_failed=0, failures=0, error="",
                 )
                 session.add(row)
+                chunks = [{"job_id": row.id, "offset": offset, "end": min(len(values), offset+self.batch_size),
+                           "refresh_total": sum(not item.get("access_token") for item in values[offset:offset+self.batch_size]),
+                           "payload": json.dumps(values[offset:offset+self.batch_size], ensure_ascii=False)}
+                          for offset in range(0, len(values), self.batch_size)]
+                session.execute(AccountIngestChunk.__table__.insert(), chunks)
+                self._event(session, row.id, "submitted", total=len(values), duplicates=row.input_duplicates,
+                            refresh_total=sum(c["refresh_total"] for c in chunks))
                 session.flush()
-                return self.public(row)
+                return self.public(row, session)
         except IntegrityError:
             # Concurrent identical POSTs race on a unique key, never create two jobs.
             with self.Session() as session:
                 row = session.query(AccountIngestJob).filter_by(request_key=key).one()
                 if row.fingerprint != fingerprint:
                     raise IngestConflict("同一幂等键不能提交不同内容")
-                return self.public(row)
+                return self.public(row, session)
 
     def get(self, job_id, *, include_result=False):
         with self.Session() as session:
             row = session.get(AccountIngestJob, job_id)
-            return self.public(row, include_result=include_result) if row else None
+            return self.public(row, session, include_result=include_result) if row else None
 
     def list_jobs(self, limit=30):
         with self.Session() as session:
             rows = session.query(AccountIngestJob).order_by(AccountIngestJob.created.desc()).limit(min(100, max(1, limit))).all()
-            return [self.public(row) for row in rows]
+            return [self.public(row, session) for row in rows]
 
     def retry(self, job_id):
         with self.transaction() as session:
@@ -166,13 +231,14 @@ class AccountIngestService:
                 return None
             if row.status != "failed":
                 raise IngestConflict("只有失败任务可以重试")
-            row.status = "sync_pending" if row.saved == row.total else "queued"
+            row.status = "sync_pending" if row.saved == row.total else "refresh_pending" if row.payload == "chunked:rt" else "queued"
             row.owner, row.lease_until, row.retry_at, row.failures, row.error = "", 0, 0, 0, ""
             row.updated = time.time()
-            return self.public(row)
+            self._event(session, row.id, "retry_requested", processed=row.saved)
+            return self.public(row, session)
 
     def claim(self, phase, owner):
-        pending, running = ("queued", "saving") if phase == "save" else ("sync_pending", "syncing")
+        pending, running = {"save": ("queued", "saving"), "refresh": ("refresh_pending", "refreshing"), "sync": ("sync_pending", "syncing")}[phase]
         now = time.time()
         with self.transaction() as session:
             eligible = and_(AccountIngestJob.retry_at <= now, or_(
@@ -183,6 +249,7 @@ class AccountIngestService:
             if row is None:
                 return None
             row.owner, row.lease_until, row.status, row.updated = owner, now+self.LEASE_SECONDS, running, now
+            self._event(session, row.id, "phase_started", phase=phase, processed=row.saved)
             return row.id
 
     def _owned(self, session, job_id, owner, status, offset=None):
@@ -196,15 +263,16 @@ class AccountIngestService:
     def heartbeat(self, job_id, owner):
         with self.transaction() as session:
             return session.query(AccountIngestJob).filter_by(id=job_id, owner=owner).filter(
-                AccountIngestJob.status.in_(["saving", "syncing"]),
+                AccountIngestJob.status.in_(["saving", "refreshing", "syncing"]),
                 AccountIngestJob.lease_until >= time.time(),
             ).update({"lease_until": time.time()+self.LEASE_SECONDS}, synchronize_session=False)
 
     @staticmethod
     def _finish_save(row, end, new_ids):
         previous_ids = json.loads(row.updated_ids)
+        previous_set = set(previous_ids)
         ids = list(dict.fromkeys([*previous_ids, *new_ids]))
-        new_unique = [account_id for account_id in ids if account_id not in previous_ids]
+        new_unique = [account_id for account_id in ids if account_id not in previous_set]
         row.saved = end
         row.updated_ids = json.dumps(ids)
         # Keep the counter tied to this checkpoint's actual inserts. This is
@@ -219,24 +287,96 @@ class AccountIngestService:
             if not row.sync_after:
                 row.payload = "[]"  # minimize duplicate credential retention
 
-    def save_batch(self, job_id, owner):
-        with self.Session() as session:
-            row = session.get(AccountIngestJob, job_id)
-            if row is None:
-                raise IngestLeaseLost("import job missing")
-            start, end = row.saved, min(row.total, row.saved+self.batch_size)
-            items = json.loads(row.payload)[start:end]
+    def _batch_items(self, session, row, start, size):
+        chunk = session.query(AccountIngestChunk).filter_by(job_id=row.id).filter(
+            AccountIngestChunk.offset <= start, AccountIngestChunk.end > start).first()
+        if chunk is None:  # already queued on an older release
+            end = min(row.total, start+size)
+            return end, json.loads(row.payload)[start:end]
+        end = min(chunk.end, start+size)
+        items = json.loads(chunk.payload)[start-chunk.offset:end-chunk.offset]
+        results = session.query(AccountIngestRefresh).filter_by(job_id=row.id).filter(
+            AccountIngestRefresh.offset >= start, AccountIngestRefresh.offset < end).all()
+        for result in results:
+            items[result.offset-start] = None if result.error else json.loads(result.payload)
+        return end, items
+
+    @staticmethod
+    def _clear_payloads(session, job_id):
+        session.query(AccountIngestChunk).filter_by(job_id=job_id).update({"payload": "[]"}, synchronize_session=False)
+        session.query(AccountIngestRefresh).filter_by(job_id=job_id).update({"payload": "{}"}, synchronize_session=False)
+
+    @staticmethod
+    def _refresh_error(exc):
+        # Never publish upstream text: it may echo a credential or proxy URL.
+        from services.account_service import TerminalRefreshTokenError, OAuthRefreshError
+        if isinstance(exc, TerminalRefreshTokenError):
+            return "refresh_token_invalid"
+        if isinstance(exc, OAuthRefreshError):
+            return "refresh_rate_limited" if exc.status_code == 429 else "refresh_upstream_error"
+        return "refresh_network_error"
+
+    def _prepare_refresh_batch(self, job_id, owner, start, items):
+        pending = [(start+i, item) for i, item in enumerate(items) if item and not item.get("access_token")]
+        if not pending:
+            return
+        workers = account_import_worker_count(len(pending))
+
+        def exchange(entry):
+            began = time.monotonic()
+            try:
+                updated = self.accounts._request_access_token_refresh(entry[1]["refresh_token"], entry[1], request_slot=account_import_slot)
+                prepared = self.accounts._prepare_account_payload({**entry[1], **updated})
+                if prepared is None:
+                    raise ValueError("missing access token")
+                return prepared, "", int((time.monotonic()-began)*1000)
+            except Exception as exc:
+                return None, self._refresh_error(exc), int((time.monotonic()-began)*1000)
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="import-rt") as executor:
+            for future, entry in bounded_future_results(executor, exchange, pending, max_in_flight=workers):
+                prepared, error, duration = future.result()
+                with self.transaction() as session:
+                    self._owned(session, job_id, owner, "refreshing", start)
+                    session.add(AccountIngestRefresh(job_id=job_id, offset=entry[0],
+                                payload=json.dumps(prepared or {}, ensure_ascii=False), error=error))
+                    self._event(session, job_id, "refresh_failed" if error else "refresh_done",
+                                item=entry[0]+1, error_code=error, duration_ms=duration)
+
+    def save_batch(self, job_id, owner, *, refresh=False):
+        status = "refreshing" if refresh else "saving"
+        # Verify ownership before any RT call; network work never holds a DB lock.
+        with self.transaction() as session:
+            row = self._owned(session, job_id, owner, status)
+            start = row.saved
+            size = min(self.batch_size, account_import_worker_count(self.batch_size)*2) if refresh else self.batch_size
+            end, items = self._batch_items(session, row, start, size)
+        if refresh:
+            self._prepare_refresh_batch(job_id, owner, start, items)
+            with self.Session() as session:
+                row = session.get(AccountIngestJob, job_id)
+                end, items = self._batch_items(session, row, start, size)
+        items = [item for item in items if item is not None]
+        began = time.monotonic()
         committed = False
+
+        def finish(session, row, ids):
+            self._finish_save(row, end, ids)
+            self._event(session, job_id, "batch_saved", start=start+1, end=end,
+                        saved=len(items), added=len(ids), duration_ms=int((time.monotonic()-began)*1000))
+            if row.status == "completed":
+                self._clear_payloads(session, job_id)
+                self._event(session, job_id, "completed")
 
         def checkpoint(session, stage, mutation, counts):
             nonlocal committed
-            row = self._owned(session, job_id, owner, "saving", start)
+            row = self._owned(session, job_id, owner, status, start)
             if stage == "after":
                 # Create-only batches never alter existing account rows. IDs
                 # are committed with the rows, not reconstructed after a crash.
                 inserted_keys = set(counts["inserted_keys"])
                 ids = [item["management_id"] for item in mutation.upserts if item["access_token"] in inserted_keys]
-                self._finish_save(row, end, ids)
+                finish(session, row, ids)
                 committed = True
 
         with account_commit_hook(checkpoint, self.accounts.storage):
@@ -245,36 +385,51 @@ class AccountIngestService:
         # write. Advancing its checkpoint alone is then safe and idempotent.
         if not committed:
             with self.transaction() as session:
-                row = self._owned(session, job_id, owner, "saving", start)
-                self._finish_save(row, end, [])
+                row = self._owned(session, job_id, owner, status, start)
+                finish(session, row, [])
         return self.get(job_id)
 
     def sync_batch(self, job_id, owner):
         with self.Session() as session:
             row = session.get(AccountIngestJob, job_id)
-            start, end = row.checked, min(row.total, row.checked+10)
-            tokens = [item["access_token"] for item in json.loads(row.payload)[start:end]]
+            start = row.checked
+            end, items = self._batch_items(session, row, start, max(10, account_quota_sync_worker_count(row.total)*2))
+            tokens = [item["access_token"] for item in items if item is not None]
+        began = time.monotonic()
         result = self.accounts.sync_accounts_and_quota(tokens, include_items=False)
+        synced = min(len(tokens), max(0, int(result.get("synced") or 0)))
+        failed = len(tokens)-synced
         with self.transaction() as session:
             row = self._owned(session, job_id, owner, "syncing")
             if row.checked != start:
                 raise IngestLeaseLost("quota checkpoint already advanced")
             row.checked = end
-            row.synced += int(result.get("synced") or 0)
-            row.sync_failed += len(result.get("errors") or [])
+            row.synced += synced
+            row.sync_failed += failed
             row.updated, row.failures, row.error = time.time(), 0, ""
+            self._event(session, job_id, "quota_batch", start=start+1, end=end,
+                        synced=synced, failed=failed,
+                        duration_ms=int((time.monotonic()-began)*1000))
+            for error in result.get("errors") or []:
+                code = error.get("failure_code")
+                safe_code = code if code in {"auth_invalid", "file_upload_throttled", "image_quota_exhausted", "no_available_account"} else "quota_sync_failed"
+                self._event(session, job_id, "quota_failed", start=start+1, end=end, error_code=safe_code)
             if end == row.total:
                 row.status, row.owner, row.lease_until, row.payload = "completed", "", 0, "[]"
+                self._clear_payloads(session, job_id)
+                self._event(session, job_id, "completed")
         return self.get(job_id)
 
     def fail(self, job_id, owner):
         with self.transaction() as session:
             row = session.query(AccountIngestJob).filter_by(id=job_id, owner=owner).with_for_update().one_or_none()
-            if row is None or row.status not in {"saving", "syncing"}:
+            if row is None or row.status not in {"saving", "refreshing", "syncing"}:
                 return
             row.failures += 1
-            row.error = "import_storage_error" if row.status == "saving" else "import_sync_error"
-            row.status = ("queued" if row.saved < row.total else "sync_pending") if row.failures < 3 else "failed"
+            row.error = "import_sync_error" if row.status == "syncing" else "import_storage_error"
+            pending = "sync_pending" if row.saved == row.total else "refresh_pending" if row.payload == "chunked:rt" else "queued"
+            row.status = pending if row.failures < 3 else "failed"
+            self._event(session, job_id, "job_failed" if row.status == "failed" else "retry_scheduled", error_code=row.error, failures=row.failures)
             row.owner, row.lease_until, row.updated = "", 0, time.time()
             row.retry_at = time.time() + min(30, 2 ** row.failures)
 
@@ -301,12 +456,12 @@ class AccountIngestService:
                 heart = threading.Thread(target=renew, name="import-heartbeat", daemon=True)
                 heart.start()
                 try:
-                    if phase == "save":
+                    if phase in {"save", "refresh"}:
                         self.accounts._account_snapshot_checked_at = 0
                         self.accounts._refresh_accounts_snapshot_if_stale(wait_for_refresh=True)
                     while not self._stop.is_set():
-                        view = self.save_batch(job_id, owner) if phase == "save" else self.sync_batch(job_id, owner)
-                        if view["status"] != ("saving" if phase == "save" else "syncing"):
+                        view = self.sync_batch(job_id, owner) if phase == "sync" else self.save_batch(job_id, owner, refresh=phase == "refresh")
+                        if view["status"] != {"save": "saving", "refresh": "refreshing", "sync": "syncing"}[phase]:
                             break
                 finally:
                     heart_stop.set()
@@ -329,7 +484,7 @@ class AccountIngestService:
             if self._threads:
                 return
             self._stop.clear()
-            for phase in ("save", "sync"):
+            for phase in ("save", "refresh", "sync"):
                 thread = threading.Thread(target=self._work, args=(phase,), name=f"account-import-{phase}", daemon=True)
                 thread.start()
                 self._threads.append(thread)

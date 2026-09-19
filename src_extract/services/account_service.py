@@ -1511,13 +1511,14 @@ class AccountService:
         *,
         image_scope: bool = False,
         deadline_monotonic: float | None = None,
+        request_slot: Callable = account_processing_slot,
     ) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
         session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
-            with account_processing_slot():
+            with request_slot():
                 response = session.post(
                     self._OAUTH_TOKEN_URL,
                     headers={
@@ -3424,10 +3425,9 @@ class AccountService:
             token_fingerprint_owners = {
                 fingerprint: token
                 for token, account in self._accounts.items()
-                for fingerprint in self._normalize_access_token_fingerprints(
-                    account.get("access_token_fingerprints"),
-                    token,
-                )
+                # Loaded/in-memory accounts are already normalized. Avoid
+                # hashing every long AT again for every 250-row import batch.
+                for fingerprint in (account.get("access_token_fingerprints") or [self._access_token_fingerprint(token)])
             }
             for access_token, payload in deduped.items():
                 resolved_token = self._resolve_access_token_locked(access_token)

@@ -31,7 +31,7 @@ Compose 默认锁定 `sha-8d9d51e`；如果 `.env` 没有设置 `CHATGPT2API_IMA
 
 服务入口为 `http://localhost:31000`。如需公网或其他端口，修改 `docker-compose.yml` 的 ports。
 
-大批量导号使用独立入口 `http://localhost:31000/account-import.html`。它按批次保存并显示可恢复进度，导号不会占用 app0-app7 的生图请求处理线程；额度同步可在页面中单独勾选。批次大小可通过 `.env` 的 `CHATGPT2API_IMPORT_BATCH_SIZE` 调整。
+大批量导号使用独立入口 `http://localhost:31000/account-import.html`（导入 v2）。先登录原后台，页面自动复用登录，无需另填密钥。支持逐行 AT、逐行 RT、单个 JSON 账号、JSON 数组和多文件导入；RT 并发兑换后才入库。页面显示持久化进度、各阶段耗时和脱敏失败日志。后端采用分块读取与 SQL 批量插入，导号不会占用 app0-app7 的生图请求处理线程；额度同步可单独勾选，批次大小通过 `.env` 的 `CHATGPT2API_IMPORT_BATCH_SIZE` 调整。性能实测与限制见 [导入性能记录](docs/account-import-performance.md)。
 
 `.env` 中的密钥是本地占位值，请在正式使用前修改 `CHATGPT2API_AUTH_KEY`、`CHATGPT2API_MONITOR_CLUSTER_SECRET` 和 `POSTGRES_PASSWORD`；修改后重新创建容器（`docker compose up -d --force-recreate`）。
 

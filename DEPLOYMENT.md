@@ -236,7 +236,15 @@ CHATGPT2API_UNKNOWN_QUOTA_SYNC_BATCH_SIZE=50
 CHATGPT2API_IMPORT_BATCH_SIZE=250
 ```
 
-页面使用管理员 Bearer 密钥提交 JSON 数组或逐行 token。任务状态也可通过 `GET /api/account-import-jobs` 查看；需要排查导入时查看 `docker compose --env-file .env logs importer`，不要把完整账号内容写入公开日志。
+3.2.4 的“导入 v2”页面复用同一域名、同一端口原后台的管理员登录，无需另填密钥；接口继续验证管理员身份。可粘贴逐行 AT/RT，或多选 TXT/JSON 文件，支持单个账号对象、账号数组、`accounts`/`tokens` 包装及嵌套 `credentials`/`auth` 凭证。自动模式识别 `rt.` 前缀；其他格式的 RT 请选“RT”模式。JSON 同时带有效 AT 和 RT 时直接入库，只有 RT 时先兑换。
+
+AT 入库、RT 兑换、额度同步由独立后台工作线程处理，RT 请求使用系统设置中已有的“导入并发数”（`account_import_concurrency`），额度同步使用 `account_quota_sync_concurrency`。分块读取、SQL 批量插入和复用账号指纹减少本地开销；RT 仍需等待上游 OAuth 响应。旧导入入口保持原行为；需要新批量路径时使用此页面。
+
+页面能继续导入其他文件、刷新恢复任务、查看历史任务与逐批日志，数据库错误中断后可从断点重试。RT 单条兑换失败会记录条目序号和错误类型并跳过，其余账号继续；不会把失败的 RT 计为“已入库”。成功兑换后的新 RT 先持久化，入库失败重试时不用再次兑换。外部 OAuth 成功到本地首次写入之间若发生进程崩溃，无法保证外部兑换只执行一次。
+
+任务状态也可通过 `GET /api/account-import-jobs` 查看，增量日志使用 `GET /api/account-import-jobs/{id}/events?after=0`（响应 `next_cursor` 供下次查询）。日志不返回 token、代理凭证或原始上游错误。已完成任务清理导入内容副本，只保留计数和日志。旧版已提交任务可以续传；数据库自动新增导入分块、RT 结果和日志表，不修改原账号表或系统设置。
+
+升级需要同时更新镜像、`docker-compose.yml` 与 `nginx.conf`，确保 `/account-import.html`、`/account-import.js` 和 `/api/account-import-jobs` 都路由至 importer；仅刷新页面不会升级后端。确认运行 `/version` 显示 `3.2.4`、页面显示“导入 v2”，并检查容器镜像 revision。排查服务启动问题可用 `docker compose --env-file .env logs importer`。
 
 无 GPU 服务器可以在系统设置的“图片放大”中选择 `FSRCNN x2 / CPU`。该模型随镜像发布，系统设置中的“超分并发数”默认每个 API 实例为 64，最大 512；保存后动态生效。放大失败会返回原图，不会让生图请求失败。也可通过以下变量提供未保存设置时的默认值：
 

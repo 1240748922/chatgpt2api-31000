@@ -338,17 +338,24 @@ class DatabaseStorageBackend(StorageBackend):
                     session.delete(row)
                     deleted += 1
 
+            insert_rows = []
             for item in upserts:
                 key = item_key(collection, item)
                 serialized = self._serialize(item)
                 row = existing.get(key)
                 if row is None:
-                    session.add(model(**{model_key: key}, data=serialized))
+                    insert_rows.append({model_key: key, "data": serialized})
                     inserted += 1
                     inserted_keys.append(key)
                 elif self._deserialize(row.data) != item:
                     row.data = serialized
                     updated += 1
+
+            # No generated ORM identity is needed here. Use executemany instead
+            # of one INSERT ... RETURNING per account, within the same CAS lock
+            # and transaction as the import checkpoint.
+            if insert_rows:
+                session.execute(model.__table__.insert(), insert_rows)
 
             if inserted or updated or deleted:
                 revision_row.version += 1

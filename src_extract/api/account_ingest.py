@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -11,6 +12,8 @@ from services.account_ingest_service import get_account_ingest_service, IngestCo
 class AccountIngestRequest(BaseModel):
     accounts: list[dict] = Field(default_factory=list, max_length=50000)
     tokens: list[str] = Field(default_factory=list, max_length=50000)
+    refresh_tokens: list[str] = Field(default_factory=list, max_length=50000)
+    token_type: Literal["auto", "at", "rt"] = "auto"
     sync_after_import: bool = False
     target_group_id: str | None = None
     request_key: str | None = Field(default=None, max_length=160)
@@ -24,7 +27,8 @@ def create_router():
         require_admin(authorization)
         from api.accounts import _target_account_group_id
         group = _target_account_group_id(body.target_group_id)
-        items = [*body.accounts, *({"access_token": token} for token in body.tokens)]
+        items = [*body.accounts, *({"refresh_token" if body.token_type == "rt" or (body.token_type == "auto" and token.strip().startswith("rt.")) else "access_token": token} for token in body.tokens),
+                 *({"refresh_token": token} for token in body.refresh_tokens)]
         if group is not None:
             items = [{**item, "group_id": group} for item in items]
         try:
@@ -62,5 +66,13 @@ def create_router():
         if job is None:
             raise HTTPException(404, detail={"error": "导入任务不存在"})
         return {"job": job}
+
+    @router.get("/api/account-import-jobs/{job_id}/events")
+    async def events(job_id: str, authorization: str | None = Header(default=None),
+                     after: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)):
+        require_admin(authorization)
+        service = await run_in_threadpool(get_account_ingest_service)
+        entries = await run_in_threadpool(service.events, job_id, after, limit)
+        return {"events": entries, "next_cursor": entries[-1]["id"] if entries else after}
 
     return router

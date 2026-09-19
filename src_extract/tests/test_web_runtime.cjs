@@ -115,6 +115,13 @@ async function testCleanupActionRequiresPreviewConfirmation() {
   assert.equal(refreshed, 1);
   assert.equal(options[1].remove_quota_exhausted, true);
   assert.equal(options[1].auto_remove_invalid_accounts, false);
+  await context.v('cleanup-credentials');
+  assert.equal(calls, 2);
+  assert.equal(refreshed, 2);
+  assert.equal(options[2].remove_unusable_credentials, true);
+  assert.equal(options[2].auto_remove_invalid_accounts, false);
+  assert(fs.readFileSync(path.join(assets, 'assets/Accounts-CQrrBRkk.js'), 'utf8')
+    .includes('删除 AT/RT 失效账号'));
   assert(fs.readFileSync(path.join(assets, 'assets/Settings-CYv60EF8.js'), 'utf8')
     .includes('initialPreview:L,loadPreview:opts=>re.previewAccountCleanup(opts)'));
 }

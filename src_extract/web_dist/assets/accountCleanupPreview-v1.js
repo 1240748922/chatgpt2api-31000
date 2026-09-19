@@ -23,7 +23,7 @@ export function confirmAccountCleanup({title, options, loadPreview, initialPrevi
       <p data-summary role="status" aria-live="polite">正在读取账号状态...</p>
       <p class="cleanup-warning">删除不可恢复。确认会清理所有符合当前条件的账号，不仅是本页；执行时会重新检查状态。未知额度不等于没有额度。</p>
       <p data-error role="alert" hidden></p>
-      <div class="cleanup-table-scroll"><table><thead><tr><th>账号</th><th>状态</th><th>剩余额度</th></tr></thead><tbody></tbody></table></div>
+      <div class="cleanup-table-scroll"><table><thead><tr><th>账号</th><th>状态</th><th>清理原因</th><th>剩余额度</th></tr></thead><tbody></tbody></table></div>
       <div class="cleanup-paging"><span data-page></span><div><button type="button" data-previous>上一页</button><button type="button" data-next>下一页</button><button type="button" data-refresh>刷新预览</button></div></div>
     </div>
     <footer><button type="button" data-cancel autofocus>取消</button><button type="button" class="cleanup-confirm" data-confirm disabled>确认删除</button></footer>`;
@@ -49,6 +49,7 @@ export function confirmAccountCleanup({title, options, loadPreview, initialPrevi
       const row = document.createElement('tr');
       for (const value of [account.email || account.id || '未命名账号',
         account.status_label || account.status || '未知',
+        account.cleanup_reason || account.status_label || account.status || '未知',
         account.quota_label ?? (account.quota_unknown ? '未知' : String(account.quota ?? 0))]) {
         const cell = document.createElement('td');
         cell.textContent = String(value);

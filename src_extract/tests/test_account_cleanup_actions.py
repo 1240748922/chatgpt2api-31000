@@ -90,6 +90,80 @@ def test_combined_invalid_and_quota_cleanup_counts_each_account_once(monkeypatch
     assert preview["total_removed"] == len(preview["items"]) == 1
 
 
+def test_credentials_cleanup_targets_only_unrecoverable_at_and_rt(monkeypatch):
+    service = _service([
+        {
+            "access_token": "dead-both",
+            "refresh_token": "revoked-rt",
+            "status": "正常",
+            "last_remote_check_result": "invalid",
+            "refresh_token_invalid_at": "2026-09-20T00:00:00+00:00",
+            "email": "dead-both@example.test",
+        },
+        {
+            "access_token": "dead-missing-rt",
+            "refresh_token": "",
+            "status": "正常",
+            "last_remote_check_result": "invalid",
+            "email": "dead-missing-rt@example.test",
+        },
+        {
+            "access_token": "recoverable",
+            "refresh_token": "still-valid-rt",
+            "status": "正常",
+            "last_remote_check_result": "invalid",
+        },
+        {
+            "access_token": "at-still-valid",
+            "refresh_token": "revoked-rt",
+            "status": "正常",
+            "refresh_token_invalid_at": "2026-09-20T00:00:00+00:00",
+        },
+        {
+            "access_token": "disabled-dead",
+            "refresh_token": "",
+            "status": "禁用",
+            "last_remote_check_result": "invalid",
+        },
+    ])
+    monkeypatch.setattr(service, "_refresh_accounts_snapshot_if_stale", lambda: None)
+
+    preview = service.preview_auto_remove_accounts(
+        remove_invalid=False,
+        remove_rate_limited=False,
+        remove_quota_exhausted=False,
+        remove_unusable_credentials=True,
+    )
+
+    assert preview["credentials_unavailable"] == 2
+    assert preview["total_removed"] == 2
+    assert {item["email"] for item in preview["items"]} == {
+        "dead-both@example.test",
+        "dead-missing-rt@example.test",
+    }
+    assert all(item["cleanup_reason"] == "AT/RT 失效" for item in preview["items"])
+    assert {item["id"] for item in preview["items"]} == {
+        service._management_id_for_token("dead-both"),
+        service._management_id_for_token("dead-missing-rt"),
+    }
+
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "delete_accounts",
+        lambda tokens, return_items=False: deleted.extend(tokens) or {"removed": len(tokens)},
+    )
+    result = service.cleanup_auto_remove_accounts(
+        remove_invalid=False,
+        remove_rate_limited=False,
+        remove_quota_exhausted=False,
+        remove_unusable_credentials=True,
+    )
+    assert deleted == ["dead-both", "dead-missing-rt"]
+    assert result["credentials_unavailable"] == 2
+    assert result["total_removed"] == 2
+
+
 def test_cleanup_preview_api_validates_pagination_and_never_deletes(monkeypatch):
     service = _service([{"access_token": "token", "status": "限流", "quota": 0}])
     monkeypatch.setattr(service, "_refresh_accounts_snapshot_if_stale", lambda: None)

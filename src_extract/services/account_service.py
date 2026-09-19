@@ -2822,27 +2822,48 @@ class AccountService:
                 scheduled += 1
         return scheduled
 
+    @staticmethod
+    def _credentials_unavailable(account: dict[str, Any]) -> bool:
+        """Return whether both the current AT and its recovery RT are unusable."""
+        availability = project_upstream_credential_availability(
+            str(account.get("access_token") or ""),
+            str(account.get("refresh_token") or ""),
+            access_confirmed_invalid=(
+                str(account.get("last_remote_check_result") or "").strip().lower()
+                == "invalid"
+            ),
+            refresh_confirmed_invalid=bool(account.get("refresh_token_invalid_at")),
+        )
+        return availability.status == "unavailable"
+
     def _auto_remove_tokens_locked(
         self,
         *,
         remove_invalid: bool,
         remove_rate_limited: bool,
         remove_quota_exhausted: bool,
+        remove_unusable_credentials: bool,
     ) -> tuple[list[str], list[str], list[str]]:
         invalid_tokens = [
             token
             for item in self._accounts.values()
-            if remove_invalid
-               and item.get("status") == "异常"
+            if item.get("status") != "禁用"
+               and (
+                   (remove_invalid and item.get("status") == "异常")
+                   or (remove_unusable_credentials and self._credentials_unavailable(item))
+               )
                and (token := item.get("access_token") or "")
         ]
+        invalid_token_set = set(invalid_tokens)
         rate_limited_tokens = [
             token
             for item in self._accounts.values()
             if remove_rate_limited
                and item.get("status") == "限流"
                and (token := item.get("access_token") or "")
+               and token not in invalid_token_set
         ]
+        rate_limited_token_set = set(rate_limited_tokens)
         quota_exhausted_tokens = [
             token
             for item in self._accounts.values()
@@ -2853,6 +2874,8 @@ class AccountService:
                and not bool(item.get("image_quota_unknown"))
                and int(item.get("quota") or 0) <= 0
                and (token := item.get("access_token") or "")
+               and token not in invalid_token_set
+               and token not in rate_limited_token_set
         ]
         return invalid_tokens, rate_limited_tokens, quota_exhausted_tokens
 
@@ -2862,6 +2885,7 @@ class AccountService:
         remove_invalid: bool | None = None,
         remove_rate_limited: bool | None = None,
         remove_quota_exhausted: bool | None = None,
+        remove_unusable_credentials: bool | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -2873,6 +2897,7 @@ class AccountService:
             else bool(remove_rate_limited)
         )
         remove_quota_exhausted = bool(remove_quota_exhausted)
+        remove_unusable_credentials = bool(remove_unusable_credentials)
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
         with self._lock:
@@ -2880,9 +2905,15 @@ class AccountService:
                 remove_invalid=remove_invalid,
                 remove_rate_limited=remove_rate_limited,
                 remove_quota_exhausted=remove_quota_exhausted,
+                remove_unusable_credentials=remove_unusable_credentials,
             )
             targets = [*invalid_tokens, *rate_limited_tokens, *quota_exhausted_tokens]
             page_accounts = [dict(self._accounts[token]) for token in targets[offset:offset + limit]]
+            credentials_unavailable = sum(
+                1
+                for token in invalid_tokens
+                if self._credentials_unavailable(self._accounts[token])
+            )
         # Project only this page outside the account lock. Never return AT/RT,
         # cookies or raw auth diagnostics in a deletion preview.
         from services.account_view import account_row
@@ -2902,6 +2933,11 @@ class AccountService:
                 "quota_label": row["quota_label"],
                 "quota_unknown": row["quota_unknown"],
                 "file_upload_limited": row["file_upload_limited"],
+                "cleanup_reason": (
+                    "AT/RT 失效"
+                    if self._credentials_unavailable(account)
+                    else row["status_label"]
+                ),
             })
         invalid = len(invalid_tokens)
         rate_limited = len(rate_limited_tokens)
@@ -2909,6 +2945,7 @@ class AccountService:
         return {
             "dry_run": True,
             "invalid": invalid,
+            "credentials_unavailable": credentials_unavailable,
             "rate_limited": rate_limited,
             "quota_exhausted": quota_exhausted,
             "total_removed": invalid + rate_limited + quota_exhausted,
@@ -2919,6 +2956,7 @@ class AccountService:
             "auto_remove_invalid_accounts": remove_invalid,
             "auto_remove_rate_limited_accounts": remove_rate_limited,
             "remove_quota_exhausted": remove_quota_exhausted,
+            "remove_unusable_credentials": remove_unusable_credentials,
         }
 
     def cleanup_auto_remove_accounts(
@@ -2927,6 +2965,7 @@ class AccountService:
         remove_invalid: bool | None = None,
         remove_rate_limited: bool | None = None,
         remove_quota_exhausted: bool | None = None,
+        remove_unusable_credentials: bool | None = None,
     ) -> dict[str, Any]:
         self._refresh_accounts_snapshot_if_stale()
         remove_invalid = config.auto_remove_invalid_accounts if remove_invalid is None else bool(remove_invalid)
@@ -2936,11 +2975,18 @@ class AccountService:
             else bool(remove_rate_limited)
         )
         remove_quota_exhausted = bool(remove_quota_exhausted)
+        remove_unusable_credentials = bool(remove_unusable_credentials)
         with self._lock:
             invalid_tokens, rate_limited_tokens, quota_exhausted_tokens = self._auto_remove_tokens_locked(
                 remove_invalid=remove_invalid,
                 remove_rate_limited=remove_rate_limited,
                 remove_quota_exhausted=remove_quota_exhausted,
+                remove_unusable_credentials=remove_unusable_credentials,
+            )
+            credentials_unavailable = sum(
+                1
+                for token in invalid_tokens
+                if self._credentials_unavailable(self._accounts[token])
             )
 
         target_tokens = list(dict.fromkeys([
@@ -2957,6 +3003,7 @@ class AccountService:
                 {
                     "removed": removed,
                     "invalid": len(invalid_tokens),
+                    "credentials_unavailable": credentials_unavailable,
                     "rate_limited": len(rate_limited_tokens),
                     "quota_exhausted": len(quota_exhausted_tokens),
                 },
@@ -2964,12 +3011,14 @@ class AccountService:
         return {
             "dry_run": False,
             "invalid": len(invalid_tokens),
+            "credentials_unavailable": credentials_unavailable,
             "rate_limited": len(rate_limited_tokens),
             "quota_exhausted": len(quota_exhausted_tokens),
             "total_removed": removed,
             "auto_remove_invalid_accounts": remove_invalid,
             "auto_remove_rate_limited_accounts": remove_rate_limited,
             "remove_quota_exhausted": remove_quota_exhausted,
+            "remove_unusable_credentials": remove_unusable_credentials,
         }
 
     def list_normal_tokens(self) -> list[str]:

@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from threading import Condition, Lock
+from threading import Condition, Event, Lock
+import time
 
 import pytest
 
@@ -42,6 +43,40 @@ def test_upload_429_records_only_upload_cooldown(monkeypatch):
     assert row["file_upload_limited"] is True
     assert row["status_label"] == "上传受限 · 可文生图"
     assert row["status_tone"] == "warning"
+
+
+def test_account_failure_verification_does_not_block_image_completion(monkeypatch):
+    service = AccountService.__new__(AccountService)
+    service._image_slot_condition = Condition()
+    service._write_lock = Lock()
+    service._write_baseline = None
+    service._accounts = OrderedDict(token={
+        "access_token": "token", "status": "正常", "quota": 8,
+        "image_quota_unknown": False,
+    })
+    monkeypatch.setattr(service, "_resolve_access_token_locked", lambda token: token)
+    monkeypatch.setattr(service, "_release_image_slot_locked", lambda _: None)
+    monkeypatch.setattr(service, "_save_accounts", lambda **_: True)
+    entered = Event()
+    release = Event()
+
+    def blocked_schedule(*_args, **_kwargs):
+        entered.set()
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(service, "_schedule_account_refresh_after_image_failure", blocked_schedule)
+    started = time.perf_counter()
+    result = service.mark_image_result(
+        "token",
+        False,
+        failure=image_failure("auth_invalid"),
+    )
+    elapsed = time.perf_counter() - started
+    assert result["last_remote_check_result"] == "pending"
+    assert elapsed < 0.5
+    assert entered.wait(1)
+    release.set()
 
 
 def test_retry_after_is_respected_and_overlaps_never_shorten_cooldown():

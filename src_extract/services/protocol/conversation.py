@@ -2177,6 +2177,32 @@ def _generate_single_image(
         for output in outputs:
             output.image_attempts = attempts
 
+    def wait_for_capacity_account(exc: ImageAccountSelectionError) -> bool:
+        """Keep capacity retries alive while the pool is temporarily busy."""
+        if retry_error is None or not image_attempts:
+            return False
+        previous_failure = image_failure(image_attempts[-1].get("failure_code", ""))
+        if not previous_failure.account_capacity_limited:
+            return False
+        if exc.code not in {"no_available_account", "quota_exhausted"}:
+            return False
+        diagnostics_getter = getattr(account_service, "get_image_selection_diagnostics", None)
+        diagnostics = diagnostics_getter() if callable(diagnostics_getter) else {}
+        if (
+            diagnostics.get("account_wait_reason") != "all_ready_accounts_busy"
+            and int(diagnostics.get("matched_count") or 0) <= 0
+        ):
+            return False
+        deadline = request.deadline_monotonic or 0.0
+        if deadline > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25, remaining))
+        else:
+            time.sleep(0.25)
+        return True
+
     def retry_with_different_account(
         failure: ImageFailure,
         error: ImageGenerationError | None = None,
@@ -2261,14 +2287,24 @@ def _generate_single_image(
                 fallback_retry_used = False
                 fallback_from_egress = {}
         except ImageAccountSelectionError as exc:
+            selection_diagnostics = {}
+            diagnostics_getter = getattr(account_service, "get_image_selection_diagnostics", None)
+            if callable(diagnostics_getter):
+                try:
+                    selection_diagnostics = diagnostics_getter()
+                except Exception:
+                    selection_diagnostics = {}
             _monitor_image_stage(
                 request,
                 "image_local_rejected",
                 local_reason="account_pool",
                 status="failed",
+                **selection_diagnostics,
                 index=index,
                 total=total,
             )
+            if wait_for_capacity_account(exc):
+                continue
             if retry_error is not None:
                 raise attach_attempts(retry_error) from exc
             raise ImageGenerationError(
@@ -2278,14 +2314,26 @@ def _generate_single_image(
                 image_attempts=image_attempts,
             ) from exc
         except RuntimeError as exc:
+            selection_diagnostics = {}
+            diagnostics_getter = getattr(account_service, "get_image_selection_diagnostics", None)
+            if callable(diagnostics_getter):
+                try:
+                    selection_diagnostics = diagnostics_getter()
+                except Exception:
+                    selection_diagnostics = {}
             _monitor_image_stage(
                 request,
                 "image_local_rejected",
                 local_reason="account_pool",
                 status="failed",
+                **selection_diagnostics,
                 index=index,
                 total=total,
             )
+            if retry_error is not None and image_attempts and wait_for_capacity_account(
+                ImageAccountSelectionError("unavailable", str(exc))
+            ):
+                continue
             if retry_error is not None:
                 raise attach_attempts(retry_error) from exc
             raise ImageGenerationError(
@@ -2304,6 +2352,8 @@ def _generate_single_image(
         attempt_access_token = token
         attempt_refresh_token = ""
         attempt_last_token_refresh_at = None
+        account_result_update_ms = 0
+        account_selection_diagnostics: dict[str, Any] = {}
 
         def finalize_image_slot(
             success: bool,
@@ -2312,10 +2362,11 @@ def _generate_single_image(
             error: ImageGenerationError | None = None,
             quota_consumed: bool | None = None,
         ) -> None:
-            nonlocal image_slot_finalized
+            nonlocal image_slot_finalized, account_result_update_ms
             if image_slot_finalized:
                 return
             image_slot_finalized = True
+            result_update_started = time.perf_counter()
             try:
                 if failure is not None and failure.code == "task_interrupted":
                     account_service.release_image_slot(token)
@@ -2348,6 +2399,11 @@ def _generate_single_image(
                         "account_email": account_email,
                         "error": diagnostic_excerpt(release_exc, 500),
                     })
+            finally:
+                account_result_update_ms = max(
+                    0,
+                    int((time.perf_counter() - result_update_started) * 1000),
+                )
             attempt: dict[str, Any] = {
                 "slot": index,
                 "attempt": len(image_attempts) + 1,
@@ -2360,6 +2416,7 @@ def _generate_single_image(
                     else "failed"
                 ),
                 "duration_ms": max(0, int((time.perf_counter() - attempt_started) * 1000)),
+                "account_result_update_ms": account_result_update_ms,
             }
             if attempt_conversation_id:
                 attempt["conversation_id"] = attempt_conversation_id
@@ -2414,6 +2471,7 @@ def _generate_single_image(
                     account_failure=failure.verify_account,
                     account_email=account_email,
                     conversation_id=attempt_conversation_id,
+                    account_result_update_ms=account_result_update_ms,
                     **_image_failure_timing_data(error),
                     index=index,
                     total=total,
@@ -2423,6 +2481,12 @@ def _generate_single_image(
         # Account selection already owns the local shard snapshot. Avoid a
         # synchronous full-pool reload here while other replicas write results.
         account = account_service.get_account(token, refresh_snapshot=False) or {}
+        diagnostics_getter = getattr(account_service, "get_image_selection_diagnostics", None)
+        if callable(diagnostics_getter):
+            try:
+                account_selection_diagnostics = diagnostics_getter()
+            except Exception:
+                account_selection_diagnostics = {}
         attempt_refresh_token = str(account.get("refresh_token") or "").strip()
         attempt_last_token_refresh_at = account.get("last_token_refresh_at")
         account_email = str(account.get("email") or "").strip()
@@ -2466,6 +2530,7 @@ def _generate_single_image(
             request,
             "image_account_lookup",
             account_wait_ms=account_wait_ms,
+            **account_selection_diagnostics,
             account_email=account_email,
             account_found=bool(account),
             max_account_attempts=max_account_attempts,
@@ -2477,6 +2542,7 @@ def _generate_single_image(
                 "event": "image_account_wait_slow",
                 "call_id": request.call_id,
                 "account_wait_ms": account_wait_ms,
+                **account_selection_diagnostics,
                 "account_email": account_email,
                 "index": index,
             })
@@ -2487,6 +2553,7 @@ def _generate_single_image(
             "account_email": account_email,
             "account_found": bool(account),
             "account_wait_ms": account_wait_ms,
+            **account_selection_diagnostics,
             "index": index,
         })
         backend: OpenAIBackendAPI | None = None

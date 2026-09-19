@@ -5,7 +5,9 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 import time
 
-from services.account_service import AccountService, TerminalRefreshTokenError
+import pytest
+
+from services.account_service import AccountService, ImageAccountSelectionError, TerminalRefreshTokenError
 
 
 class _SelectionProbe:
@@ -129,3 +131,30 @@ def test_image_selection_skips_account_that_fails_token_maintenance():
     probe = MaintenanceProbe()
     assert probe.get_available_access_token() == "healthy"
     assert probe.released == ["stale"]
+
+
+def test_busy_image_pool_exits_short_wait_with_diagnostics(monkeypatch):
+    probe = AccountService.__new__(AccountService)
+    probe._lock = Lock()
+    probe._image_slot_condition = __import__("threading").Condition()
+    probe._accounts = OrderedDict([
+        ("busy", _account("busy", quota=8, unknown=False)),
+    ])
+    probe._image_inflight = {"busy": 1}
+    probe._image_index = 0
+    probe._image_shard_count = 1
+    probe._image_shard_index = 0
+    probe._IMAGE_POOL_WAIT_SECONDS = 0.01
+    probe._account_snapshot_checked_at = time.monotonic()
+
+    started = time.perf_counter()
+    with pytest.raises(ImageAccountSelectionError) as caught:
+        probe._acquire_next_candidate_token()
+
+    assert caught.value.code == "no_available_account"
+    assert time.perf_counter() - started < 0.5
+    diagnostics = probe.get_image_selection_diagnostics()
+    assert diagnostics["account_wait_reason"] == "all_ready_accounts_busy"
+    assert diagnostics["matched_count"] == 1
+    assert diagnostics["ready_count"] == 1
+    assert diagnostics["busy_count"] == 1

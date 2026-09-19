@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Lock, Thread, local
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -202,6 +202,10 @@ class AccountService:
             max_workers=1,
             thread_name_prefix="image-account-save",
         )
+        self._image_failure_schedule_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="image-failure-schedule",
+        )
         self._index = 0
         self._persisted_accounts: dict[str, dict] = {}
         self._accounts_revision = ""
@@ -218,6 +222,7 @@ class AccountService:
         self._image_failure_refresh_pending_set: set[str] = set()
         self._image_failure_refresh_pending_scopes: dict[str, str] = {}
         self._image_failure_refresh_started_at: dict[str, float] = {}
+        self._image_selection_local = local()
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -2142,6 +2147,24 @@ class AccountService:
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
+    def _set_image_selection_diagnostics(self, **values: object) -> None:
+        """Keep per-request account-pool diagnostics without sharing state between threads."""
+        state = getattr(self, "_image_selection_local", None)
+        if state is None:
+            state = local()
+            self._image_selection_local = state
+        current = getattr(state, "diagnostics", None)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(values)
+        state.diagnostics = current
+
+    def get_image_selection_diagnostics(self) -> dict[str, object]:
+        """Return diagnostics for the most recent image-account selection on this thread."""
+        state = getattr(self, "_image_selection_local", None)
+        diagnostics = getattr(state, "diagnostics", None) if state is not None else None
+        return dict(diagnostics) if isinstance(diagnostics, dict) else {}
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -2151,8 +2174,21 @@ class AccountService:
             deadline_monotonic: float | None = None,
             requires_file_upload: bool = False,
     ) -> str:
+        selection_started = time.monotonic()
+        selection_loops = 0
+        state = getattr(self, "_image_selection_local", None)
+        if state is None:
+            state = local()
+            self._image_selection_local = state
+        state.diagnostics = {}
+        self._set_image_selection_diagnostics(
+            account_wait_reason="starting",
+            selection_loop_count=0,
+            selection_wait_ms=0,
+        )
         pool_wait_deadline = time.monotonic() + self._IMAGE_POOL_WAIT_SECONDS
         while True:
+            selection_loops += 1
             with self._image_slot_condition:
                 remaining = (
                     float(deadline_monotonic) - time.monotonic()
@@ -2181,14 +2217,39 @@ class AccountService:
                         requires_file_upload=requires_file_upload,
                     )
                 )
+                diagnostics = self.get_image_selection_diagnostics()
+                self._set_image_selection_diagnostics(
+                    selection_loop_count=selection_loops,
+                    selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
+                    matched_count=matched_count,
+                    ready_count=ready_count,
+                    limited_count=limited_count,
+                    **{
+                        key: value
+                        for key, value in diagnostics.items()
+                        if key in {"busy_count", "upload_limited_count", "available_slot_count"}
+                    },
+                )
                 if ready_count == 0:
                     pool_wait_remaining = pool_wait_deadline - time.monotonic()
                     if pool_wait_remaining <= 0:
                         if matched_count > 0 and limited_count == matched_count:
+                            self._set_image_selection_diagnostics(
+                                account_wait_reason="all_matched_accounts_quota_limited",
+                                selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
+                            )
                             raise ImageAccountSelectionError(
                                 "quota_exhausted",
                                 "all matched image accounts are remote-confirmed quota exhausted",
                             )
+                        self._set_image_selection_diagnostics(
+                            account_wait_reason=(
+                                "all_matched_accounts_upload_limited"
+                                if matched_count > 0 and diagnostics.get("upload_limited_count", 0) == matched_count
+                                else "no_ready_account"
+                            ),
+                            selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
+                        )
                         raise ImageAccountSelectionError(
                             "unavailable",
                             "no image account is ready for current model/status filters",
@@ -2199,15 +2260,33 @@ class AccountService:
                             pool_wait_remaining,
                             remaining if remaining is not None else pool_wait_remaining,
                         )
-                    )
+                        )
                 elif access_token:
                     self._image_inflight[access_token] = int(
                         self._image_inflight.get(access_token, 0)
                     ) + 1
+                    self._set_image_selection_diagnostics(
+                        account_wait_reason="selected",
+                        selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
+                    )
                     return access_token
                 else:
+                    pool_wait_remaining = pool_wait_deadline - time.monotonic()
+                    if pool_wait_remaining <= 0:
+                        self._set_image_selection_diagnostics(
+                            account_wait_reason="all_ready_accounts_busy",
+                            selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
+                        )
+                        raise ImageAccountSelectionError(
+                            "unavailable",
+                            "all ready image account slots are busy",
+                        )
                     self._image_slot_condition.wait(
-                        timeout=min(1.0, remaining) if remaining is not None else 1.0
+                        timeout=min(
+                            1.0,
+                            pool_wait_remaining,
+                            remaining if remaining is not None else pool_wait_remaining,
+                        )
                     )
             # Empty-pool waiting is shorter than the normal snapshot TTL. Check
             # the shared revision sooner so imports/quota updates on another
@@ -2244,7 +2323,7 @@ class AccountService:
         limit = max(1, int(config.image_account_concurrency or 1))
         cursor = self._image_index % count
         first_available = first_warm = None
-        ready = matched = limited = 0
+        ready = matched = limited = busy = upload_limited = 0
         for offset in range(count):
             ordinal = (cursor + offset) % count
             token = keys[ordinal]
@@ -2257,15 +2336,29 @@ class AccountService:
                 continue
             matched += 1
             limited += int(item.get("status") == "限流")
-            if not self._is_image_account_available(item) or (requires_file_upload and upload_blocked(item, now)):
+            if not self._is_image_account_available(item):
+                continue
+            if requires_file_upload and upload_blocked(item, now):
+                upload_limited += 1
                 continue
             ready += 1
             if int(self._image_inflight.get(token, 0)) >= limit:
+                busy += 1
                 continue
             if self._is_unlimited_image_quota_account(item) or (
                 not item.get("image_quota_unknown") and int(item.get("quota") or 0) > 0
             ):
                 self._image_index = (ordinal + 1) % count
+                setter = getattr(self, "_set_image_selection_diagnostics", None)
+                if callable(setter):
+                    setter(
+                        matched_count=matched,
+                        ready_count=ready,
+                        busy_count=busy,
+                        limited_count=limited,
+                        upload_limited_count=upload_limited,
+                        available_slot_count=max(0, ready - busy),
+                    )
                 return token, ready, matched, limited
             if first_available is None:
                 first_available = (token, ordinal)
@@ -2274,6 +2367,16 @@ class AccountService:
         chosen = first_warm or first_available
         if chosen:
             self._image_index = (chosen[1] + 1) % count
+        setter = getattr(self, "_set_image_selection_diagnostics", None)
+        if callable(setter):
+            setter(
+                matched_count=matched,
+                ready_count=ready,
+                busy_count=busy,
+                limited_count=limited,
+                upload_limited_count=upload_limited,
+                available_slot_count=max(0, ready - busy),
+            )
         return chosen[0] if chosen else None, ready, matched, limited
 
     def _no_ready_candidate_error(
@@ -4449,6 +4552,59 @@ class AccountService:
                 },
             )
 
+    def _schedule_image_failure_refresh_async(
+        self,
+        access_token: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Schedule post-failure account verification away from the image request."""
+        def schedule() -> None:
+            try:
+                scheduled = self._schedule_account_refresh_after_image_failure(
+                    access_token,
+                    force=force,
+                )
+                if not scheduled:
+                    self._record_remote_check_error(
+                        access_token,
+                        "image_failure",
+                        "Account verification could not be scheduled.",
+                    )
+            except Exception as exc:
+                logger.warning({
+                    "event": "image_failure_refresh_schedule_failed",
+                    "token": anonymize_token(access_token),
+                    "error": self._credential_error_text(
+                        exc,
+                        self.get_account(access_token, refresh_snapshot=False),
+                        access_token=access_token,
+                    ),
+                })
+
+        executor = getattr(self, "_image_failure_schedule_executor", None)
+        try:
+            if executor is not None:
+                executor.submit(schedule)
+            else:
+                # Lightweight service doubles used by maintenance tests may not
+                # run __init__; preserve the non-blocking behavior for them.
+                Thread(
+                    target=schedule,
+                    name="image-failure-refresh-schedule",
+                    daemon=True,
+                ).start()
+        except Exception as exc:
+            logger.warning({
+                "event": "image_failure_refresh_schedule_start_failed",
+                "token": anonymize_token(access_token),
+                "error": self._credential_error_text(
+                    exc,
+                    self.get_account(access_token, refresh_snapshot=False),
+                    access_token=access_token,
+                ),
+            })
+
     def _schedule_account_refresh_after_image_failure(self, access_token: str, *, force: bool = False) -> bool:
         if not access_token:
             return False
@@ -4705,16 +4861,10 @@ class AccountService:
             finally:
                 self._image_slot_condition.notify_all()
         if should_verify_after_failure:
-            scheduled = self._schedule_account_refresh_after_image_failure(
+            self._schedule_image_failure_refresh_async(
                 access_token,
                 force=True,
             )
-            if not scheduled:
-                self._record_remote_check_error(
-                    access_token,
-                    "image_failure",
-                    "Account verification could not be scheduled.",
-                )
         return result
 
     def _schedule_image_result_persist(

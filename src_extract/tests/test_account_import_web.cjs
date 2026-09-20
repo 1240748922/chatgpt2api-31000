@@ -165,6 +165,8 @@ async function testOriginalModalAndBackupRestore() {
   assert(!panel.includes('onDeactivated(controller.stop)'));
   assert(panel.includes('event?.target'));
   assert(panel.includes('onInput: onFileChange'));
+  assert(panel.includes('JSON.stringify(accounts, null, 2)'));
+  assert(panel.includes('内容已填入上方输入框'));
   const calls=[];
   const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
   const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},

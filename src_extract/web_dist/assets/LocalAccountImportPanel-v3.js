@@ -1,8 +1,8 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, a as h, b as createVNode, l as Button, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260920-account-import-fix-v2";
-import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260920-account-import-fix-v2";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260920-account-import-fix-v3";
+import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260920-account-import-fix-v3";
 
 const titles = {access_token: "导入 Access Token", refresh_token: "导入 Refresh Token", session_json: "导入 Session JSON", cpa_json: "导入 CPA JSON 文件", sub2api_json: "导入 Sub2API JSON 文件"};
 export default defineComponent({
@@ -28,20 +28,38 @@ export default defineComponent({
     onUnmounted(() => { disposed = true; controller.stop(); emit("busy-change", false); });
     const hasInput = computed(() => Boolean(text.value.trim() || files.value.length));
     const selectedFileNames = computed(() => files.value.map(file => file.name).filter(Boolean));
-    function onFileChange(event) {
-      // Prefer the event target. In some browsers the delegated currentTarget
-      // is the wrapping label, which has no FileList even though the native
-      // control already displays the selected filename.
-      const target = event?.target;
-      const current = event?.currentTarget;
-      const input = target?.files ? target : current;
-      files.value = Array.from(input?.files || []);
-      validation.value = "";
-    }
     function currentFiles() {
       // Keep a native-input fallback for browsers that replace FileList during
       // a modal repaint before Vue receives the change event.
       return files.value.length ? files.value : Array.from(fileInput.value?.files || []);
+    }
+    async function onFileChange(event) {
+      const target = event?.target;
+      const current = event?.currentTarget;
+      const input = target?.files ? target : current;
+      const selected = Array.from(input?.files || []);
+      files.value = selected;
+      validation.value = "";
+      if (!selected.length || reading.value) return;
+      reading.value = true;
+      emit("busy-change", true);
+      try {
+        // Read files immediately and put normalized records into the same
+        // textarea used by pasted AT/RT content. JSON fields and rt.* lines
+        // are classified by parseInput; opaque RT values still follow the
+        // currently selected RT tab.
+        const accounts = await readImportInputs({text: text.value, files: selected, mode: props.mode});
+        if (disposed) return;
+        text.value = JSON.stringify(accounts, null, 2);
+        files.value = [];
+        if (fileInput.value) fileInput.value.value = "";
+        validation.value = `已读取 ${selected.length} 个文件，共 ${accounts.length} 条，内容已填入上方输入框`;
+      } catch (error) {
+        validation.value = error.message;
+      } finally {
+        reading.value = false;
+        emit("busy-change", state.value.busy);
+      }
     }
     async function submit() {
       if (busy.value) return;
@@ -85,13 +103,13 @@ export default defineComponent({
           h("textarea", {value: text.value, onInput: event => {text.value = event.target.value;}, rows: "5", disabled: busy.value,
             class: "ui-textarea-sm font-mono", spellcheck: false, autocomplete: "off",
             placeholder: props.mode === "refresh_token" ? "一行一个 refresh token" : props.mode === "access_token" ? "一行一个 access token，或粘贴账号 JSON" : "粘贴账号 JSON"})]),
-        h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "选择文件（可多选，与粘贴内容合并）"),
+        h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "选择文件（自动识别并填入上方输入框）"),
           h("input", {ref: fileInput, type: "file", multiple: true, disabled: busy.value,
             accept: ".txt,.json,text/plain,application/json", class: "block w-full text-xs", "aria-label": "选择账号文件",
             onChange: onFileChange, onInput: onFileChange})]),
         selectedFileNames.value.length ? h("p", {class: "text-xs text-muted-foreground break-all"}, `已选择 ${selectedFileNames.value.length} 个文件：${selectedFileNames.value.join("、")}`) : null,
         h("label", {class: "flex items-center gap-2 text-xs"}, [h("input", {type: "checkbox", checked: sync.value, disabled: busy.value, onChange: event => {sync.value = event.target.checked;}}), "入库后在后台同步账号信息与额度"]),
-        h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), button(busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),
+        h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), button(reading.value ? "读取文件中…" : busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),
         validation.value || current.notice ? h("p", {role: "status", class: "text-xs leading-5 break-words"}, validation.value || current.notice) : null,
         h("div", {class: "border-t border-border pt-3 space-y-3"}, [
           h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "导入任务与日志"),

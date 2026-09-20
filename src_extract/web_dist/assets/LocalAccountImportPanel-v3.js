@@ -1,8 +1,8 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, a as h, b as createVNode, l as Button, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260920-account-import-fix-v4";
-import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260920-account-import-fix-v4";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-fix-v5";
+import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-fix-v5";
 
 const titles = {access_token: "导入 Access Token", refresh_token: "导入 Refresh Token", session_json: "导入 Session JSON", cpa_json: "导入 CPA JSON 文件", sub2api_json: "导入 Sub2API JSON 文件"};
 export default defineComponent({

@@ -15,8 +15,11 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 async function testInputs() {
   assert.deepEqual(plain(parseInput('at-one\r\n# note\nrt.1.two')), [{access_token:'at-one'}, {refresh_token:'rt.1.two'}]);
   assert.deepEqual(plain(parseInput('opaque-refresh', 'refresh_token')), [{refresh_token:'opaque-refresh'}]);
-  assert.deepEqual(plain(parseInput('{"credentials":{"accessToken":"at"}}')), [{credentials:{accessToken:'at'}}]);
-  assert.equal(parseInput('{"data":{"items":[{"refreshToken":"rt"}]}}')[0].refreshToken, 'rt');
+  assert.deepEqual(plain(parseInput('{"credentials":{"accessToken":"at"}}')), [{access_token:'at'}]);
+  assert.equal(parseInput('{"data":{"items":[{"refreshToken":"rt"}]}}')[0].refresh_token, 'rt');
+  assert.deepEqual(plain(parseInput('{"type":"codex","email":"person@example.com","access_token":"at","refresh_token":"rt"}', 'session_json')), [{access_token:'at',refresh_token:'rt'}]);
+  assert.deepEqual(plain(parseInput('{"email":"person@example.com","accessToken":"at","refreshToken":"rt"}', 'access_token')), [{access_token:'at'}]);
+  assert.deepEqual(plain(parseInput('{"email":"person@example.com","accessToken":"at","refreshToken":"rt"}', 'refresh_token')), [{refresh_token:'rt'}]);
   assert.equal(parseInput('{"accounts":[{"access_token":"at"}],"tokens":["at2"],"refresh_tokens":["opaque"]}').length, 3);
   assert.throws(() => parseInput('{broken-json'), /JSON 格式错误/);
   assert.throws(() => parseInput('{"foo":"bar"}'), /缺少/);
@@ -34,6 +37,10 @@ async function testInputs() {
   assert.equal(parsed[0].proxy, 'direct');
   assert.equal(parsed[1].refresh_token, 'rt.synthetic');
   assert.equal((await readImportInputs({files:[{name:'a.txt',size:5,text:async()=>'rt.s'}], mode:'refresh_token'}))[0].refresh_token, 'rt.s');
+  const sessionFile = await readImportInputs({files:[{name:'session.json',size:120,text:async()=>'{"type":"codex","email":"person@example.com","access_token":"file-at","account_id":"id"}'}], mode:'session_json'});
+  assert.deepEqual(plain(sessionFile), [{access_token:'file-at',source_type:'web'}]);
+  const refreshFile = await readImportInputs({files:[{name:'session.json',size:120,text:async()=>'{"email":"person@example.com","accessToken":"file-at","refreshToken":"file-rt"}'}], mode:'refresh_token'});
+  assert.deepEqual(plain(refreshFile), [{refresh_token:'file-rt',source_type:'web'}]);
   await assert.rejects(readImportInputs({files:[{name:'a.json',size:100000000,text:async()=>{throw new Error('must not read');}}]}), /64 MiB/);
   assert.match(formatEvent({time:1,code:'batch_saved',start:1,end:2,saved:2,added:2,duration_ms:123}), /0.12 秒/);
 }
@@ -169,6 +176,7 @@ async function testOriginalModalAndBackupRestore() {
   assert(panel.includes('JSON.stringify(accounts, null, 2)'));
   assert(panel.includes('内容已填入上方输入框'));
   assert(bundle.includes('at=R(()=>st.value)'), 'background import state must not lock the import modal');
+  assert(!bundle.includes('s.value||(o.value=!1)'), 'closing the import modal must not be blocked by an import flag');
   assert(bundle.includes('scrollable:"",onClose:t(ao)'), 'modal overlay close must use the same close handler');
   assert(bundle.includes('title:"导入账号",compact:"",onClose:t(ao)'), 'modal close button must remain enabled');
   const calls=[];

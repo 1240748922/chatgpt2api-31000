@@ -163,6 +163,8 @@ async function testOriginalModalAndBackupRestore() {
   assert(bundle.includes('t($)==="sub2api"?'));
   assert(!panel.includes('onActivated(controller.resume)'));
   assert(!panel.includes('onDeactivated(controller.stop)'));
+  assert(panel.includes('event?.target'));
+  assert(panel.includes('onInput: onFileChange'));
   const calls=[];
   const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
   const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},

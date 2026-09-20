@@ -100,6 +100,21 @@ async function testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection() {
   assert.equal(f.scheduled.size,0);
 }
 
+async function testBackgroundSubmitDoesNotWaitForFirstPoll() {
+  const f = fixture();
+  const pending = [];
+  f.api.get = () => new Promise(resolve => pending.push(resolve));
+  const submission = f.controller.submit({accounts:[{access_token:'synthetic'}],syncAfterImport:false,targetGroupId:''});
+  let timeout;
+  const deadline = new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('submit waited for the first background poll')), 250); });
+  try {
+    assert.equal(await Promise.race([submission, deadline]), true);
+  } finally { clearTimeout(timeout); }
+  assert.equal(f.state().busy, false);
+  assert.equal(f.state().job.id, 'job-one');
+  f.controller.stop();
+}
+
 async function testLogPagingAndReconnection() {
   const f=fixture();let page=0;
   f.job.done=true;f.job.status='completed';
@@ -136,7 +151,9 @@ async function testTransientGatewayErrorRetries() {
 
 async function testOriginalModalAndBackupRestore() {
   const bundle=fs.readFileSync(path.join(assets,'Accounts-CQrrBRkk.js'),'utf8');
+  const panel=fs.readFileSync(path.join(assets,'LocalAccountImportPanel-v3.js'),'utf8');
   assert(bundle.includes('localImportModes.includes(t($))?i(LocalAccountImportPanel'));
+  assert(bundle.includes('key:`local-account-import-${t($)}`'));
   assert(bundle.includes('targetGroupId:Gt.value'));
   assert(bundle.includes('onAccountsChanged:()=>t(Zt)({silentErrorToast:!0})'));
   assert(bundle.includes('value:"refresh_token"'));
@@ -144,6 +161,8 @@ async function testOriginalModalAndBackupRestore() {
   assert(bundle.includes('t($)==="backup_json"?'));
   assert(bundle.includes('t($)==="remote_cpa"?'));
   assert(bundle.includes('t($)==="sub2api"?'));
+  assert(!panel.includes('onActivated(controller.resume)'));
+  assert(!panel.includes('onDeactivated(controller.stop)'));
   const calls=[];
   const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
   const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},
@@ -164,7 +183,7 @@ async function testOriginalModalAndBackupRestore() {
 }
 
 (async()=>{
-  await testInputs();await testSubmissionAndResume();await testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection();
+  await testInputs();await testSubmissionAndResume();await testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection();await testBackgroundSubmitDoesNotWaitForFirstPoll();
   await testLogPagingAndReconnection();await testTransientGatewayErrorRetries();await testOriginalModalAndBackupRestore();
   console.log('PASS: original modal integration, AT/RT/JSON files, target groups, async progress/logs, resume/idempotency, backup/OAuth compatibility');
 })().catch(error=>{console.error(error);process.exitCode=1;});

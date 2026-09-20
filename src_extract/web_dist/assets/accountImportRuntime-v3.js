@@ -148,11 +148,15 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
       if (![401,403,404].includes(error?.response?.status)) timer = schedule(() => poll(id, generation), 4000);
     }
   }
-  function select(id) {
+  function select(id, {background = false} = {}) {
     cancel(timer); epoch++; cursor = 0; lastSaved = 0; lastRefresh = 0; refreshedTerminal = "";
     remember(id);
     update({selected: id, job: state.jobs.find(job => job.id === id) || null, events: [], items: [], connection: ""});
-    if (id && active) return poll(id, epoch);
+    if (id && active) {
+      const pending = poll(id, epoch);
+      if (background) { void pending; return; }
+      return pending;
+    }
   }
   async function history(preferred) {
     const generation = ++historyEpoch;
@@ -186,7 +190,10 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
       if (!active) return true;
       historyEpoch++; // an older history fetch must not replace the new selection
       update({jobs: [job, ...state.jobs.filter(item => item.id !== job.id)], notice: "已提交后台处理，可关闭窗口或继续导入。进度和日志可再次打开此窗口查看。"});
-      select(job.id);
+      // The job is already accepted by the backend. Start the first poll in
+      // the background so a slow status endpoint cannot keep the import modal
+      // locked and make a successful submission look stuck.
+      select(job.id, {background: true});
       return true;
     } catch (error) { if (active) update({notice: message(error)}); return false; }
     finally { update({busy: false}); }
@@ -196,7 +203,7 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
     update({busy: true});
     try {
       const {job} = await api.post(`/api/account-import-jobs/${state.selected}/retry`);
-      if (active) { update({job, notice: "已从断点恢复任务"}); select(job.id); }
+      if (active) { update({job, notice: "已从断点恢复任务"}); select(job.id, {background: true}); }
     } catch (error) { if (active) update({notice: message(error)}); }
     finally { update({busy: false}); }
   }

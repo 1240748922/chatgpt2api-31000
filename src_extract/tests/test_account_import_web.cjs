@@ -173,7 +173,10 @@ async function testOriginalModalAndBackupRestore() {
   assert(panel.includes('event?.target'));
   assert(!panel.includes('onInput: onFileChange'), 'file input must not process the same FileList twice');
   assert(panel.includes('onChange: onFileChange'));
-  assert(panel.includes('JSON.stringify(accounts, null, 2)'));
+  assert(panel.includes('const nativeButton ='));
+  assert(panel.includes('nativeButton(reading.value ? "读取文件中…"'));
+  assert(panel.includes('JSON.stringify(accounts.map(({source_type, ...account}) => account), null, 2)'));
+  assert(panel.includes('accounts.map(({source_type, ...account}) => account)'));
   assert(panel.includes('内容已填入上方输入框'));
   assert(bundle.includes('at=R(()=>st.value)'), 'background import state must not lock the import modal');
   assert(!bundle.includes('s.value||(o.value=!1)'), 'closing the import modal must not be blocked by an import flag');

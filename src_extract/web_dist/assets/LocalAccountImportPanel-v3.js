@@ -1,8 +1,8 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, a as h, b as createVNode, l as Button, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-fix-v5";
-import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-fix-v5";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-fix-v7";
+import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-fix-v7";
 
 const titles = {access_token: "导入 Access Token", refresh_token: "导入 Refresh Token", session_json: "导入 Session JSON", cpa_json: "导入 CPA JSON 文件", sub2api_json: "导入 Sub2API JSON 文件"};
 export default defineComponent({
@@ -52,7 +52,7 @@ export default defineComponent({
         // this read finishes.
         const accounts = await readImportInputs({text: text.value, files: selected, mode: props.mode});
         if (disposed) return;
-        text.value = JSON.stringify(accounts, null, 2);
+        text.value = JSON.stringify(accounts.map(({source_type, ...account}) => account), null, 2);
         files.value = [];
         if (fileInput.value) fileInput.value.value = "";
         validation.value = `已读取 ${selected.length} 个文件，共 ${accounts.length} 条，内容已填入上方输入框`;
@@ -83,6 +83,10 @@ export default defineComponent({
     const button = (label, onClick, disabled = busy.value, primary = false) => createVNode(Button, {
       size: "xs", variant: primary ? "primary" : "outline", onClick, disabled,
     }, {default: () => label});
+    const nativeButton = (label, onClick, disabled, primary = false) => h("button", {
+      type: "button", class: ["ui-btn", "ui-btn-xs", primary ? "ui-btn-primary" : "ui-btn-outline", disabled ? "opacity-60 cursor-not-allowed" : ""],
+      disabled, onClick: event => { event.preventDefault(); void onClick(); },
+    }, label);
     const metric = (label, value) => h("div", {class: "min-w-0"}, [h("div", {class: "text-muted-foreground text-xs"}, label), h("div", {class: "mt-1 font-medium tabular-nums text-sm"}, value)]);
     const stageLabel = stage => ({save: "入库", refresh: "RT 兑换", quota: "额度同步"}[stage] || stage || "处理");
     const statusClass = status => ({success: "text-emerald-600", failed: "text-red-600", skipped: "text-muted-foreground", info: "text-amber-600"}[status] || "text-muted-foreground");
@@ -111,7 +115,7 @@ export default defineComponent({
             onChange: onFileChange})]),
         selectedFileNames.value.length ? h("p", {class: "text-xs text-muted-foreground break-all"}, `已选择 ${selectedFileNames.value.length} 个文件：${selectedFileNames.value.join("、")}`) : null,
         h("label", {class: "flex items-center gap-2 text-xs"}, [h("input", {type: "checkbox", checked: sync.value, disabled: busy.value, onChange: event => {sync.value = event.target.checked;}}), "入库后在后台同步账号信息与额度"]),
-        h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), button(reading.value ? "读取文件中…" : busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),
+        h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), nativeButton(reading.value ? "读取文件中…" : busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),
         validation.value || current.notice ? h("p", {role: "status", class: "text-xs leading-5 break-words"}, validation.value || current.notice) : null,
         h("div", {class: "border-t border-border pt-3 space-y-3"}, [
           h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "导入任务与日志"),

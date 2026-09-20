@@ -49,6 +49,10 @@ class DashboardRuntimeView(BaseModel):
 
 class DashboardOperationsView(BaseModel):
     active_requests: int = Field(ge=0)
+    scope: Literal["instance", "cluster"]
+    expected_instances: int = Field(ge=1)
+    responding_instances: int = Field(ge=1)
+    complete: bool
 
 
 class DashboardAccountView(BaseModel):

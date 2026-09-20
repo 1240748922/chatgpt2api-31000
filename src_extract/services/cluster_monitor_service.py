@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Any, Mapping
 
 from services.realtime_monitor_service import realtime_monitor_service
@@ -12,6 +14,9 @@ from services.runtime_configuration import account_shard_settings
 
 
 _INTERNAL_PATH = "/internal/monitor/realtime"
+_OPERATIONS_TTL = 1.0
+_operations_lock = Lock()
+_operations_cache: tuple[tuple[int, int, str], float, dict[str, Any]] | None = None
 
 
 def _int(value: object) -> int:
@@ -50,6 +55,69 @@ def _local_image_load() -> dict[str, Any]:
 def local_internal_image_load(provided: str) -> dict[str, Any]:
     _authorize(provided)
     return _local_image_load()
+
+
+def local_internal_operations(provided: str) -> dict[str, int]:
+    _authorize(provided)
+    _, index = account_shard_settings()
+    return {"instance_index": index, **realtime_monitor_service.operations_snapshot()}
+
+
+def _collect_operations(count: int, own_index: int, secret: str) -> dict[str, Any]:
+    # Never use snapshot()["active"] here: it scans history/accounts and its
+    # displayed record list is capped. We need the full O(1) active counter.
+    active = realtime_monitor_service.operations_snapshot()["active_requests"]
+    responding = 1
+    if count > 1 and secret:
+        with ThreadPoolExecutor(max_workers=min(count - 1, 16), thread_name_prefix="dashboard-count") as executor:
+            futures = {
+                executor.submit(_request_json, f"http://app{index}:80/internal/monitor/operations", secret, 1.0): index
+                for index in range(count) if index != own_index
+            }
+            for future in as_completed(futures):
+                try:
+                    payload = future.result()
+                    value, index = payload.get("active_requests"), payload.get("instance_index")
+                    if type(value) is not int or value < 0 or type(index) is not int or index != futures[future]:
+                        continue
+                    active += value
+                    responding += 1
+                except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+                    # Missing/old replicas are explicitly partial, not zeros.
+                    continue
+    return {
+        "active_requests": active,
+        "scope": "cluster" if count > 1 else "instance",
+        "expected_instances": count,
+        "responding_instances": responding,
+        "complete": responding == count,
+    }
+
+
+def cluster_operations_snapshot() -> dict[str, Any]:
+    """Read-only dashboard sample; coalesce callers without touching admission.
+
+    One-second cache and single flight keep multiple dashboards from fanning
+    out independently. The lock is separate from the request lifecycle lock.
+    No database, account pool, durable counter or background task is involved.
+    """
+    global _operations_cache
+    count, own_index = account_shard_settings()
+    if count <= 1:
+        return _collect_operations(1, own_index, "")
+    try:
+        secret = _secret()
+    except RuntimeError:
+        secret = ""
+    key = (count, own_index, secret)
+    with _operations_lock:
+        if _operations_cache is not None:
+            cached_key, expires, result = _operations_cache
+            if cached_key == key and time.monotonic() < expires:
+                return dict(result)
+        result = _collect_operations(count, own_index, secret)
+        _operations_cache = (key, time.monotonic() + _OPERATIONS_TTL, result)
+        return dict(result)
 
 
 def cluster_image_load_snapshot() -> dict[str, Any]:

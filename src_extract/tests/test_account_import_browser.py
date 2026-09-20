@@ -50,6 +50,7 @@ class ImportUI:
         self.hold_posts = False
         self.extra_items = 0
         self.extra_events = 0
+        self.dashboard = None
         self.jobs = [dict(id="synthetic-history", status="completed", total=2,
                          processed=2, saved=2, added=2, skipped=0, synced=1,
                          sync_failed=1, done=True, created_at=1, updated_at=2)]
@@ -87,6 +88,8 @@ class ImportUI:
                           capabilities=dict(admin_console=True, studio=True), home_route="/")
         elif path == "/version":
             result = dict(version=(ROOT / "src_extract/VERSION").read_text().strip())
+        elif path == "/api/dashboard":
+            result = self.dashboard
         elif path == "/api/accounts":
             result = dict(accounts=[], total=0, all_total=0, page=1, page_size=20)
         elif path == "/api/account-groups":
@@ -222,6 +225,64 @@ def test_large_log_scroll_is_bounded(ui):
     assert raw.evaluate('el => el.scrollHeight > el.clientHeight')
     assert not ui.dialog.locator('details').count()
     ui.close()
+
+
+def test_many_import_jobs_do_not_grow_modal_or_history_list(ui):
+    ui.jobs.extend(dict(ui.jobs[0], id=f"history-{i}") for i in range(1000))
+    ui.extra_items = 1000
+    ui.extra_events = 400
+    ui.open()
+    ui.show_logs()
+    options = ui.dialog.get_by_label("选择导入任务").locator("option")
+    pw.expect(options).to_have_count(30)
+    pw.expect(ui.dialog.get_by_text("仅展示最近 30 个任务", exact=False)).to_be_visible()
+    ui.dialog.get_by_label("选择导入任务").select_option("history-28")
+    pw.expect(ui.dialog.get_by_text("failed@example.test", exact=True)).to_be_visible()
+    bounds = ui.dialog.evaluate("el => ({client:el.clientHeight, scroll:el.scrollHeight})")
+    assert bounds["scroll"] <= bounds["client"] + 1, bounds
+    ui.page.screenshot(path=str(ROOT / ".runtime/import-history-bounded.png"))
+    ui.close()
+
+
+@pytest.mark.parametrize("mode", ["complete", "partial", "legacy", "single"])
+def test_dashboard_current_concurrency_uses_cluster_sample(ui, mode):
+    from dashboard_fixtures import dashboard_payload
+    ui.dashboard = dashboard_payload()
+    operations = ui.dashboard["operations"]
+    if mode == "partial":
+        operations.update(active_requests=125, responding_instances=6, complete=False)
+        ui.dashboard["metrics"].update(status="degraded", ready=False, stale=True)
+    elif mode == "legacy":
+        ui.dashboard["operations"] = dict(active_requests=1)
+    elif mode == "single":
+        operations.update(active_requests=0, scope="instance", expected_instances=1, responding_instances=1)
+    ui.page.goto(ui.origin + "/#/")
+    label = ui.page.get_by_text("当前并发", exact=True)
+    pw.expect(label).to_be_visible()
+    card = label.locator("..")
+    if mode == "complete":
+        pw.expect(card).to_contain_text("199")
+        pw.expect(card).to_contain_text("集群采样 · 8/8 实例")
+        ui.page.screenshot(path=str(ROOT / ".runtime/dashboard-cluster-count.png"))
+    elif mode == "partial":
+        pw.expect(card).to_contain_text("≥ 125")
+        pw.expect(card).to_contain_text("6/8 实例")
+        pw.expect(ui.page.get_by_text("并发统计不完整", exact=False)).to_be_visible()
+        pw.expect(ui.page.get_by_text("统计数据暂未更新", exact=False)).to_be_visible()
+    elif mode == "legacy":
+        pw.expect(card).to_contain_text("仅当前实例（旧版统计）")
+    else:
+        pw.expect(card).to_contain_text("0")
+        pw.expect(card).to_contain_text("当前实例采样")
+    # No chart/total changes: counters and warnings must still refresh, rather
+    # than be skipped by the dashboard's unchanged-metrics fingerprint.
+    ui.dashboard = dashboard_payload()
+    ui.dashboard["operations"]["active_requests"] = 0
+    ui.page.get_by_role("button", name="刷新当前页面", exact=True).click()
+    pw.expect(card).to_contain_text("集群采样 · 8/8 实例")
+    pw.expect(card.locator("p").nth(1)).to_have_text("0")
+    pw.expect(ui.page.get_by_text("并发统计不完整", exact=False)).to_have_count(0)
+    assert not ui.errors, ui.errors
 
 
 def test_minimize_keeps_draft_and_releases_page(ui):

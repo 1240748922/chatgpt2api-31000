@@ -1,6 +1,8 @@
 // Shared by the account-management import panel. No credentials are persisted
 // in browser storage; only the selected durable job ID is remembered.
 export const localImportModes = ["access_token", "refresh_token", "session_json", "cpa_json", "sub2api_json"];
+export const importHistoryLimit = 30;
+export const importEventLimit = 5000;
 export const importStates = {queued: "等待入库", saving: "分批入库中", refresh_pending: "等待 RT 兑换", refreshing: "RT 兑换与入库中", sync_pending: "已入库，等待额度同步", syncing: "后台同步额度中", completed: "已完成", failed: "任务中断"};
 const errors = {refresh_token_invalid: "RT 已过期、撤销或无效", refresh_rate_limited: "RT 兑换受到上游限流", refresh_upstream_error: "上游未能完成 RT 兑换", refresh_network_error: "RT 兑换网络异常或超时", import_storage_error: "数据库写入异常", import_sync_error: "额度同步异常", quota_sync_failed: "账号信息或额度同步失败", auth_invalid: "账号认证失效", image_quota_exhausted: "图像额度已用尽", file_upload_throttled: "上传受限", no_available_account: "账号暂不可用"};
 export const elapsed = ms => `${(Math.max(0, Number(ms) || 0)/1000).toFixed(2)} 秒`;
@@ -200,7 +202,7 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
       const [data, logs] = await Promise.all([api.get(`/api/account-import-jobs/${id}`), api.get(`/api/account-import-jobs/${id}/events?after=${cursor}`)]);
       if (!active || epoch !== generation) return;
       cursor = logs.next_cursor;
-      const events = [...state.events, ...logs.events].slice(-5000);
+      const events = [...state.events, ...logs.events].slice(-importEventLimit);
       update({job: data.job, jobs: state.jobs.map(job => job.id === id ? data.job : job),
         events, items: collectImportItems(events), connection: ""});
       refreshAccounts(data.job);
@@ -224,7 +226,8 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
   async function history(preferred) {
     const generation = ++historyEpoch;
     try {
-      const {jobs} = await api.get("/api/account-import-jobs");
+      const data = await api.get("/api/account-import-jobs");
+      const jobs = data.jobs.slice(0, importHistoryLimit);
       if (!active || historyEpoch !== generation) return;
       const selected = preferred || state.selected || readRemembered();
       update({jobs, connection: ""});
@@ -252,7 +255,7 @@ export function createImportController({api, onUpdate, onAccountsChanged = () =>
       request = null; remember(job.id);
       if (!active) return true;
       historyEpoch++; // an older history fetch must not replace the new selection
-      update({jobs: [job, ...state.jobs.filter(item => item.id !== job.id)], notice: "已提交后台处理，可关闭窗口或继续导入。进度和日志可再次打开此窗口查看。"});
+      update({jobs: [job, ...state.jobs.filter(item => item.id !== job.id)].slice(0, importHistoryLimit), notice: "已提交后台处理，可关闭窗口或继续导入。进度和日志可再次打开此窗口查看。"});
       // The job is already accepted by the backend. Start the first poll in
       // the background so a slow status endpoint cannot keep the import modal
       // locked and make a successful submission look stuck.

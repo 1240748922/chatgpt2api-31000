@@ -6,7 +6,7 @@ from services.dashboard_metrics_service import (
     DASHBOARD_TIME_RANGES,
     dashboard_metrics_service,
 )
-from services.realtime_monitor_service import realtime_monitor_service
+from services.cluster_monitor_service import cluster_operations_snapshot
 from services.runtime_environment_service import snapshot as runtime_environment_snapshot
 from utils.timezone import beijing_now
 
@@ -38,7 +38,7 @@ def build_dashboard_view(*, app_version: str) -> dict:
     image_storage = _image_storage_view()
     overall_healthy = account_healthy and bool(metrics.get("ready"))
     runtime = runtime_environment_snapshot()
-    operations = realtime_monitor_service.operations_snapshot()
+    operations = cluster_operations_snapshot()
     return {
         "status": "ok" if overall_healthy else "degraded",
         "healthy": overall_healthy,

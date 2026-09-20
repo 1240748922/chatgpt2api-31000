@@ -177,6 +177,43 @@ async function testTransientGatewayErrorRetries() {
   f.controller.stop();
 }
 
+async function testHistoryAndEventsRemainBounded() {
+  const f = fixture();
+  const jobs = Array.from({length:1000}, (_, i) => ({...f.job,id:`history-${i}`,done:true}));
+  let serial=0;
+  f.api.get = async url => url === '/api/account-import-jobs' ? {jobs}
+    : url.includes('/events?') ? {events:[],next_cursor:0} : {job:{...f.job,id:url.split('/').pop(),done:true}};
+  f.api.post = async () => ({job:{...f.job,id:`new-${++serial}`,done:true}});
+  await f.controller.history();
+  assert.equal(f.state().jobs.length,30);
+  for (let i=0;i<60;i++) {
+    assert(await f.controller.submit({accounts:[{access_token:'synthetic'}]}));
+    await flush();
+    assert.equal(f.state().jobs.length,30, 'repeated submissions must obey the same history limit');
+    assert.equal(f.state().selected,`new-${i+1}`);
+  }
+  assert.equal(f.state().jobs[29].id,'new-31');
+  assert.equal(jobs.length,1000, 'display limit must not delete server history');
+  let cursor=0;
+  f.api.get = async url => {
+    if (!url.includes('/events?')) return {job:{...f.job,done:true}};
+    const after=Number(url.split('after=')[1]);
+    assert.equal(after,cursor, 'cursor must survive trimming old browser events');
+    const events=Array.from({length:Math.min(100,5101-cursor)},(_,i)=>({id:cursor+i+1,time:1,code:'completed'}));
+    cursor+=events.length;
+    return {events,next_cursor:cursor};
+  };
+  await f.controller.select('job-one');
+  while(f.scheduled.size) {
+    const next=[...f.scheduled.values()][0];f.scheduled.clear();await next();
+  }
+  assert.equal(cursor,5101);
+  assert.equal(f.state().events.length,5000);
+  assert.equal(f.state().events[0].id,102);
+  assert.equal(f.state().events.at(-1).id,5101);
+  f.controller.stop();
+}
+
 async function testOriginalModalAndBackupRestore() {
   const bundle=fs.readFileSync(path.join(assets,'Accounts-CQrrBRkk.js'),'utf8');
   const panel=fs.readFileSync(path.join(assets,'LocalAccountImportPanel-v3.js'),'utf8');
@@ -228,6 +265,6 @@ async function testOriginalModalAndBackupRestore() {
 
 (async()=>{
   await testInputs();await testSubmissionAndResume();await testRetryKeepsRequestKeyAndOldPollsCannotReplaceSelection();await testBackgroundSubmitDoesNotWaitForFirstPoll();
-  await testLogPagingAndReconnection();await testTransientGatewayErrorRetries();await testOriginalModalAndBackupRestore();
+  await testLogPagingAndReconnection();await testTransientGatewayErrorRetries();await testHistoryAndEventsRemainBounded();await testOriginalModalAndBackupRestore();
   console.log('PASS: original modal integration, AT/RT/JSON files, target groups, async progress/logs, resume/idempotency, backup/OAuth compatibility');
 })().catch(error=>{console.error(error);process.exitCode=1;});

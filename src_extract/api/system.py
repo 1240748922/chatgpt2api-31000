@@ -70,6 +70,7 @@ from services.cluster_monitor_service import (
     local_internal_call_detail,
     local_internal_snapshot,
     local_internal_image_load,
+    local_internal_operations,
 )
 from services.model_catalog_service import get_model_catalog
 from services.monitor_view import build_monitor_record_view, build_monitor_view
@@ -404,6 +405,14 @@ def create_router(app_version: str) -> APIRouter:
         try:
             return local_internal_image_load(x_cluster_monitor_secret or "")
         except PermissionError as exc:
+            raise HTTPException(status_code=403, detail={"error": "forbidden"}) from exc
+
+    @router.get("/internal/monitor/operations")
+    async def get_internal_operations(x_cluster_monitor_secret: str | None = Header(default=None)):
+        try:
+            # O(1) memory counter only; don't queue behind image/maintenance IO.
+            return local_internal_operations(x_cluster_monitor_secret or "")
+        except (PermissionError, RuntimeError) as exc:
             raise HTTPException(status_code=403, detail={"error": "forbidden"}) from exc
 
     @router.get("/internal/monitor/realtime")

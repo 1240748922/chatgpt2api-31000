@@ -1,9 +1,9 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, b as createVNode, l as Button, O as Icon, a5 as Checkbox, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-window-v9";
-import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-window-v9";
-import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260921-account-import-window-v9";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-dashboard-cluster-v10";
+import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel, importHistoryLimit, importEventLimit} from "./accountImportRuntime-v3.js?v=20260921-dashboard-cluster-v10";
+import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260921-dashboard-cluster-v10";
 
 // The bundle's `a` export is createBaseVNode, a compiler-only helper: it
 // does not normalize classes or a single VNode child. Use public createVNode
@@ -140,12 +140,14 @@ export default defineComponent({
         h("section", {class: "account-import-log-view", role: "tabpanel", id: "account-import-view-logs", "aria-labelledby": "account-import-view-logs-tab",
           style: {display: view.value === "logs" ? "flex" : "none"}}, [
           h("div", {class: "account-import-log-toolbar"}, [
-            h("select", {class: "ui-input-sm account-import-job-select", "aria-label": "选择导入任务", value: current.selected || "", disabled: busy.value,
+            h("select", {class: "ui-input-sm account-import-job-select", "aria-label": "选择导入任务", "aria-describedby": "account-import-history-note",
+              title: `仅显示最近 ${importHistoryLimit} 个任务；不会删除后台历史`, value: current.selected || "", disabled: busy.value,
               onChange: event => controller.select(event.target.value)}, current.jobs.length
                 ? current.jobs.map(job => h("option", {value: job.id, key: job.id}, `${new Date(job.created_at*1000).toLocaleString()} · ${jobLabel(job)} · ${job.total} 条`))
                 : [h("option", {value: ""}, "暂无任务")]),
             button("刷新", () => controller.history(), busy.value, false, "lucide:refresh-cw"),
           ]),
+          h("p", {id: "account-import-history-note", class: "account-import-history-note"}, `仅展示最近 ${importHistoryLimit} 个任务；每个任务展示最近 ${importEventLimit} 条日志事件（可含多条账号明细）。后台历史不受此显示上限影响。`),
           current.connection ? h("p", {role: "alert", class: "text-xs text-amber-600"}, current.connection) : null,
           job ? h("div", {class: "space-y-2", style: {flexShrink: 0}}, [
             h("p", {class: "text-xs leading-5", role: "status"}, `${jobLabel(job)} · 总耗时 ${elapsed(((job.done ? job.updated_at : Date.now()/1000)-job.created_at)*1000)} · 已处理 ${job.processed ?? job.saved}/${job.total}`),

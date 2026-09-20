@@ -180,6 +180,7 @@ async function testTransientGatewayErrorRetries() {
 async function testOriginalModalAndBackupRestore() {
   const bundle=fs.readFileSync(path.join(assets,'Accounts-CQrrBRkk.js'),'utf8');
   const panel=fs.readFileSync(path.join(assets,'LocalAccountImportPanel-v3.js'),'utf8');
+  const dialog=fs.readFileSync(path.join(assets,'AccountImportDialog-v1.js'),'utf8');
   assert(bundle.includes('localImportModes.includes(t($))?i(LocalAccountImportPanel'));
   assert(bundle.includes('key:`local-account-import-${t($)}`'));
   assert(bundle.includes('targetGroupId:Gt.value'));
@@ -202,8 +203,10 @@ async function testOriginalModalAndBackupRestore() {
   assert(panel.includes('内容已填入上方输入框'));
   assert(bundle.includes('at=R(()=>st.value)'), 'background import state must not lock the import modal');
   assert(!bundle.includes('s.value||(o.value=!1)'), 'closing the import modal must not be blocked by an import flag');
-  assert(bundle.includes('scrollable:"",onClose:t(ao)'), 'modal overlay close must use the same close handler');
-  assert(bundle.includes('title:"导入账号",compact:"",onClose:t(ao)'), 'modal close button must remain enabled');
+  assert(bundle.includes('onClose:t(ao),onMinimize:t(ao),onRestore:()=>L.value=!0'), 'parent visibility follows minimize/restore without duplicate windows');
+  assert(dialog.includes('ModalHeader, {title: "导入账号", compact: true, onClose: close}'), 'reuse the original enabled close control');
+  assert(dialog.includes('open: props.open || minimized.value'), 'minimizing must preserve the existing panel/controller');
+  assert(dialog.includes('modal: !minimized.value'), 'minimized window must release page focus and scrolling');
   const calls=[];
   const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
   const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},

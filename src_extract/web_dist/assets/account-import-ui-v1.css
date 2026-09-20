@@ -1,0 +1,43 @@
+/* Explicit CSS is required: this export has no Tailwind build step, so new
+   utility names such as max-h-64 do not create any CSS rules. */
+.account-import-window { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.account-import-window--local { height: min(46rem, calc(100dvh - 2rem)); }
+.account-import-preserved, .account-import-dialog-body { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.account-import-window--local .account-import-layout { display: grid; grid-template-columns: 14rem minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+.account-import-window--local .account-import-sidebar { min-height: 0; overflow-y: auto; }
+.account-import-window--local .account-import-content { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.account-import-panel, .account-import-log-view, .account-import-records { display: flex; flex-direction: column; min-height: 0; min-width: 0; flex: 1; gap: 12px; overflow: hidden; }
+.account-import-tabs { display: flex; gap: 4px; flex-shrink: 0; padding: 4px; border-radius: 12px; background: hsl(var(--muted) / .55); }
+.account-import-tab { flex: 1; min-width: 0; padding: 7px 12px; border-radius: 9px; color: hsl(var(--muted-foreground)); font-size: 12px; font-weight: 500; }
+.account-import-tab[aria-selected="true"] { background: hsl(var(--background)); color: hsl(var(--foreground)); box-shadow: 0 1px 3px #0001; }
+.account-import-tab:focus-visible, .account-import-dock-restore:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+.account-import-form { display: flex; flex-direction: column; flex: 1; gap: 12px; min-height: 0; overflow-y: auto; }
+.account-import-input-field { display: flex; flex-direction: column; flex: 1; min-height: 150px; }
+.account-import-input-field textarea { flex: 1; min-height: 120px; resize: none; }
+.account-import-notice { flex-shrink: 0; max-height: 3rem; overflow-y: auto; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.account-import-summary { flex-shrink: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.account-import-summary > div { border: 1px solid hsl(var(--border)); border-radius: 10px; padding: 8px; }
+.account-import-log-toolbar, .account-import-record-toolbar, .account-import-pagination { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.account-import-job-select { min-width: 0; flex: 1; }
+.account-import-search { flex: 1; min-width: 100px; }
+.account-import-table-scroll { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; border: 1px solid hsl(var(--border)); border-radius: 10px; }
+.account-import-table-scroll table { width: 100%; font-size: 12px; }
+.account-import-table-scroll thead { position: sticky; top: 0; background: hsl(var(--muted)); z-index: 1; text-align: left; }
+.account-import-table-scroll th, .account-import-table-scroll td { padding: 8px; }
+.account-import-table-scroll td { border-top: 1px solid hsl(var(--border)); vertical-align: top; overflow-wrap: anywhere; }
+.account-import-raw-log { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.65; border: 1px solid hsl(var(--border)); border-radius: 10px; }
+.account-import-footer { flex-shrink: 0; margin: 0; font-size: 11px; line-height: 1.5; color: hsl(var(--muted-foreground)); }
+.account-import-overlay.account-import-overlay--minimized { inset: auto 1rem 1rem auto; width: min(24rem, calc(100vw - 2rem)); padding: 0; overflow: visible; background: none; }
+.account-import-window.account-import-window--minimized { height: auto; max-height: none; min-height: 0; box-shadow: 0 8px 32px #0003; }
+.account-import-dock { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+.account-import-dock-restore { display: flex; flex: 1; min-width: 0; align-items: center; gap: 12px; padding: 4px; text-align: left; border-radius: 8px; }
+.account-import-dock-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.account-import-dock-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: hsl(var(--muted-foreground)); }
+@media (max-width: 720px) {
+  .account-import-window--local .account-import-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 9rem) minmax(0, 1fr); }
+  .account-import-window--local .account-import-sidebar { border-right: 0; border-bottom: 1px solid hsl(var(--border)); }
+  .account-import-window--local .account-import-content { padding: 10px; }
+  .account-import-panel, .account-import-log-view, .account-import-records, .account-import-form { gap: 8px; }
+  .account-import-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+  .account-import-summary > div { padding: 4px 8px; }
+}

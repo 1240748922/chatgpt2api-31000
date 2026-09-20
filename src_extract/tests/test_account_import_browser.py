@@ -48,6 +48,8 @@ class ImportUI:
         self.page, self.origin = page, origin
         self.errors, self.posts, self.pending = [], [], []
         self.hold_posts = False
+        self.extra_items = 0
+        self.extra_events = 0
         self.jobs = [dict(id="synthetic-history", status="completed", total=2,
                          processed=2, saved=2, added=2, skipped=0, synced=1,
                          sync_failed=1, done=True, created_at=1, updated_at=2)]
@@ -105,12 +107,17 @@ class ImportUI:
         elif path.startswith("/api/account-import-jobs/"):
             job_id = path.split("/")[3]
             if path.endswith("/events"):
-                events = [] if parse_qs(url.query).get("after") != ["0"] else [
-                    dict(id=1, time=2, code="quota_batch", items=[
+                all_events = [
+                    dict(id=1, time=2, code="quota_batch", start=1, end=2, synced=1, failed=1, items=[
                         dict(account_label="passed@example.test", stage="quota", status="success", message="已同步"),
                         dict(account_label="failed@example.test", stage="quota", status="failed", message="auth_invalid"),
-                    ])]
-                result = dict(events=events, next_cursor=1)
+                    ] + [dict(account_label=f"extra-{i}@example.test", stage="refresh", status="success", message="RT 已兑换")
+                         for i in range(self.extra_items)])]
+                all_events.extend(dict(id=i+2, time=i+3, code="batch_saved", start=i+1, end=i+1,
+                                       saved=1, added=1, duration_ms=10) for i in range(self.extra_events))
+                after = int(parse_qs(url.query).get("after", ["0"])[0])
+                events = [event for event in all_events if event["id"] > after][:100]
+                result = dict(events=events, next_cursor=events[-1]["id"] if events else after)
             else:
                 result = dict(job=next(job for job in self.jobs if job["id"] == job_id))
         route.fulfill(json=result)
@@ -126,12 +133,25 @@ class ImportUI:
     def open(self, mode="refresh_token"):
         self.page.goto(self.origin + f"/#/accounts?import={mode}")
         try:
-            pw.expect(self.dialog).to_be_visible()
+            # git-show interception spawns a process per old asset on Windows.
+            pw.expect(self.dialog).to_be_visible(timeout=30000 if self.baseline else 5000)
+            self.show_logs()
             pw.expect(self.dialog.get_by_label("选择导入任务")).to_have_value("synthetic-history")
             pw.expect(self.dialog.get_by_text("failed@example.test", exact=True)).to_be_visible()
+            self.show_input()
         except AssertionError as error:
             error.add_note(f"Browser errors: {self.errors}")
             raise
+
+    def show_logs(self):
+        if self.baseline and not self.dialog.get_by_role("tab", name="任务日志", exact=True).count():
+            return  # Old revisions stacked the form and logs instead of tabs.
+        self.dialog.get_by_role("tab", name="任务日志", exact=True).click()
+
+    def show_input(self):
+        if self.baseline and not self.dialog.get_by_role("tab", name="导入账号", exact=True).count():
+            return
+        self.dialog.get_by_role("tab", name="导入账号", exact=True).click()
 
     def upload(self, records, name="accounts.json"):
         body = records if isinstance(records, str) else json.dumps(records)
@@ -178,6 +198,150 @@ def test_history_upload_submit_close_and_reopen(ui):
         ui.reopen()
         pw.expect(ui.dialog.get_by_label("选择导入任务")).to_have_value("synthetic-job-1")
         ui.close()
+
+
+def test_large_log_scroll_is_bounded(ui):
+    ui.extra_items = 1000
+    ui.extra_events = 400
+    ui.open()
+    ui.show_logs()
+    table_scroll = ui.dialog.locator('table').locator('..')
+    sizes = table_scroll.evaluate('(el) => ({client:el.clientHeight, scroll:el.scrollHeight, height:el.getBoundingClientRect().height})')
+    assert sizes['scroll'] > sizes['client']
+    assert sizes['height'] < 500, sizes
+    assert ui.dialog.locator('tbody tr').count() == 100
+    bounds = ui.dialog.evaluate('(el) => ({client:el.clientHeight, scroll:el.scrollHeight})')
+    assert bounds['scroll'] <= bounds['client'] + 1, bounds
+    ui.dialog.get_by_role('button', name='下一页', exact=True).click()
+    pw.expect(ui.dialog.get_by_label('明细分页')).to_have_text('第 2 / 11 页 · 1002 条记录')
+    ui.page.screenshot(path=str(ROOT / '.runtime/import-tabs-logs.png'))
+    ui.dialog.get_by_role('tab', name='原始日志', exact=True).click()
+    raw = ui.dialog.get_by_role('tabpanel', name='原始日志', exact=True)
+    pw.expect(raw).to_be_visible()
+    pw.expect(raw).to_contain_text('第 400–400 条')
+    assert raw.evaluate('el => el.scrollHeight > el.clientHeight')
+    assert not ui.dialog.locator('details').count()
+    ui.close()
+
+
+def test_minimize_keeps_draft_and_releases_page(ui):
+    ui.open()
+    ui.textarea.fill('synthetic-draft-rt')
+    ui.dialog.get_by_text('入库后在后台同步账号信息与额度', exact=True).click()
+    for _ in range(3):
+        ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+        pw.expect(ui.dialog).to_have_count(0)
+        dock = ui.page.get_by_role('dialog', name='已最小化的导入任务', exact=True)
+        pw.expect(dock).to_be_visible()
+        assert dock.get_attribute('aria-modal') is None
+        assert ui.page.locator('body').evaluate('el => el.style.overflow') != 'hidden'
+        ui.page.get_by_role('button', name='刷新列表', exact=True).click()
+        assert dock.bounding_box()['height'] < 100
+        ui.page.screenshot(path=str(ROOT / '.runtime/import-minimized.png'))
+        ui.page.get_by_role('button', name='恢复导入窗口').click()
+        pw.expect(ui.dialog).to_have_count(1)
+        pw.expect(ui.textarea).to_have_value('synthetic-draft-rt')
+        pw.expect(ui.dialog.get_by_role('checkbox', name='入库后在后台同步账号信息与额度')).not_to_be_checked()
+    assert not ui.posts
+    ui.close()
+
+
+def test_minimize_job_still_polls_and_menu_restores_same_panel(ui):
+    ui.open()
+    ui.textarea.fill('synthetic-rt')
+    ui.dialog.get_by_role('button', name='开始导入', exact=True).click()
+    pw.expect(ui.dialog.get_by_role('tab', name='任务日志', exact=True)).to_have_attribute('aria-selected', 'true')
+    ui.dialog.get_by_label('筛选导入结果').select_option('failed')
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    ui.jobs[0].update(status='syncing', processed=1, saved=1)
+    dock = ui.page.get_by_role('dialog', name='已最小化的导入任务', exact=True)
+    pw.expect(dock).to_contain_text('后台同步额度中 · 1/1')
+    ui.reopen()
+    pw.expect(dock).to_have_count(0)
+    pw.expect(ui.dialog.get_by_role('tab', name='任务日志', exact=True)).to_have_attribute('aria-selected', 'true')
+    pw.expect(ui.dialog.get_by_label('筛选导入结果')).to_have_value('failed')
+    assert len(ui.posts) == 1
+    ui.close()
+
+
+def test_minimize_during_submit_then_close_dock(ui):
+    ui.open()
+    ui.hold_posts = True
+    ui.textarea.fill('synthetic-rt')
+    ui.dialog.get_by_role('button', name='开始导入', exact=True).click()
+    pw.expect(ui.dialog.get_by_role('button', name='正在提交…', exact=True)).to_be_disabled()
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    route, job = ui.pending.pop()
+    route.fulfill(json=dict(job=job))
+    dock = ui.page.get_by_role('dialog', name='已最小化的导入任务', exact=True)
+    pw.expect(dock).to_contain_text('分批入库中')
+    ui.page.get_by_role('button', name='恢复导入窗口').click()
+    pw.expect(ui.dialog.get_by_label('选择导入任务')).to_have_value('synthetic-job-1')
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    dock.get_by_role('button', name='关闭导入窗口').click()
+    pw.expect(dock).to_have_count(0)
+    ui.reopen()
+    pw.expect(ui.dialog.get_by_label('选择导入任务')).to_have_value('synthetic-job-1')
+    assert len(ui.posts) == 1
+    ui.close()
+
+
+def test_minimize_during_file_read_keeps_completed_input(ui):
+    ui.open()
+    ui.page.evaluate("""() => {
+        File.prototype.text = function() {
+            return new Promise(resolve => { window.finishFileRead = resolve; });
+        };
+    }""")
+    ui.upload(dict(refresh_token='file-rt'))
+    pw.expect(ui.dialog.get_by_role('button', name='读取文件中…', exact=True)).to_be_disabled()
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    ui.page.evaluate("window.finishFileRead('{\"refresh_token\":\"file-rt\"}')")
+    ui.page.get_by_role('button', name='恢复导入窗口').click()
+    pw.expect(ui.textarea).to_have_value('file-rt')
+    pw.expect(ui.dialog.get_by_role('button', name='开始导入', exact=True)).to_be_enabled()
+    assert not ui.posts
+    ui.close()
+
+
+def test_minimized_import_survives_navigation(ui):
+    ui.open()
+    ui.textarea.fill('draft-across-navigation')
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    ui.page.get_by_role('link', name='日志管理', exact=True).click()
+    pw.expect(ui.page).to_have_url(ui.origin + '/#/logs')
+    assert ui.page.locator('body').evaluate('el => el.style.overflow') != 'hidden'
+    ui.page.get_by_role('link', name='账号管理', exact=True).click()
+    ui.page.get_by_role('button', name='恢复导入窗口').click()
+    pw.expect(ui.textarea).to_have_value('draft-across-navigation')
+    assert not ui.posts
+    ui.close()
+
+
+def test_nonlocal_import_form_keeps_original_controls(ui):
+    ui.open()
+    ui.dialog.get_by_role('button', name='OAuth 登录已有账号', exact=True).click()
+    pw.expect(ui.dialog.get_by_placeholder('name@example.com')).to_be_visible()
+    ui.dialog.get_by_role('button', name='最小化导入窗口').click()
+    ui.page.get_by_role('button', name='恢复导入窗口').click()
+    pw.expect(ui.dialog.get_by_placeholder('name@example.com')).to_be_visible()
+    ui.close()
+
+
+@pytest.mark.parametrize('size', [(1366, 768), (800, 600), (390, 844)])
+def test_import_window_fits_viewport_with_large_history(ui, size):
+    ui.page.set_viewport_size(dict(width=size[0], height=size[1]))
+    ui.extra_items = 500
+    ui.open()
+    ui.show_logs()
+    bounds = ui.dialog.bounding_box()
+    assert bounds['y'] >= 0 and bounds['y'] + bounds['height'] <= size[1], bounds
+    assert bounds['x'] >= 0 and bounds['x'] + bounds['width'] <= size[0], bounds
+    assert ui.dialog.evaluate('el => el.scrollHeight <= el.clientHeight + 1')
+    scroll = ui.dialog.get_by_label('账号明细滚动区域')
+    assert scroll.bounding_box()['height'] > 60
+    assert scroll.evaluate('el => el.scrollHeight > el.clientHeight')
+    ui.close()
 
 
 @pytest.mark.parametrize("mode,key", [("access_token", "accessToken"), ("refresh_token", "refreshToken")])
@@ -276,6 +440,7 @@ def test_target_group_and_quota_sync_option_are_preserved(ui):
 
 def test_mode_switch_logs_filter_and_close(ui):
     ui.open()
+    ui.show_logs()
     ui.dialog.get_by_label("筛选导入结果").select_option("failed")
     pw.expect(ui.dialog.get_by_text("passed@example.test", exact=True)).to_have_count(0)
     pw.expect(ui.dialog.get_by_text("failed@example.test", exact=True)).to_be_visible()

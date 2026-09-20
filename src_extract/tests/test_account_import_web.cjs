@@ -7,8 +7,8 @@ const assets = path.resolve(__dirname, '../web_dist/assets');
 const source = fs.readFileSync(path.join(assets, 'accountImportRuntime-v3.js'), 'utf8');
 const context = {Blob, setTimeout, clearTimeout, Date};
 vm.createContext(context);
-vm.runInContext(source.replace(/export /g, '') + '\nthis.runtime={parseInput,readImportInputs,createImportController,formatEvent,collectImportItems};', context);
-const {parseInput, readImportInputs, createImportController, formatEvent, collectImportItems} = context.runtime;
+vm.runInContext(source.replace(/export /g, '') + '\nthis.runtime={parseInput,readImportInputs,formatImportInput,createImportController,formatEvent,collectImportItems};', context);
+const {parseInput, readImportInputs, formatImportInput, createImportController, formatEvent, collectImportItems} = context.runtime;
 const plain = object => JSON.parse(JSON.stringify(object));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -24,6 +24,19 @@ async function testInputs() {
   assert.throws(() => parseInput('{broken-json'), /JSON 格式错误/);
   assert.throws(() => parseInput('{"foo":"bar"}'), /缺少/);
   assert.throws(() => parseInput('{"refresh_tokens":[{}]}'), /无效 RT/);
+  assert.throws(() => parseInput('{"refresh_token":"rt"}', 'access_token'), /缺少 access_token/);
+  assert.throws(() => parseInput('{"refresh_tokens":["rt"]}', 'access_token'), /缺少 access_token/);
+  assert.throws(() => parseInput('{"access_token":"at"}', 'refresh_token'), /缺少 refresh_token/);
+  // JSON named fields determine credentials; neither RT nor AT needs a prefix.
+  for (const mode of ['access_token', 'refresh_token']) {
+    const values = Array.from({length:500}, (_, i) => `opaque-${mode}-${i}`);
+    const input = JSON.stringify({data:values.map(value => ({email:'synthetic@example.test', tokens:{[mode]:value}}))});
+    const accounts = await readImportInputs({text:input, mode});
+    assert.equal(accounts.length, 500, 'a data array must not collapse to its first token');
+    const text = formatImportInput(accounts, mode);
+    assert.equal(text, values.join('\n'), 'textarea contains tokens only, not JSON metadata');
+    assert.deepEqual(plain(await readImportInputs({text, mode})), plain(accounts), 'display and submit roundtrip');
+  }
   const itemEvents = collectImportItems([{id:7,code:'quota_batch',items:[{account_label:'person@example.com',status:'failed',stage:'quota',message:'auth_invalid'}]}]);
   assert.equal(itemEvents[0].account_label, 'person@example.com');
   assert.equal(itemEvents[0].status_label, '失败');
@@ -41,6 +54,14 @@ async function testInputs() {
   assert.deepEqual(plain(sessionFile), [{access_token:'file-at',source_type:'web'}]);
   const refreshFile = await readImportInputs({files:[{name:'session.json',size:120,text:async()=>'{"email":"person@example.com","accessToken":"file-at","refreshToken":"file-rt"}'}], mode:'refresh_token'});
   assert.deepEqual(plain(refreshFile), [{refresh_token:'file-rt',source_type:'web'}]);
+  const merged = await readImportInputs({text:'pasted-at',files:[{name:'file.json',size:50,text:async()=>'{"accessToken":"file-at"}'}],mode:'access_token'});
+  assert.equal(formatImportInput(merged,'access_token'), 'pasted-at\nfile-at');
+  for (const mode of ['cpa_json', 'sub2api_json']) {
+    const metadata = [{access_token:'at',refresh_token:'rt',source_type:'web',group_id:'source-group',proxy:'direct'}];
+    const first = await readImportInputs({text:JSON.stringify(metadata),mode});
+    assert.deepEqual(plain(await readImportInputs({text:formatImportInput(first,mode),mode})),metadata);
+  }
+  await assert.rejects(readImportInputs({files:[{name:'broken.json',size:8,text:async()=>'not-json'}]}), /第 1 个文件.*JSON 格式错误/);
   await assert.rejects(readImportInputs({files:[{name:'a.json',size:100000000,text:async()=>{throw new Error('must not read');}}]}), /64 MiB/);
   assert.match(formatEvent({time:1,code:'batch_saved',start:1,end:2,saved:2,added:2,duration_ms:123}), /0.12 秒/);
 }
@@ -173,10 +194,11 @@ async function testOriginalModalAndBackupRestore() {
   assert(panel.includes('event?.target'));
   assert(!panel.includes('onInput: onFileChange'), 'file input must not process the same FileList twice');
   assert(panel.includes('onChange: onFileChange'));
-  assert(panel.includes('const nativeButton ='));
-  assert(panel.includes('nativeButton(reading.value ? "读取文件中…"'));
-  assert(panel.includes('JSON.stringify(accounts.map(({source_type, ...account}) => account), null, 2)'));
-  assert(panel.includes('accounts.map(({source_type, ...account}) => account)'));
+  assert(!panel.includes('a as h'), 'createBaseVNode is not the public h render helper');
+  assert(panel.includes('b as createVNode'));
+  assert(panel.includes('createVNode(Button'), 'reuse original themed controls');
+  assert(panel.includes('createVNode(Icon'));
+  assert(panel.includes('formatImportInput(accounts, props.mode)'));
   assert(panel.includes('内容已填入上方输入框'));
   assert(bundle.includes('at=R(()=>st.value)'), 'background import state must not lock the import modal');
   assert(!bundle.includes('s.value||(o.value=!1)'), 'closing the import modal must not be blocked by an import flag');

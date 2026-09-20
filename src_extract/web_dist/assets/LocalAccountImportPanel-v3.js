@@ -1,8 +1,15 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
-import {d as defineComponent, a as h, b as createVNode, l as Button, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-fix-v7";
-import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-fix-v7";
+import {d as defineComponent, b as createVNode, l as Button, O as Icon, a5 as Checkbox, r as ref, G as computed, s as onMounted,
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260921-account-import-render-v8";
+import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260921-account-import-render-v8";
+import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260921-account-import-render-v8";
+
+// The bundle's `a` export is createBaseVNode, a compiler-only helper: it
+// does not normalize classes or a single VNode child. Use public createVNode
+// for handwritten render functions and wrap a single child like Vue's h().
+const h = (type, props, children) => createVNode(type, props,
+  children?.__v_isVNode ? [children] : children);
 
 const titles = {access_token: "导入 Access Token", refresh_token: "导入 Refresh Token", session_json: "导入 Session JSON", cpa_json: "导入 CPA JSON 文件", sub2api_json: "导入 Sub2API JSON 文件"};
 export default defineComponent({
@@ -10,7 +17,7 @@ export default defineComponent({
   props: {mode: {default: "access_token"}, targetGroupId: {default: null}},
   emits: ["busy-change", "accounts-changed"],
   setup(props, {emit}) {
-    const text = ref(""), files = ref([]), fileInput = ref(null), sync = ref(true), reading = ref(false), validation = ref("");
+    const text = ref(""), fileInput = ref(null), sync = ref(true), reading = ref(false), validation = ref("");
     const itemFilter = ref("all"), itemSearch = ref("");
     const state = ref({jobs: [], job: null, events: [], items: [], busy: false, notice: "", connection: ""});
     let disposed = false;
@@ -26,21 +33,14 @@ export default defineComponent({
     // matching unmount, leaving a stale modal instance behind on reopen.
     onMounted(() => controller.history());
     onUnmounted(() => { disposed = true; controller.stop(); emit("busy-change", false); });
-    const hasInput = computed(() => Boolean(text.value.trim() || files.value.length));
-    const selectedFileNames = computed(() => files.value.map(file => file.name).filter(Boolean));
-    function currentFiles() {
-      // Keep a native-input fallback for browsers that replace FileList during
-      // a modal repaint before Vue receives the change event.
-      return files.value.length ? files.value : Array.from(fileInput.value?.files || []);
-    }
+    const hasInput = computed(() => Boolean(text.value.trim()));
     async function onFileChange(event) {
       const target = event?.target;
       const current = event?.currentTarget;
       const input = target?.files ? target : current;
       const selected = Array.from(input?.files || []);
-      files.value = selected;
+      if (!selected.length || busy.value) return;
       validation.value = "";
-      if (!selected.length || reading.value) return;
       reading.value = true;
       emit("busy-change", true);
       try {
@@ -52,41 +52,34 @@ export default defineComponent({
         // this read finishes.
         const accounts = await readImportInputs({text: text.value, files: selected, mode: props.mode});
         if (disposed) return;
-        text.value = JSON.stringify(accounts.map(({source_type, ...account}) => account), null, 2);
-        files.value = [];
-        if (fileInput.value) fileInput.value.value = "";
+        text.value = formatImportInput(accounts, props.mode);
         validation.value = `已读取 ${selected.length} 个文件，共 ${accounts.length} 条，内容已填入上方输入框`;
       } catch (error) {
-        validation.value = error.message;
+        if (!disposed) validation.value = error.message;
       } finally {
-        reading.value = false;
-        emit("busy-change", state.value.busy);
+        if (input) input.value = "";
+        if (!disposed) { reading.value = false; emit("busy-change", state.value.busy); }
       }
     }
     async function submit() {
       if (busy.value) return;
-      const selected = currentFiles();
-      if (!text.value.trim() && !selected.length) {
+      if (!text.value.trim()) {
         validation.value = "请选择账号文件或粘贴账号内容";
         return;
       }
       reading.value = true; validation.value = ""; emit("busy-change", true);
       try {
-        const accounts = await readImportInputs({text: text.value, files: selected, mode: props.mode});
+        const accounts = await readImportInputs({text: text.value, mode: props.mode});
         if (disposed) return;
-        if (await controller.submit({accounts, syncAfterImport: sync.value, targetGroupId: props.targetGroupId})) {
-          text.value = ""; files.value = []; if (fileInput.value) fileInput.value.value = "";
+        if (await controller.submit({accounts, syncAfterImport: sync.value, targetGroupId: props.targetGroupId}) && !disposed) {
+          text.value = "";
         }
-      } catch (error) { validation.value = error.message; }
-      finally { reading.value = false; emit("busy-change", state.value.busy); }
+      } catch (error) { if (!disposed) validation.value = error.message; }
+      finally { if (!disposed) { reading.value = false; emit("busy-change", state.value.busy); } }
     }
-    const button = (label, onClick, disabled = busy.value, primary = false) => createVNode(Button, {
+    const button = (label, onClick, disabled = busy.value, primary = false, icon = "") => createVNode(Button, {
       size: "xs", variant: primary ? "primary" : "outline", onClick, disabled,
-    }, {default: () => label});
-    const nativeButton = (label, onClick, disabled, primary = false) => h("button", {
-      type: "button", class: ["ui-btn", "ui-btn-xs", primary ? "ui-btn-primary" : "ui-btn-outline", disabled ? "opacity-60 cursor-not-allowed" : ""],
-      disabled, onClick: event => { event.preventDefault(); void onClick(); },
-    }, label);
+    }, {default: () => [icon ? createVNode(Icon, {icon, class: "h-3.5 w-3.5", "aria-hidden": "true"}) : null, label]});
     const metric = (label, value) => h("div", {class: "min-w-0"}, [h("div", {class: "text-muted-foreground text-xs"}, label), h("div", {class: "mt-1 font-medium tabular-nums text-sm"}, value)]);
     const stageLabel = stage => ({save: "入库", refresh: "RT 兑换", quota: "额度同步"}[stage] || stage || "处理");
     const statusClass = status => ({success: "text-emerald-600", failed: "text-red-600", skipped: "text-muted-foreground", info: "text-amber-600"}[status] || "text-muted-foreground");
@@ -100,24 +93,27 @@ export default defineComponent({
       );
       const itemCounts = allItems.reduce((counts, item) => { counts[item.status] = (counts[item.status] || 0) + 1; return counts; }, {});
       return h("section", {class: "space-y-3", "aria-label": "本地账号导入"}, [
-        h("div", {}, [h("h3", {class: "text-sm font-medium"}, titles[props.mode]),
-          h("p", {class: "mt-1 text-xs leading-6 text-muted-foreground"}, props.mode === "refresh_token"
-            ? "一行一个 RT，支持 TXT / JSON 多文件。兑换成功后分批入库，失败项记录在下方日志。"
-            : "粘贴账号内容或多选 TXT / JSON 文件。支持 AT、包含 RT 的 JSON，以及单个账号或账号数组。"),
-          h("p", {class: "text-xs text-muted-foreground"}, "重复账号跳过，保留现有状态与额度；需要覆盖完整配置时使用“导入完整备份文件”。")]),
-        h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "账号内容"),
-          h("textarea", {value: text.value, onInput: event => {text.value = event.target.value;}, rows: "5", disabled: busy.value,
+        createVNode(ImportModePanel, {title: titles[props.mode], description: props.mode === "refresh_token"
+          ? "一行一个 RT。选择 TXT / JSON 文件后，按 refresh_token / refreshToken 键名提取并填入输入框。"
+          : props.mode === "access_token"
+            ? "一行一个 AT。选择 TXT / JSON 文件后，按 access_token / accessToken 键名提取并填入输入框。"
+            : "支持单个账号或账号数组，自动识别 JSON 中的 AT / RT。后台分批入库，保留进度与日志。"}),
+        h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, props.mode === "refresh_token" ? "Refresh Token" : props.mode === "access_token" ? "Access Token" : "账号内容"),
+          h("textarea", {value: text.value, "aria-label": "账号内容", onInput: event => {text.value = event.target.value;}, rows: "10", disabled: busy.value,
             class: "ui-textarea-sm font-mono", spellcheck: false, autocomplete: "off",
             placeholder: props.mode === "refresh_token" ? "一行一个 refresh token" : props.mode === "access_token" ? "一行一个 access token，或粘贴账号 JSON" : "粘贴账号 JSON"})]),
-        h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "选择文件（自动识别并填入上方输入框）"),
-          h("input", {ref: fileInput, type: "file", multiple: true, disabled: busy.value,
-            accept: ".txt,.json,text/plain,application/json", class: "block w-full text-xs", "aria-label": "选择账号文件",
-            onChange: onFileChange})]),
-        selectedFileNames.value.length ? h("p", {class: "text-xs text-muted-foreground break-all"}, `已选择 ${selectedFileNames.value.length} 个文件：${selectedFileNames.value.join("、")}`) : null,
-        h("label", {class: "flex items-center gap-2 text-xs"}, [h("input", {type: "checkbox", checked: sync.value, disabled: busy.value, onChange: event => {sync.value = event.target.checked;}}), "入库后在后台同步账号信息与额度"]),
-        h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), nativeButton(reading.value ? "读取文件中…" : busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),
+        h("input", {ref: fileInput, type: "file", multiple: true, disabled: busy.value,
+          accept: ".txt,.json,text/plain,application/json", class: "hidden", "aria-label": "选择账号文件", onChange: onFileChange}),
+        createVNode(Checkbox, {"model-value": sync.value, disabled: busy.value,
+          "onUpdate:modelValue": value => {sync.value = Boolean(value);}}, {default: () => "入库后在后台同步账号信息与额度"}),
+        h("div", {class: "flex flex-wrap justify-end gap-2"}, [
+          button(reading.value ? "读取文件中…" : "读取 TXT / JSON 文件", () => fileInput.value?.click(), busy.value, false, "lucide:paperclip"),
+          button(state.value.busy ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true, "lucide:cloud-upload"),
+        ]),
         validation.value || current.notice ? h("p", {role: "status", class: "text-xs leading-5 break-words"}, validation.value || current.notice) : null,
         h("div", {class: "border-t border-border pt-3 space-y-3"}, [
+          h("div", {class: "flex items-center justify-between gap-2"}, [h("span", {class: "text-sm font-medium"}, "导入任务与日志"),
+            button("刷新任务列表", () => controller.history(), busy.value, false, "lucide:refresh-cw")]),
           h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "导入任务与日志"),
             h("select", {class: "ui-input-sm w-full", "aria-label": "选择导入任务", value: current.selected || "", disabled: busy.value,
               onChange: event => controller.select(event.target.value)}, current.jobs.length

@@ -8,30 +8,22 @@ export function jobLabel(job) {
   return (importStates[job.status] || job.status) + (job.done && (job.refresh_failed || job.sync_failed) ? "（有失败项）" : "");
 }
 
-export function parseInput(text, mode = "auto") {
+export function parseInput(text, mode = "auto", jsonFile = false) {
   const value = text.trim();
   if (!value) return [];
   const importMode = mode === "rt" ? "refresh_token" : mode;
   const token = value => ({[importMode === "refresh_token" || (importMode !== "access_token" && value.startsWith("rt.")) ? "refresh_token" : "access_token"]: value});
   const accessKeys = ["access_token", "accessToken", "token"];
   const refreshKeys = ["refresh_token", "refreshToken"];
-  const collectionKeys = new Set(["accounts", "items", "results", "tokens", "refresh_tokens"]);
   function findNamedToken(value, keys, seen = new Set()) {
-    if (!value || typeof value !== "object" || seen.has(value)) return "";
+    // Never search across an account array: a wrapper containing many records
+    // must be expanded by records(), not silently reduced to its first token.
+    if (!value || typeof value !== "object" || Array.isArray(value) || seen.has(value)) return "";
     seen.add(value);
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (typeof item === "string" && keys.includes("token") && item.trim()) return item.trim();
-        const found = findNamedToken(item, keys, seen);
-        if (found) return found;
-      }
-      return "";
-    }
     for (const key of keys) {
       if (typeof value[key] === "string" && value[key].trim()) return value[key].trim();
     }
     for (const key of ["credentials", "credential", "tokens", "auth", "session", "data", "account"]) {
-      if (collectionKeys.has(key) && Array.isArray(value[key])) continue;
       const found = findNamedToken(value[key], keys, seen);
       if (found) return found;
     }
@@ -41,8 +33,14 @@ export function parseInput(text, mode = "auto") {
     const access = findNamedToken(parsed, accessKeys);
     const refresh = findNamedToken(parsed, refreshKeys);
     if (!access && !refresh) return null;
-    if (importMode === "access_token") return access ? {access_token: access} : {refresh_token: refresh};
-    if (importMode === "refresh_token") return refresh ? {refresh_token: refresh} : {access_token: access};
+    if (importMode === "access_token") {
+      if (!access) throw new Error("JSON 账号缺少 access_token / accessToken；只有 RT 时请使用“导入 Refresh Token”");
+      return {access_token: access};
+    }
+    if (importMode === "refresh_token") {
+      if (!refresh) throw new Error("JSON 账号缺少 refresh_token / refreshToken；只有 AT 时请使用“导入 Access Token”");
+      return {refresh_token: refresh};
+    }
     return {...(access ? {access_token: access} : {}), ...(refresh ? {refresh_token: refresh} : {})};
   }
   function structuredRecords(parsed) {
@@ -73,7 +71,7 @@ export function parseInput(text, mode = "auto") {
     if (Array.isArray(parsed.refresh_tokens)) {
       for (const value of parsed.refresh_tokens) {
         if (typeof value !== "string" || !value.trim()) throw new Error("JSON 中存在无效 RT");
-        result.push({refresh_token: value.trim()});
+        result.push(tokenRecord({refresh_token: value.trim()}));
       }
     }
     const normalized = tokenRecord(parsed);
@@ -82,7 +80,7 @@ export function parseInput(text, mode = "auto") {
     if (parsed.data && typeof parsed.data === "object") return records(parsed.data);
     throw new Error("JSON 账号缺少 access_token 或 refresh_token");
   }
-  if (["json", "session_json", "cpa_json", "sub2api_json"].includes(mode) || /^[\[{]/.test(value)) {
+  if (jsonFile || ["json", "session_json", "cpa_json", "sub2api_json"].includes(mode) || /^[\[{]/.test(value)) {
     let parsed;
     try { parsed = JSON.parse(value); } catch (_) { throw new Error("JSON 格式错误，请检查文件或粘贴内容；未按 token 导入"); }
     return ["cpa_json", "sub2api_json"].includes(mode) ? structuredRecords(parsed) : records(parsed);
@@ -96,7 +94,7 @@ export async function readImportInputs({text = "", files = [], mode = "access_to
   const accounts = parseInput(text, mode);
   for (let i = 0; i < selected.length; i++) {
     try {
-      const values = parseInput(await selected[i].text(), mode);
+      const values = parseInput(await selected[i].text(), mode, /\.json$/i.test(selected[i].name));
       for (const item of values) accounts.push(item);
     } catch (error) { throw new Error(`第 ${i+1} 个文件：${error.message}`); }
     if (accounts.length > 50000) throw new Error("每次最多导入 50000 条账号");
@@ -104,6 +102,19 @@ export async function readImportInputs({text = "", files = [], mode = "access_to
   if (!accounts.length || accounts.length > 50000) throw new Error("每次需要 1～50000 条账号");
   const source = ["cpa_json", "sub2api_json"].includes(mode) ? "codex" : "web";
   return accounts.map(item => ({...item, source_type: item.source_type || source}));
+}
+
+export function formatImportInput(accounts, mode) {
+  if (mode === "access_token" || mode === "refresh_token") {
+    return accounts.map(account => {
+      const value = account[mode];
+      if (typeof value !== "string" || !value.trim()) throw new Error(`账号缺少 ${mode}`);
+      return value.trim();
+    }).join("\n");
+  }
+  // CPA/Sub2API can carry explicit groups/proxies/source metadata; only the
+  // credential-only modes have a plain-token textarea.
+  return JSON.stringify(accounts, null, 2);
 }
 
 function itemStatusLabel(status) {

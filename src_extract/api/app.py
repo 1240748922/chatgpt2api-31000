@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from threading import Event
+from threading import Event, Thread
 
 from anyio.to_thread import current_default_thread_limiter
 from fastapi import FastAPI, HTTPException
@@ -57,6 +57,42 @@ def create_app() -> FastAPI:
         _configure_threadpool()
         singleton_background = account_shard_settings()[1] == 0
         import_service = None
+        startup_maintenance_thread: Thread | None = None
+
+        def run_startup_maintenance() -> None:
+            """Run singleton maintenance without delaying the HTTP listener."""
+            try:
+                projection_reset = dashboard_metrics_service.reset_projection_schema_if_needed()
+                if projection_reset.changed:
+                    logger.info({
+                        "event": "dashboard_metrics_projection_schema_reset",
+                        "state_recreated": projection_reset.state_recreated,
+                        "hourly_recreated": projection_reset.hourly_recreated,
+                        "model_hourly_recreated": projection_reset.model_hourly_recreated,
+                    })
+            except Exception as exc:
+                logger.error({"event": "dashboard_metrics_projection_schema_reset_failed", "error": str(exc)})
+            try:
+                cleanup_result = retention_cleanup_coordinator.run_startup_automatic(
+                    enforce_image_free_space=False,
+                )
+                cleanup_errors = cleanup_result.get("errors") or {}
+                if cleanup_errors.get("logs"):
+                    logger.error({"event": "log_startup_cleanup_failed", "error": cleanup_errors["logs"]})
+                if cleanup_errors.get("images"):
+                    logger.error({"event": "image_startup_cleanup_failed", "error": cleanup_errors["images"]})
+            except Exception as exc:
+                logger.error({"event": "retention_startup_cleanup_failed", "error": str(exc)})
+            try:
+                dashboard_metrics_service.sync_from_log_service(log_service)
+            except Exception as exc:
+                logger.error({"event": "dashboard_metrics_startup_sync_failed", "error": str(exc)})
+            try:
+                account_service.cleanup_auto_remove_accounts()
+            except Exception as exc:
+                logger.error({"event": "account_startup_cleanup_failed", "error": str(exc)})
+            logger.info({"event": "startup_maintenance_finished"})
+
         if singleton_background and env_int("CHATGPT2API_IMPORT_WORKER_ENABLED", 1, 0, 1):
             from services.account_ingest_service import get_account_ingest_service
             import_service = await run_in_threadpool(get_account_ingest_service)
@@ -64,44 +100,13 @@ def create_app() -> FastAPI:
         if singleton_background:
             start_genbox_push_service()
             image_task_service.start()
-        try:
-            projection_reset = (
-                await run_in_threadpool(dashboard_metrics_service.reset_projection_schema_if_needed)
-                if singleton_background else None
-            )
-            if projection_reset is not None and projection_reset.changed:
-                logger.info({
-                    "event": "dashboard_metrics_projection_schema_reset",
-                    "state_recreated": projection_reset.state_recreated,
-                    "hourly_recreated": projection_reset.hourly_recreated,
-                    "model_hourly_recreated": projection_reset.model_hourly_recreated,
-                })
-        except Exception as exc:
-            logger.error({"event": "dashboard_metrics_projection_schema_reset_failed", "error": str(exc)})
-        try:
-            cleanup_result = (
-                await run_in_threadpool(
-                    retention_cleanup_coordinator.run_startup_automatic,
-                    enforce_image_free_space=False,
-                )
-                if singleton_background else {}
-            )
-            cleanup_errors = cleanup_result.get("errors") or {}
-            if cleanup_errors.get("logs"):
-                logger.error({"event": "log_startup_cleanup_failed", "error": cleanup_errors["logs"]})
-            if cleanup_errors.get("images"):
-                logger.error({"event": "image_startup_cleanup_failed", "error": cleanup_errors["images"]})
-        except Exception as exc:
-            logger.error({"event": "retention_startup_cleanup_failed", "error": str(exc)})
-        try:
-            (
-                await run_in_threadpool(dashboard_metrics_service.sync_from_log_service, log_service)
-                if singleton_background else None
-            )
-        except Exception as exc:
-            logger.error({"event": "dashboard_metrics_startup_sync_failed", "error": str(exc)})
         if singleton_background:
-            account_service.cleanup_auto_remove_accounts()
+            startup_maintenance_thread = Thread(
+                target=run_startup_maintenance,
+                name="startup-maintenance",
+                daemon=True,
+            )
+            startup_maintenance_thread.start()
         stop_event = Event()
         thread = start_account_lifecycle_watcher(stop_event) if singleton_background else None
         replenishment_thread = start_account_replenishment_watcher(stop_event) if singleton_background else None
@@ -113,6 +118,8 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            if startup_maintenance_thread is not None:
+                startup_maintenance_thread.join(timeout=1)
             if import_service is not None:
                 await run_in_threadpool(import_service.stop)
             if thread is not None:

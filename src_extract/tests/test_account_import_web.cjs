@@ -164,9 +164,13 @@ async function testOriginalModalAndBackupRestore() {
   assert(!panel.includes('onActivated(controller.resume)'));
   assert(!panel.includes('onDeactivated(controller.stop)'));
   assert(panel.includes('event?.target'));
-  assert(panel.includes('onInput: onFileChange'));
+  assert(!panel.includes('onInput: onFileChange'), 'file input must not process the same FileList twice');
+  assert(panel.includes('onChange: onFileChange'));
   assert(panel.includes('JSON.stringify(accounts, null, 2)'));
   assert(panel.includes('内容已填入上方输入框'));
+  assert(bundle.includes('at=R(()=>st.value)'), 'background import state must not lock the import modal');
+  assert(bundle.includes('scrollable:"",onClose:t(ao)'), 'modal overlay close must use the same close handler');
+  assert(bundle.includes('title:"导入账号",compact:"",onClose:t(ao)'), 'modal close button must remain enabled');
   const calls=[];
   const bulk={start:async()=>{},update:()=>{},appendEvents:()=>{},finish:()=>{},end:()=>{},refreshProgress:{value:{}},batchBusy:{value:false}};
   const scope={T:value=>({value}),De:()=>({}),Ke:()=>({ask:async()=>true}),Vo:[],Ks:()=>({}),Lo:async()=>{},

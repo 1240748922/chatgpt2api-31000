@@ -1,8 +1,8 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, a as h, b as createVNode, l as Button, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260920-account-import-fix-v3";
-import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260920-account-import-fix-v3";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260920-account-import-fix-v4";
+import {createImportController, readImportInputs, formatEvent, elapsed, jobLabel} from "./accountImportRuntime-v3.js?v=20260920-account-import-fix-v4";
 
 const titles = {access_token: "导入 Access Token", refresh_token: "导入 Refresh Token", session_json: "导入 Session JSON", cpa_json: "导入 CPA JSON 文件", sub2api_json: "导入 Sub2API JSON 文件"};
 export default defineComponent({
@@ -47,7 +47,9 @@ export default defineComponent({
         // Read files immediately and put normalized records into the same
         // textarea used by pasted AT/RT content. JSON fields and rt.* lines
         // are classified by parseInput; opaque RT values still follow the
-        // currently selected RT tab.
+        // currently selected RT tab. The textarea is the single source of
+        // truth used by submit(), so the button becomes usable as soon as
+        // this read finishes.
         const accounts = await readImportInputs({text: text.value, files: selected, mode: props.mode});
         if (disposed) return;
         text.value = JSON.stringify(accounts, null, 2);
@@ -106,7 +108,7 @@ export default defineComponent({
         h("label", {class: "block text-xs"}, [h("span", {class: "ui-field-label"}, "选择文件（自动识别并填入上方输入框）"),
           h("input", {ref: fileInput, type: "file", multiple: true, disabled: busy.value,
             accept: ".txt,.json,text/plain,application/json", class: "block w-full text-xs", "aria-label": "选择账号文件",
-            onChange: onFileChange, onInput: onFileChange})]),
+            onChange: onFileChange})]),
         selectedFileNames.value.length ? h("p", {class: "text-xs text-muted-foreground break-all"}, `已选择 ${selectedFileNames.value.length} 个文件：${selectedFileNames.value.join("、")}`) : null,
         h("label", {class: "flex items-center gap-2 text-xs"}, [h("input", {type: "checkbox", checked: sync.value, disabled: busy.value, onChange: event => {sync.value = event.target.checked;}}), "入库后在后台同步账号信息与额度"]),
         h("div", {class: "flex flex-wrap justify-end gap-2"}, [button("刷新任务列表", () => controller.history()), button(reading.value ? "读取文件中…" : busy.value ? "正在提交…" : "开始导入", submit, busy.value || !hasInput.value, true)]),

@@ -109,6 +109,11 @@ async function testCleanupActionRequiresPreviewConfirmation() {
   vm.runInContext(source.slice(start, end), context);
   await context.v('cleanup-invalid');
   assert.equal(calls, 0, 'cancel does not delete');
+  assert.equal(options[0].auto_remove_invalid_accounts, true);
+  assert.equal(options[0].remove_unusable_credentials, true,
+    'manual abnormal cleanup must include projected AT-invalid/no-usable-RT accounts');
+  assert.equal(options[0].remove_quota_exhausted, false);
+  assert.equal(options[0].auto_remove_rate_limited_accounts, false);
   confirmed = true;
   await context.v('cleanup-quota');
   assert.equal(calls, 1);

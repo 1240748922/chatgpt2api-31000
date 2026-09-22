@@ -9,6 +9,46 @@ from fastapi.testclient import TestClient
 from api import system
 
 from services.account_service import AccountService
+from services.account_view import account_status_category
+from cleanup_fixtures import cleanup_accounts
+
+
+def test_manual_combined_cleanup_matches_displayed_abnormal_and_preserves_others(monkeypatch):
+    accounts = cleanup_accounts()
+    service = _service(accounts)
+    monkeypatch.setattr(service, "_refresh_accounts_snapshot_if_stale", lambda: None)
+    expected = {a["email"] for a in accounts if account_status_category(a) == "abnormal"}
+    assert expected == {name + "@example.test" for name in [
+        "expired-no-rt", "remote-invalid", "both-invalid", "stored-abnormal"]}
+    options = dict(remove_invalid=True, remove_unusable_credentials=True,
+                   remove_rate_limited=False, remove_quota_exhausted=False)
+    preview = service.preview_auto_remove_accounts(**options)
+    assert {a["email"] for a in preview["items"]} == expected
+    assert preview["total_removed"] == 4
+    assert all(a["status_label"] == "异常" for a in preview["items"])
+    assert not any(secret in json.dumps(preview) for a in accounts
+                   for secret in [a["access_token"], a.get("refresh_token", "")] if secret)
+    # The execution endpoint recomputes conditions; it does not trust preview IDs.
+    recovered = next(a for a in accounts if a["name"] == "expired-no-rt")
+    recovered["refresh_token"] = "synthetic-new-recovery-rt"
+    deleted = []
+    monkeypatch.setattr(service, "delete_accounts", lambda tokens, **kw: deleted.extend(tokens) or {"removed": 0})
+    service.cleanup_auto_remove_accounts(**options)
+    assert recovered["access_token"] not in deleted
+    assert {a["email"] for a in accounts if a["access_token"] in deleted} == expected - {recovered["email"]}
+
+
+def test_background_cleanup_does_not_inherit_manual_credential_scope(monkeypatch):
+    from types import SimpleNamespace
+    from services import account_service as module
+    service = _service(cleanup_accounts())
+    monkeypatch.setattr(service, "_refresh_accounts_snapshot_if_stale", lambda: None)
+    monkeypatch.setattr(module, "config", SimpleNamespace(
+        auto_remove_invalid_accounts=True, auto_remove_rate_limited_accounts=False))
+    deleted = []
+    monkeypatch.setattr(service, "delete_accounts", lambda tokens, **kw: deleted.extend(tokens) or {"removed": 0})
+    service.cleanup_auto_remove_accounts()
+    assert deleted == ["synthetic-stored-abnormal"]
 
 
 def _service(accounts: list[dict]) -> AccountService:

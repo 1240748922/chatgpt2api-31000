@@ -130,6 +130,7 @@ def _backend_image_result_timing_data(
 
 
 _IMAGE_PROGRESS_STAGE_EVENTS = {
+    "preparing_inputs": "image_preparing_inputs",
     "uploading": "image_uploading",
     "bootstrapping": "image_bootstrapping",
     "getting_token": "image_getting_token",
@@ -139,6 +140,7 @@ _IMAGE_PROGRESS_STAGE_EVENTS = {
 }
 
 _IMAGE_PROGRESS_DURATION_KEYS = {
+    "preparing_inputs": "input_prepare_ms",
     "uploading": "upload_ms",
     "bootstrapping": "bootstrap_ms",
     "getting_token": "requirements_ms",
@@ -148,6 +150,7 @@ _IMAGE_PROGRESS_DURATION_KEYS = {
 
 
 _IMAGE_FAILURE_DIAGNOSTIC_ATTRS = (
+    "image_input_timings",
     "failure_phase", "failure_phase_ms", "poll_trace",
     "poll_attempts", "poll_timeout_secs", "last_task_error",
     "last_conversation_snapshot", "last_assistant_text",
@@ -166,6 +169,7 @@ def _image_failure_timing_data(error: Exception | None) -> dict[str, Any]:
         metric = "stream_error_ms"
     if metric:
         result[metric] = elapsed
+    result.update(getattr(error, "image_input_timings", None) or {})
     return result
 
 
@@ -174,6 +178,7 @@ def _image_progress_callback_with_monitor(
         index: int,
         total: int,
         account_email_getter: Callable[[], str],
+        input_timings_getter: Callable[[], dict] | None = None,
 ) -> Callable[[str], None]:
     original_callback = request.progress_callback
     last_step = ""
@@ -193,6 +198,8 @@ def _image_progress_callback_with_monitor(
         duration_key = _IMAGE_PROGRESS_DURATION_KEYS.get(last_step)
         if duration_key:
             data[duration_key] = int((now - last_step_started) * 1000)
+        if last_step == "preparing_inputs" and input_timings_getter is not None:
+            data.update(input_timings_getter())
         stage_event = _IMAGE_PROGRESS_STAGE_EVENTS.get(step_name)
         if stage_event:
             _monitor_image_stage(request, stage_event, **data)
@@ -2643,6 +2650,7 @@ def _generate_single_image(
                     index,
                     total,
                     lambda: account_email,
+                    lambda: getattr(backend, "image_input_timings", lambda: {})(),
                 )
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []

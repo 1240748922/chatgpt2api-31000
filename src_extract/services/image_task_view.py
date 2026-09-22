@@ -16,6 +16,7 @@ _STAGE_LABELS = {
     "image_egress_waiting": "等待出口",
     "image_egress_ready": "出口就绪",
     "uploading": "上传图片",
+    "preparing_inputs": "上传与预热",
     "bootstrapping": "初始化上游",
     "getting_token": "获取令牌",
     "preparing_conversation": "准备会话",

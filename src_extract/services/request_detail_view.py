@@ -22,9 +22,20 @@ _TIMELINE_STEPS = (
     ("account_snapshot_check_ms", "账号快照检查", "entry", "包含在等待账号内"),
     ("account_candidate_total_ms", "候选账号取号", "entry", "筛选与槽位等待，包含在等待账号内"),
     ("account_token_maintenance_ms", "账号凭据维护", "entry", "AT 刷新、同步等待及保存，包含在等待账号内"),
+    ("account_token_lookup_ms", "凭据读取与锁等待", "entry", "包含在账号凭据维护内，不重复相加"),
+    ("account_token_slot_ms", "刷新并发槽位等待", "entry", "包含在账号凭据维护内，不重复相加"),
+    ("account_token_http_ms", "刷新凭据请求", "entry", "包含在账号凭据维护内，不重复相加"),
+    ("account_token_save_ms", "凭据结果保存", "entry", "包含在账号凭据维护内，不重复相加"),
+    ("account_token_singleflight_ms", "等待同账号刷新", "entry", "包含在账号凭据维护内，不重复相加"),
     ("egress_wait_ms", "等待出口", "entry", "代理出口准备"),
     ("egress_acquire_ms", "出口租约", "entry", "代理节点并发"),
-    ("upload_ms", "上传输入图", "prepare", "参考图上传"),
+    ("input_prepare_ms", "上传与预热总计", "prepare", "实际墙钟耗时；已扣除重叠，不与子项重复相加"),
+    ("upload_ms", "上传输入图", "prepare", "读取、申请地址、传输与确认累计；与预热可能重叠"),
+    ("upload_decode_ms", "读取与解码输入图", "prepare", "包含在上传耗时内"),
+    ("upload_register_ms", "申请上传地址", "prepare", "上游文件登记；包含在上传耗时内"),
+    ("upload_put_ms", "传输输入图", "prepare", "原始图片字节传输；包含在上传耗时内"),
+    ("upload_confirm_ms", "确认上传", "prepare", "通知上游上传完成；包含在上传耗时内"),
+    ("prewarm_overlap_ms", "上传与预热重叠", "prepare", "两步同时执行的时间；不计入总耗时加和"),
     ("bootstrap_ms", "预热页面", "prepare", "ChatGPT 页面"),
     ("requirements_ms", "获取请求令牌", "prepare", "requirements / token"),
     ("prepare_conversation_ms", "准备会话", "prepare", "图片会话上下文"),
@@ -64,7 +75,7 @@ _TIMELINE_SEGMENTS = (
         "prepare",
         "上游准备",
         "prepare",
-        ("upload_ms", "bootstrap_ms", "requirements_ms", "prepare_conversation_ms"),
+        ("input_prepare_ms", "upload_ms", "bootstrap_ms", "requirements_ms", "prepare_conversation_ms"),
     ),
     ("upstream", "上游生成", "upstream", ("generation_start_ms", "sse_stream_ms")),
     ("poll_wait", "等待结果", "resolve", ("poll_wait_ms",)),
@@ -300,6 +311,8 @@ def _timeline_segment_value(
     segment_key: str,
     aggregate_keys: tuple[str, ...],
 ) -> int:
+    if segment_key == "prepare" and "input_prepare_ms" in timings:
+        return _int(timings["input_prepare_ms"]) + _int(timings.get("requirements_ms")) + _int(timings.get("prepare_conversation_ms"))
     primary_value = sum(_int(timings.get(key)) for key in aggregate_keys)
     if segment_key != "upstream":
         return primary_value
@@ -307,7 +320,7 @@ def _timeline_segment_value(
     if envelope_value <= 0:
         return max(primary_value, _int(timings.get("generation_start_ms")) + _int(timings.get("stream_error_ms")))
     prepare_keys = next((keys for key, _, _, keys in _TIMELINE_SEGMENTS if key == "prepare"), ())
-    prepare_value = sum(_int(timings.get(key)) for key in prepare_keys)
+    prepare_value = _timeline_segment_value(timings, "prepare", prepare_keys)
     return max(primary_value, max(0, envelope_value - prepare_value))
 
 
@@ -335,6 +348,7 @@ def build_request_timeline_presentation(
     wall_duration_ms: int = 0,
 ) -> dict[str, Any]:
     phase_metrics = {
+        "preparing_inputs": "input_prepare_ms",
         "uploading": "upload_ms", "bootstrapping": "bootstrap_ms",
         "getting_token": "requirements_ms", "preparing_conversation": "prepare_conversation_ms",
         "starting_generation": "generation_start_ms", "generating": "stream_error_ms",

@@ -24,6 +24,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
+from services.image_input_prewarm import input_transfer_pool, put_signed_image
 from services.image_failure import (
     ImageDownloadError,
     ImageFailure,
@@ -1246,64 +1247,117 @@ class OpenAIBackendAPI:
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
         return base64.b64decode(payload)
 
+    @contextmanager
+    def _image_input_step(self, metric: str, phase: str = "uploading"):
+        started = time.perf_counter()
+        try:
+            yield
+        except Exception as exc:
+            if not getattr(exc, "failure_phase", ""):
+                exc.failure_phase = phase
+                exc.failure_phase_ms = max(0, int((time.perf_counter() - started) * 1000))
+            raise
+        finally:
+            self._add_image_input_timing(metric, (time.perf_counter() - started) * 1000)
+
+    def _add_image_input_timing(self, metric: str, elapsed: float):
+        timings = getattr(self, "_image_input_timings", None)
+        if isinstance(timings, dict):
+            timings[metric] = timings.get(metric, 0.0) + max(0.0, elapsed)
+
+    def image_input_timings(self):
+        timings = dict(getattr(self, "_image_input_timings", None) or {})
+        if any(key.startswith("upload_") for key in timings):
+            timings["upload_ms"] = sum(timings.get(key, 0) for key in (
+                "upload_decode_ms", "upload_register_ms", "upload_put_ms", "upload_confirm_ms"))
+        return {key: max(0, int(value)) for key, value in timings.items()}
+
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """上传一张 base64 图片，返回底层文件元数据。"""
-        data = self._decode_image_base64(image)
-        if (
-                image
-                and len(image) < 512
-                and not image.startswith("data:")
-                and "\n" not in image
-                and "\r" not in image
-        ):
-            candidate_path = Path(os.path.expanduser(image))
-            if candidate_path.exists() and candidate_path.is_file():
-                file_name = candidate_path.name
-        image = Image.open(BytesIO(data))
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, "image/png")
+        """Upload unchanged image bytes; picture requests may overlap the PUT with bootstrap."""
+        with self._image_input_step("upload_decode_ms"):
+            data = self._decode_image_base64(image)
+            if (image and len(image) < 512 and not image.startswith("data:")
+                    and "\n" not in image and "\r" not in image):
+                candidate_path = Path(os.path.expanduser(image))
+                if candidate_path.exists() and candidate_path.is_file():
+                    file_name = candidate_path.name
+            with Image.open(BytesIO(data)) as decoded:
+                width, height = decoded.size
+                mime_type = Image.MIME.get(decoded.format, "image/png")
         path = "/backend-api/files"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
-                  "height": height},
-            timeout=self._image_request_timeout(60),
-        )
-        ensure_ok(response, path)
-        upload_meta = response.json()
-        response = self.session.put(
-            upload_meta["upload_url"],
-            headers={
-                "Content-Type": mime_type,
-                "x-ms-blob-type": "BlockBlob",
-                "x-ms-version": "2020-04-08",
-                "Origin": self.base_url,
-                "Referer": self.base_url + "/",
-                "User-Agent": self.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.8",
-            },
-            data=data,
-            timeout=self._image_request_timeout(120),
-        )
-        ensure_ok(response, "image_upload", credential_scope="signed_asset")
-        path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            data="{}",
-            timeout=self._image_request_timeout(60),
-        )
-        ensure_ok(response, path)
-        return {
-            "file_id": upload_meta["file_id"],
-            "file_name": file_name,
-            "file_size": len(data),
-            "mime_type": mime_type,
-            "width": width,
-            "height": height,
+        with self._image_input_step("upload_register_ms"):
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal",
+                      "width": width, "height": height},
+                timeout=self._image_request_timeout(60),
+            )
+            ensure_ok(response, path)
+            upload_meta = response.json()
+        put_headers = {
+            "Content-Type": mime_type, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08",
+            "Origin": self.base_url, "Referer": self.base_url + "/", "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.8",
         }
+        future = None
+        transfer_timing = {}
+        if getattr(self, "_image_prewarm_pending", False):
+            self._image_prewarm_pending = False
+            # Only after registration succeeds: account 401/upload 429 stays
+            # fast, and authenticated requests never share a concurrent Session.
+            session_kwargs = proxy_settings.build_session_kwargs_from_profile(
+                self.proxy_profile, impersonate=self.fp["impersonate"], verify=True,
+            )
+            future = input_transfer_pool.try_submit(
+                put_signed_image, session_kwargs, upload_meta["upload_url"], put_headers,
+                data, self._image_request_timeout(120), self.deadline_monotonic, transfer_timing,
+            )
+        if future is None:
+            with self._image_input_step("upload_put_ms"):
+                response = self.session.put(upload_meta["upload_url"], headers=put_headers, data=data,
+                                            timeout=self._image_request_timeout(120))
+                ensure_ok(response, "image_upload", credential_scope="signed_asset")
+        else:
+            warm_start = warm_end = time.perf_counter()
+            try:
+                try:
+                    # A transfer which already failed does not need any warmup.
+                    if future.done():
+                        future.result()
+                    warm_start = time.perf_counter()
+                    try:
+                        with self._image_input_step("bootstrap_ms", "bootstrapping"):
+                            self._bootstrap_image()
+                        self._image_prewarm_done = True
+                    finally:
+                        warm_end = time.perf_counter()
+                finally:
+                    # Drain even on warmup failure: keep account/egress leases
+                    # until the bounded transfer finishes and closes its Session.
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        exc.failure_phase = "uploading"
+                        exc.failure_phase_ms = max(0, int((transfer_timing.get("ended", 0)
+                                                         - transfer_timing.get("started", 0)) * 1000))
+                        raise
+            finally:
+                put_start = transfer_timing.get("started", warm_end)
+                put_end = transfer_timing.get("ended", put_start)
+                self._add_image_input_timing("upload_put_ms", (put_end - put_start) * 1000)
+                self._add_image_input_timing("prewarm_overlap_ms",
+                                            (min(warm_end, put_end) - max(warm_start, put_start)) * 1000)
+        path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
+        with self._image_input_step("upload_confirm_ms"):
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                data="{}", timeout=self._image_request_timeout(60),
+            )
+            ensure_ok(response, path)
+        return {"file_id": upload_meta["file_id"], "file_name": file_name, "file_size": len(data),
+                "mime_type": mime_type, "width": width, "height": height}
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
@@ -3732,10 +3786,33 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        with self._image_request_phase("uploading"):
-            references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
-        with self._image_request_phase("bootstrapping"):
-            self._bootstrap_image()
+        self._image_input_timings = {} if images else None
+        self._image_prewarm_pending = bool(images)
+        self._image_prewarm_done = False
+        if images:
+            input_started = time.perf_counter()
+            error = None
+            try:
+                with self._image_request_phase("preparing_inputs"):
+                    with self._image_request_phase("uploading", report=False):
+                        references = [self._upload_image(image, f"image_{idx}.png")
+                                      for idx, image in enumerate(images, start=1)]
+                    if not self._image_prewarm_done:
+                        with self._image_input_step("bootstrap_ms", "bootstrapping"):
+                            self._bootstrap_image()
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                self._image_prewarm_pending = False
+                self._add_image_input_timing("input_prepare_ms", (time.perf_counter() - input_started) * 1000)
+                if error is not None:
+                    error.image_input_timings = self.image_input_timings()
+        else:
+            with self._image_request_phase("uploading"):
+                references = []
+            with self._image_request_phase("bootstrapping"):
+                self._bootstrap_image()
         with self._image_request_phase("getting_token"):
             requirements = self._get_chat_requirements(
                 deadline=self.deadline_monotonic,
@@ -3763,14 +3840,16 @@ class OpenAIBackendAPI:
             response.close()
 
     @contextmanager
-    def _image_request_phase(self, phase: str) -> Iterator[None]:
+    def _image_request_phase(self, phase: str, *, report: bool = True) -> Iterator[None]:
         started = time.perf_counter()
-        self._report_progress(phase)
+        if report:
+            self._report_progress(phase)
         try:
             yield
         except Exception as exc:
-            exc.failure_phase = phase
-            exc.failure_phase_ms = max(0, int((time.perf_counter() - started) * 1000))
+            if not getattr(exc, "failure_phase", ""):
+                exc.failure_phase = phase
+                exc.failure_phase_ms = max(0, int((time.perf_counter() - started) * 1000))
             raise
 
     def _bootstrap(self, timeout_secs: float = 30.0) -> None:

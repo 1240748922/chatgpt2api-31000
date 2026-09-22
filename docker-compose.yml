@@ -38,6 +38,8 @@ x-app: &app
     CHATGPT2API_BUILD_TIME: ${CHATGPT2API_BUILD_TIME:-unknown}
     CHATGPT2API_THREAD_TOKENS: 160
     CHATGPT2API_IMAGE_THREAD_TOKENS: 140
+    # Optional overlap workers, NOT an image request limit; full/0 uses serial upload.
+    CHATGPT2API_IMAGE_PREWARM_CONCURRENCY: ${CHATGPT2API_IMAGE_PREWARM_CONCURRENCY:-64}
     CHATGPT2API_IMAGE_QUEUE_LIMIT: 40
     CHATGPT2API_IMAGE_RETRY_AFTER_SECS: 2
     # Super-resolution is independent from image generation slots. Keep eight

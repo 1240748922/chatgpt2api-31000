@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from services.account_maintenance_metrics import TOKEN_METRIC_LABELS
+from services.image_input_prewarm import INPUT_METRIC_LABELS
+
 import math
 import time
 from collections import Counter, deque
@@ -74,6 +77,7 @@ STAGE_LABELS = {
     "image_account_wait_slow": "等待账号",
     "image_egress_waiting": "等待出口",
     "image_egress_ready": "出口就绪",
+    "image_preparing_inputs": "上传与预热",
     "image_uploading": "上传图片",
     "image_bootstrapping": "初始化上游",
     "image_getting_token": "获取令牌",
@@ -113,6 +117,7 @@ ACTIVE_STAGE_GROUPS = {
     "image_account_wait_slow": "等待账号",
     "image_egress_waiting": "等待出口",
     "image_egress_ready": "等待出口",
+    "image_preparing_inputs": "上游准备",
     "image_uploading": "上游准备",
     "image_bootstrapping": "上游准备",
     "image_getting_token": "上游准备",
@@ -138,6 +143,8 @@ ACTIVE_STAGE_GROUPS = {
 
 
 METRIC_LABELS = {
+    **INPUT_METRIC_LABELS,
+    **TOKEN_METRIC_LABELS,
     "handler_queue_ms": "等待入口",
     "stream_first_queue_ms": "首包线程等待",
     "account_wait_ms": "等待账号",
@@ -1017,6 +1024,8 @@ class RealtimeMonitorService:
                 "resolve_ms",
                 "download_ms",
                 *POSTPROCESS_METRIC_LABELS,
+                *INPUT_METRIC_LABELS,
+                *TOKEN_METRIC_LABELS,
                 "response_ms",
                 "stream_ms",
                 "total_ms",

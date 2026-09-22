@@ -8,7 +8,7 @@ import random
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +16,7 @@ from threading import Condition, Lock, Thread, local
 from typing import Any, Callable
 from uuid import uuid4
 
+from services.account_maintenance_metrics import collect_token_timings, token_phase, token_request_slot
 from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -1405,6 +1406,7 @@ class AccountService:
         with self._lock:
             return self._resolve_access_token_locked(access_token)
 
+    @token_phase("account_token_lookup_ms")
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
@@ -1431,6 +1433,7 @@ class AccountService:
             str(item.get("last_token_refresh_at") or "").strip(),
         )
 
+    @token_phase("account_token_save_ms")
     def _record_token_refresh_error(
         self,
         access_token: str,
@@ -1530,27 +1533,28 @@ class AccountService:
 
         session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
-            with request_slot():
-                response = session.post(
-                    self._OAUTH_TOKEN_URL,
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": self._OAUTH_USER_AGENT,
-                    },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": self._OAUTH_CLIENT_ID,
-                    },
-                    timeout=(
-                        max(0.001, min(60.0, deadline_monotonic - time.monotonic()))
-                        if deadline_monotonic is not None and deadline_monotonic > time.monotonic()
-                        else 60
-                        if deadline_monotonic is None
-                        else 0.001
-                    ),
-                )
+            with token_request_slot(request_slot):
+                with token_phase("account_token_http_ms"):
+                    response = session.post(
+                        self._OAUTH_TOKEN_URL,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": self._OAUTH_USER_AGENT,
+                        },
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": self._OAUTH_CLIENT_ID,
+                        },
+                        timeout=(
+                            max(0.001, min(60.0, deadline_monotonic - time.monotonic()))
+                            if deadline_monotonic is not None and deadline_monotonic > time.monotonic()
+                            else 60
+                            if deadline_monotonic is None
+                            else 0.001
+                        ),
+                    )
             raw_text = self._safe_response_text(response)
             try:
                 data = response.json() if raw_text else {}
@@ -1654,6 +1658,7 @@ class AccountService:
             rotations.append((new_token, alias_sources))
         return rotations
 
+    @token_phase("account_token_save_ms")
     def _apply_refreshed_tokens(
         self,
         old_access_token: str,
@@ -1915,12 +1920,13 @@ class AccountService:
                 else:
                     future.set_result(result)
             try:
-                if deadline_monotonic is None:
-                    return future.result()
-                remaining = deadline_monotonic - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("image request deadline exceeded while waiting for token refresh")
-                return future.result(timeout=remaining)
+                with token_phase("account_token_singleflight_ms") if not owner else nullcontext():
+                    if deadline_monotonic is None:
+                        return future.result()
+                    remaining = deadline_monotonic - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("image request deadline exceeded while waiting for token refresh")
+                    return future.result(timeout=remaining)
             except TerminalRefreshTokenError as exc:
                 expected_access_token = str(
                     getattr(exc, "expected_access_token", active_token) or active_token
@@ -2463,6 +2469,7 @@ class AccountService:
         else:
             self._image_inflight[access_token] = current_inflight - 1
 
+    @collect_token_timings
     def get_available_access_token(
             self,
             plan_type: str | None = None,

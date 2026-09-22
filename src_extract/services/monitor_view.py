@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from services.account_maintenance_metrics import TOKEN_METRIC_LABELS
+from services.image_input_prewarm import INPUT_METRIC_LABELS
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -296,6 +299,10 @@ BOOLEAN_FIELDS = {
     "returned_message",
 }
 
+EVENT_FIELDS.update(TOKEN_METRIC_LABELS)
+EVENT_METRIC_PAIRS += tuple((label, key) for key, label in TOKEN_METRIC_LABELS.items())
+EVENT_FIELDS.update(INPUT_METRIC_LABELS)
+EVENT_METRIC_PAIRS += tuple((label, key) for key, label in INPUT_METRIC_LABELS.items())
 EVENT_FIELDS.update(POSTPROCESS_METRIC_LABELS)
 EVENT_METRIC_PAIRS += tuple((label, key) for key, label in POSTPROCESS_METRIC_LABELS.items())
 SLOW_METRIC_PAIRS += tuple(POSTPROCESS_METRIC_LABELS.items())
@@ -426,6 +433,8 @@ def _row_duration(record: Mapping[str, Any]) -> int:
 def _tracked_duration(timings: Mapping[str, int]) -> int:
     queue = sum(_int(timings.get(key)) for key in ENTRY_QUEUE_METRIC_KEYS)
     linear = sum(_int(timings.get(key)) for key in LINEAR_STAGE_KEYS)
+    if "input_prepare_ms" in timings:
+        linear += _int(timings["input_prepare_ms"]) - _int(timings.get("upload_ms")) - _int(timings.get("bootstrap_ms"))
     wrapped = max(_int(timings.get("total_ms")), _int(timings.get("stream_ms")), linear)
     return queue + wrapped
 

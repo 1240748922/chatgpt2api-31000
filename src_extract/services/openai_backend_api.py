@@ -24,7 +24,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
-from services.image_input_prewarm import input_transfer_pool, put_signed_image, snapshot_cookies, merge_upload_cookies
+from services.image_input_prewarm import input_transfer_pool, put_signed_image, snapshot_cookies, merge_upload_cookies, prepare_image_upload
 from services.image_failure import (
     ImageDownloadError,
     ImageFailure,
@@ -1273,35 +1273,32 @@ class OpenAIBackendAPI:
         return {key: max(0, int(value)) for key, value in timings.items()}
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """Upload unchanged bytes; overlap PUT and confirmation with page bootstrap."""
+        return self._upload_image_group([(image, file_name)])[0]
+
+    def _upload_image_group(self, images: list[tuple[str, str]]) -> list[Dict[str, Any]]:
+        """Register the first reference, then overlap ordered uploads with warmup."""
+        image, file_name = images[0]
         with self._image_input_step("upload_decode_ms"):
-            data = self._decode_image_base64(image)
-            if (image and len(image) < 512 and not image.startswith("data:")
-                    and "\n" not in image and "\r" not in image):
-                candidate_path = Path(os.path.expanduser(image))
-                if candidate_path.exists() and candidate_path.is_file():
-                    file_name = candidate_path.name
-            with Image.open(BytesIO(data)) as decoded:
-                width, height = decoded.size
-                mime_type = Image.MIME.get(decoded.format, "image/png")
+            data, reference = prepare_image_upload(image, file_name, self._decode_image_base64)
         path = "/backend-api/files"
         with self._image_input_step("upload_register_ms"):
             response = self.session.post(
                 self.base_url + path,
                 headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-                json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal",
-                      "width": width, "height": height},
+                json={"file_name": reference["file_name"], "file_size": len(data), "use_case": "multimodal",
+                      "width": reference["width"], "height": reference["height"]},
                 timeout=self._image_request_timeout(60),
             )
             ensure_ok(response, path)
             upload_meta = response.json()
         put_headers = {
-            "Content-Type": mime_type, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08",
+            "Content-Type": reference["mime_type"], "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08",
             "Origin": self.base_url, "Referer": self.base_url + "/", "User-Agent": self.user_agent,
             "Accept": "application/json, text/plain, */*", "Accept-Language": "en-US,en;q=0.8",
         }
         future = None
         transfer_timing = {}
+        stop_upload = threading.Event()
         confirmation_path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         if getattr(self, "_image_prewarm_pending", False):
             self._image_prewarm_pending = False
@@ -1319,7 +1316,7 @@ class OpenAIBackendAPI:
             future = input_transfer_pool.try_submit(
                 put_signed_image, session_kwargs, upload_meta["upload_url"], put_headers,
                 data, self._image_request_timeout(120), self.deadline_monotonic, transfer_timing,
-                confirmation,
+                confirmation, images[1:], self._decode_image_base64, stop_upload,
             )
         if future is None:
             with self._image_input_step("upload_put_ms"):
@@ -1338,6 +1335,9 @@ class OpenAIBackendAPI:
                         with self._image_input_step("bootstrap_ms", "bootstrapping"):
                             self._bootstrap_image()
                         self._image_prewarm_done = True
+                    except BaseException:
+                        stop_upload.set()
+                        raise
                     finally:
                         warm_end = time.perf_counter()
                 finally:
@@ -1346,9 +1346,10 @@ class OpenAIBackendAPI:
                     try:
                         uploaded_cookies = future.result()
                     except Exception as exc:
-                        exc.failure_phase = "uploading"
-                        exc.failure_phase_ms = max(0, int((transfer_timing.get("ended", 0)
-                                                         - transfer_timing.get("started", 0)) * 1000))
+                        if not getattr(exc, "failure_phase", ""):
+                            exc.failure_phase = "uploading"
+                            exc.failure_phase_ms = max(0, int((transfer_timing.get("ended", 0)
+                                                              - transfer_timing.get("started", 0)) * 1000))
                         raise
             finally:
                 put_start = transfer_timing.get("started", warm_end)
@@ -1358,8 +1359,10 @@ class OpenAIBackendAPI:
                 confirm_end = transfer_timing.get("confirm_ended", confirm_start)
                 if "confirm_started" in transfer_timing:
                     self._add_image_input_timing("upload_confirm_ms", (confirm_end - confirm_start) * 1000)
+                for metric, elapsed in transfer_timing.get("tail_metrics", {}).items():
+                    self._add_image_input_timing(metric, elapsed)
                 self._add_image_input_timing("prewarm_overlap_ms",
-                                            (min(warm_end, confirm_end) - max(warm_start, put_start)) * 1000)
+                    (min(warm_end, transfer_timing.get("ended", confirm_end)) - max(warm_start, put_start)) * 1000)
             merge_upload_cookies(self.session.cookies, confirmation["cookies"], uploaded_cookies)
         if future is None:
             with self._image_input_step("upload_confirm_ms"):
@@ -1369,8 +1372,14 @@ class OpenAIBackendAPI:
                     data="{}", timeout=self._image_request_timeout(60),
                 )
                 ensure_ok(response, confirmation_path)
-        return {"file_id": upload_meta["file_id"], "file_name": file_name, "file_size": len(data),
-                "mime_type": mime_type, "width": width, "height": height}
+        references = [{"file_id": upload_meta["file_id"], **reference}]
+        if future is None:
+            # No worker slot: keep the old serial path without a queue or a
+            # second registration of the already registered first reference.
+            references.extend(self._upload_image(item, name) for item, name in images[1:])
+        else:
+            references.extend(transfer_timing.get("references", []))
+        return references
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
@@ -3799,7 +3808,7 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        self._image_input_timings = {} if images else None
+        self._image_input_timings = {}
         self._image_prewarm_pending = bool(images)
         self._image_prewarm_done = False
         if images:
@@ -3808,8 +3817,11 @@ class OpenAIBackendAPI:
             try:
                 with self._image_request_phase("preparing_inputs"):
                     with self._image_request_phase("uploading", report=False):
-                        references = [self._upload_image(image, f"image_{idx}.png")
-                                      for idx, image in enumerate(images, start=1)]
+                        if len(images) > 1:
+                            references = self._upload_image_group([
+                                (image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)])
+                        else:
+                            references = [self._upload_image(images[0], "image_1.png")]
                     if not self._image_prewarm_done:
                         with self._image_input_step("bootstrap_ms", "bootstrapping"):
                             self._bootstrap_image()
@@ -3863,6 +3875,8 @@ class OpenAIBackendAPI:
             if not getattr(exc, "failure_phase", ""):
                 exc.failure_phase = phase
                 exc.failure_phase_ms = max(0, int((time.perf_counter() - started) * 1000))
+            if phase == "bootstrapping":
+                exc.image_input_timings = self.image_input_timings()
             raise
 
     def _bootstrap(self, timeout_secs: float = 30.0) -> None:
@@ -3885,6 +3899,8 @@ class OpenAIBackendAPI:
         the caller's overall deadline; auth and rate-limit failures are final.
         """
         deadline = time.monotonic() + self._image_request_timeout(20)
+        if not isinstance(getattr(self, "_image_input_timings", None), dict):
+            self._image_input_timings = {}
         for attempt in range(2):
             options = getattr(getattr(self, "session", None), "curl_options", None)
             force_fresh = attempt > 0 and isinstance(options, dict)
@@ -3892,6 +3908,7 @@ class OpenAIBackendAPI:
             previous_fresh = options.get(CurlOpt.FRESH_CONNECT) if force_fresh else None
             if force_fresh:
                 options[CurlOpt.FRESH_CONNECT] = 1
+            started = time.perf_counter()
             try:
                 self._bootstrap(timeout_secs=max(0.001, min(10.0, deadline - time.monotonic())))
                 return
@@ -3905,6 +3922,8 @@ class OpenAIBackendAPI:
                     raise
                 logger.info({"event": "image_bootstrap_reconnect", "failure_code": failure.code})
             finally:
+                self._add_image_input_timing("bootstrap_retry_ms" if attempt else "bootstrap_first_ms",
+                                             (time.perf_counter() - started) * 1000)
                 if force_fresh:
                     if had_fresh:
                         options[CurlOpt.FRESH_CONNECT] = previous_fresh

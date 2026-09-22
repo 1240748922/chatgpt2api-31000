@@ -198,7 +198,7 @@ def _image_progress_callback_with_monitor(
         duration_key = _IMAGE_PROGRESS_DURATION_KEYS.get(last_step)
         if duration_key:
             data[duration_key] = int((now - last_step_started) * 1000)
-        if last_step == "preparing_inputs" and input_timings_getter is not None:
+        if last_step in {"preparing_inputs", "bootstrapping"} and input_timings_getter is not None:
             data.update(input_timings_getter())
         stage_event = _IMAGE_PROGRESS_STAGE_EVENTS.get(step_name)
         if stage_event:

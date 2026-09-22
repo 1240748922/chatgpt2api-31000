@@ -43,6 +43,8 @@ _TIMELINE_STEPS = (
     ("upload_confirm_ms", "确认上传", "prepare", "通知上游上传完成；包含在上传耗时内"),
     ("prewarm_overlap_ms", "上传与预热重叠", "prepare", "两步同时执行的时间；不计入总耗时加和"),
     ("bootstrap_ms", "预热页面", "prepare", "ChatGPT 页面"),
+    ("bootstrap_first_ms", "预热首次请求", "prepare", "包含在页面预热内，不重复相加"),
+    ("bootstrap_retry_ms", "预热重连请求", "prepare", "首次瞬时失败后的新连接重试；包含在页面预热内"),
     ("requirements_ms", "获取请求令牌", "prepare", "requirements / token"),
     ("prepare_conversation_ms", "准备会话", "prepare", "图片会话上下文"),
     ("http_dns_ms", "HTTP DNS", "prepare", "域名解析"),

@@ -9,6 +9,7 @@ from services.protocol import conversation as protocol
 from services.realtime_monitor_service import RealtimeMonitorService
 from services.request_detail_view import build_request_timeline_presentation
 from test_image_recovery import Clock
+from test_log_detail_api import log_api
 
 
 @pytest.fixture
@@ -154,3 +155,47 @@ def test_sse_failure_timeline_does_not_subtract_preparation_twice():
     timeline = build_request_timeline_presentation({"bootstrap_ms": 5000, "generation_start_ms": 1000, "stream_error_ms": 10000}, [])
     upstream = next(segment for segment in timeline["segments"] if segment["key"] == "upstream")
     assert upstream["value_ms"] == 11000
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_plain_generation_bootstrap_retry_diagnostics_survive_log_api(phased_backend, log_api, monkeypatch, failed):
+    from api.monitor_contract import MonitorEventView
+    from services.monitor_view import _project_event
+    instance, clock, _ = phased_backend
+    calls = []
+    def bootstrap(*, timeout_secs):
+        calls.append(timeout_secs)
+        clock.sleep(10 if len(calls) == 1 else 1)
+        if len(calls) == 1 or failed:
+            raise api.requests.exceptions.Timeout("synthetic page timeout")
+    monkeypatch.setattr(instance, "_bootstrap", bootstrap)
+    monitor = RealtimeMonitorService()
+    monkeypatch.setattr(protocol, "realtime_monitor_service", monitor)
+    monitor.start("warmup", endpoint="/v1/images/generations", model="fixture")
+    request = protocol.ConversationRequest(call_id="warmup", trace_image_perf=True)
+    instance.progress_callback = protocol._image_progress_callback_with_monitor(
+        request, 1, 1, lambda: "", instance.image_input_timings)
+    if failed:
+        with pytest.raises(api.requests.exceptions.Timeout) as caught:
+            list(instance._stream_picture_conversation("test", "gpt-image-2", []))
+        metrics = protocol._image_failure_timing_data(caught.value)
+    else:
+        list(instance._stream_picture_conversation("test", "gpt-image-2", []))
+        event = next(e for e in monitor._events if e["event"] == "image_getting_token")
+        view = MonitorEventView.model_validate(_project_event(event))
+        assert view.bootstrap_first_ms == 10000 and view.bootstrap_retry_ms == 1000
+        metrics = {k: v for k, v in event.items() if k.endswith("_ms")}
+    assert metrics["bootstrap_ms"] == 11000
+    assert metrics["bootstrap_first_ms"] == 10000
+    assert metrics["bootstrap_retry_ms"] == 1000
+    logs, client = log_api
+    logs.append_item({"id": "warmup", "type": "call", "detail": {
+        "call_id": "warmup", "status": "failed" if failed else "success", "duration_ms": 11000,
+        "endpoint": "/v1/images/generations", "image_attempts": [{"slot": 1, "attempt": 1,
+            "duration_ms": 11000, "monitor": {"metrics": metrics}}]}})
+    response = client.get("/api/logs/warmup")
+    assert response.status_code == 200, response.text
+    timings = response.json()["attempts"][0]["timings_ms"]
+    assert timings["bootstrap_first_ms"] == 10000 and timings["bootstrap_retry_ms"] == 1000
+    timeline = build_request_timeline_presentation(metrics, [], wall_duration_ms=11000)
+    assert {s["key"]: s["value_ms"] for s in timeline["segments"]} == {"prepare": 11000}

@@ -24,13 +24,15 @@ def response(code=200, data=None, text=""):
 @pytest.fixture
 def transport(monkeypatch):
     pools = []
-    def build(*, parallel=True, fail="", capacity=1, deadline=None, confirm_delay=0, warm_delay=.04):
+    def build(*, parallel=True, fail="", capacity=1, deadline=None, confirm_delay=0, warm_delay=.04,
+              warm_wait_for_uploads=0):
         pool = prewarm.NonQueuingPool(capacity)
         pools.append(pool)
         monkeypatch.setattr(api, "input_transfer_pool", pool)
         state = SimpleNamespace(events=[], workers=[], put_started=threading.Event(),
                                 warm_started=threading.Event(), timeouts=[], payloads=[], session_kwargs=[],
-                                caller=threading.get_ident(), registrations=0)
+                                caller=threading.get_ident(), registrations=0, confirmations=0,
+                                all_uploaded=threading.Event(), references=[], register_payloads=[])
         data = BytesIO()
         Image.new("RGB", (4, 6), "red").save(data, format="PNG")
         state.bytes = data.getvalue()
@@ -43,6 +45,26 @@ def transport(monkeypatch):
                 raise api.requests.exceptions.Timeout("synthetic deadline")
             time.sleep(seconds)
 
+        def register(kwargs):
+            state.events.append("register")
+            state.registrations += 1
+            state.register_payloads.append(kwargs["json"])
+            if fail == "register401":
+                return response(401, {"error": {"code": "token_invalid"}})
+            if fail in {"register429", f"register429_{state.registrations}"}:
+                return response(429, {"error": {"code": "file_upload_throttled"}})
+            return response(data={"upload_url": "https://asset.invalid/signed", "file_id": f"file-{state.registrations}"})
+
+        def confirm(kwargs):
+            state.events.append("confirm")
+            delay(confirm_delay, kwargs["timeout"])
+            state.confirmations += 1
+            if state.confirmations == warm_wait_for_uploads:
+                state.all_uploaded.set()
+            if fail == "confirm401":
+                return response(401, {"error": {"code": "token_invalid"}})
+            return response(429, {"error": {"code": "file_upload_throttled"}}) if fail == "confirm429" else response()
+
         class MainSession:
             headers = {"Sec-Ch-Ua": "synthetic", "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": "test",
                        "User-Agent": "synthetic-UA", "OAI-Session-Id": "synthetic-session"}
@@ -54,20 +76,10 @@ def transport(monkeypatch):
                 assert kwargs["headers"]["Authorization"] == "Bearer synthetic-at"
                 state.timeouts.append(kwargs["timeout"])
                 if url.endswith("/files"):
-                    state.events.append("register")
-                    state.registrations += 1
-                    if fail == "register401":
-                        return response(401, {"error": {"code": "token_invalid"}})
-                    if fail == "register429":
-                        return response(429, {"error": {"code": "file_upload_throttled"}})
-                    return response(data={"upload_url": "https://asset.invalid/signed", "file_id": f"file-{state.registrations}"})
+                    return register(kwargs)
                 assert url.endswith("/uploaded")
                 assert all(worker.closed for worker in state.workers)
-                state.events.append("confirm")
-                delay(confirm_delay, kwargs["timeout"])
-                if fail == "confirm401":
-                    return response(401, {"error": {"code": "token_invalid"}})
-                return response(429, {"error": {"code": "file_upload_throttled"}}) if fail == "confirm429" else response()
+                return confirm(kwargs)
             def put(self, url, **kwargs):
                 assert threading.get_ident() == state.caller
                 state.events.append("serial_put")
@@ -80,6 +92,8 @@ def transport(monkeypatch):
                 state.warm_started.set()
                 if parallel:
                     assert state.put_started.wait(2), "PUT was not started concurrently"
+                if warm_wait_for_uploads:
+                    assert state.all_uploaded.wait(2), "later images blocked behind page warmup"
                 delay(warm_delay, kwargs["timeout"])
                 if fail in {"bootstrap", "both"}:
                     return response(403, {"detail": "synthetic warmup rejected"})
@@ -114,16 +128,18 @@ def transport(monkeypatch):
                 return response(403, {"detail": "synthetic signed asset failed"}) if fail in {"put", "both"} else response()
             def post(self, url, **kwargs):
                 assert threading.get_ident() != state.caller
-                assert url == "https://chatgpt.com/backend-api/files/file-1/uploaded"
+                state.timeouts.append(kwargs["timeout"])
                 assert kwargs["headers"]["Authorization"] == "Bearer synthetic-at"
                 assert self.headers["OAI-Session-Id"] == "synthetic-session"
                 assert self.cookies["registration"] == "account-cookie"
-                state.events.append("confirm")
-                delay(confirm_delay, kwargs["timeout"])
+                path = url.removeprefix("https://chatgpt.com")
+                assert kwargs["headers"]["X-OpenAI-Target-Path"] == path
+                assert kwargs["headers"]["X-OpenAI-Target-Route"] == path
+                if path == "/backend-api/files":
+                    return register(kwargs)
+                assert path == f"/backend-api/files/file-{state.registrations}/uploaded"
                 self.cookies["confirmed"] = "worker-cookie"
-                if fail == "confirm401":
-                    return response(401, {"error": {"code": "token_invalid"}})
-                return response(429, {"error": {"code": "file_upload_throttled"}}) if fail == "confirm429" else response()
+                return confirm(kwargs)
 
         monkeypatch.setattr(prewarm.requests, "Session", TransferSession)
         instance = api.OpenAIBackendAPI.__new__(api.OpenAIBackendAPI)
@@ -147,6 +163,7 @@ def transport(monkeypatch):
         monkeypatch.setattr(instance, "_prepare_image_conversation", lambda *a: state.events.append("prepare"))
         def generate(*args):
             state.events.append("generate")
+            state.references = args[-1]
             return SimpleNamespace(close=lambda: state.events.append("sse_closed"))
         monkeypatch.setattr(instance, "_start_image_generation", generate)
         monkeypatch.setattr(instance, "_iter_timed_sse_payloads", lambda *a, **kw: iter(()))
@@ -217,9 +234,111 @@ def test_all_inputs_remain_ordered_and_bootstrap_happens_only_once(transport):
     instance, state, _ = transport()
     run(instance, state, count=3)
     assert state.events.count("bootstrap") == 1
-    assert state.events.count("parallel_put") == 1 and state.events.count("serial_put") == 2
+    assert state.events.count("parallel_put") == 3 and "serial_put" not in state.events
     assert state.events.count("confirm") == 3
     assert state.payloads == [state.bytes] * 3
+
+
+def test_all_five_uploads_can_finish_before_page_warmup(transport):
+    instance, state, _ = transport(warm_wait_for_uploads=5, warm_delay=0)
+    run(instance, state, count=5)
+    assert state.events.count("bootstrap") == 1
+    assert state.events.index("bootstrap_done") > max(i for i, e in enumerate(state.events) if e == "confirm")
+    assert [item["file_id"] for item in state.references] == [f"file-{i}" for i in range(1, 6)]
+    assert [item["file_name"] for item in state.references] == [f"image_{i}.png" for i in range(1, 6)]
+    assert state.events.count("generate") == 1
+
+
+@pytest.mark.parametrize("capacity", [0, 1])
+def test_distinct_reference_bytes_metadata_and_order_are_preserved(transport, tmp_path, capacity):
+    instance, state, _ = transport(parallel=bool(capacity), capacity=capacity)
+    local = tmp_path / "reference.jpg"
+    Image.new("RGB", (9, 7), "blue").save(local, format="JPEG")
+    third = BytesIO()
+    Image.new("RGBA", (11, 13), "green").save(third, format="PNG")
+    images = [state.input, str(local), "data:image/png;base64," + base64.b64encode(third.getvalue()).decode()]
+    list(instance._stream_picture_conversation("synthetic", "gpt-image-2", images))
+    assert state.payloads == [state.bytes, local.read_bytes(), third.getvalue()]
+    assert [(r["width"], r["height"], r["mime_type"]) for r in state.references] == [
+        (4, 6, "image/png"), (9, 7, "image/jpeg"), (11, 13, "image/png")]
+    assert [r["file_name"] for r in state.references] == ["image_1.png", "reference.jpg", "image_3.png"]
+    assert state.registrations == state.confirmations == 3
+    assert state.events.count("bootstrap") == state.events.count("generate") == 1
+
+
+def test_late_registration_429_stops_batch_and_keeps_partial_timings(transport):
+    instance, state, _ = transport(fail="register429_3", warm_delay=.2)
+    with pytest.raises(Exception) as caught:
+        run(instance, state, count=5)
+    assert classify_image_exception(caught.value).code == "file_upload_throttled"
+    assert state.registrations == 3 and state.confirmations == 2 and len(state.payloads) == 2
+    assert all(worker.closed for worker in state.workers)
+    assert "generate" not in state.events
+    metrics = caught.value.image_input_timings
+    assert metrics["upload_put_ms"] >= 100
+    assert metrics["input_prepare_ms"] >= metrics["prewarm_overlap_ms"] > 0
+
+
+def test_batch_stops_new_uploads_after_warmup_failure(transport):
+    instance, state, _ = transport(fail="bootstrap", warm_delay=0)
+    with pytest.raises(Exception) as caught:
+        run(instance, state, count=5)
+    assert caught.value.failure_phase == "bootstrapping"
+    assert state.registrations == 1 and len(state.payloads) == 1
+    assert all(worker.closed for worker in state.workers)
+    assert "generate" not in state.events
+
+
+def test_batch_deadline_is_not_reset_between_images(transport):
+    instance, state, _ = transport(deadline=.11, warm_delay=.01)
+    with pytest.raises(Exception) as caught:
+        run(instance, state, count=5)
+    assert caught.value.failure_phase == "uploading"
+    assert 1 <= state.registrations < 5
+    assert all(0 < timeout <= .11 for timeout in state.timeouts)
+    assert all(worker.closed for worker in state.workers)
+    assert "generate" not in state.events
+
+
+def test_batch_pool_full_does_not_wait_or_register_first_image_twice(transport):
+    instance, state, pool = transport(parallel=False)
+    release = threading.Event()
+    held = pool.try_submit(lambda: release.wait(3))
+    try:
+        run(instance, state, count=5)
+        assert not held.done()
+        assert state.registrations == state.confirmations == 5
+        assert not state.workers
+        assert state.events.count("bootstrap") == 1
+    finally:
+        release.set()
+
+
+def test_batch_timing_accounts_for_full_upload_overlap(transport):
+    instance, state, _ = transport(warm_wait_for_uploads=5, warm_delay=.03)
+    run(instance, state, count=5)
+    metrics = instance.image_input_timings()
+    assert metrics["prewarm_overlap_ms"] >= 250
+    assert abs(metrics["upload_ms"] + metrics["bootstrap_ms"] - metrics["prewarm_overlap_ms"]
+               - metrics["input_prepare_ms"]) < 50
+
+
+def test_synthetic_latency_against_first_image_only_overlap(transport, monkeypatch):
+    timings = []
+    for first_only in (True, False):
+        instance, state, _ = transport(warm_delay=.3)
+        if first_only:
+            upload_group = instance._upload_image_group
+            # Reproduce the previous first-file-only barrier without changing
+            # delays, image bytes, sessions or the first registration gate.
+            monkeypatch.setattr(instance, "_upload_image_group",
+                                lambda images: [upload_group([item])[0] for item in images])
+        run(instance, state, count=5)
+        timings.append(instance.image_input_timings())
+    old, new = timings
+    assert new["prewarm_overlap_ms"] > old["prewarm_overlap_ms"] + 100
+    print(f"synthetic five-image preparation: first-only={old['input_prepare_ms']}ms, "
+          f"whole-batch={new['input_prepare_ms']}ms")
 
 
 def test_no_reference_images_keep_original_flow(transport):
@@ -227,7 +346,8 @@ def test_no_reference_images_keep_original_flow(transport):
     run(instance, state, count=0)
     assert not state.workers
     assert state.events == ["bootstrap", "bootstrap_done", "requirements", "prepare", "generate", "sse_closed"]
-    assert instance.image_input_timings() == {}
+    assert instance.image_input_timings()["bootstrap_first_ms"] > 0
+    assert "input_prepare_ms" not in instance.image_input_timings()
 
 
 def test_request_deadline_bounds_both_operations_and_drains_worker(transport):
@@ -248,7 +368,8 @@ def test_worker_does_not_open_session_after_expired_deadline(monkeypatch):
     assert timing["ended"] >= timing["started"]
 
 
-def test_parallel_metrics_reach_monitor_without_double_counting(transport, monkeypatch):
+@pytest.mark.parametrize("count", [1, 5])
+def test_parallel_metrics_reach_monitor_without_double_counting(transport, monkeypatch, count):
     from services.realtime_monitor_service import RealtimeMonitorService
     from services.monitor_view import _project_event
     from api.monitor_contract import MonitorEventView
@@ -259,7 +380,7 @@ def test_parallel_metrics_reach_monitor_without_double_counting(transport, monke
     request = protocol.ConversationRequest(call_id="input", trace_image_perf=True)
     instance.progress_callback = protocol._image_progress_callback_with_monitor(
         request, 1, 1, lambda: "", instance.image_input_timings)
-    run(instance, state)
+    run(instance, state, count=count)
     event = next(e for e in monitor._events if e["event"] == "image_getting_token")
     view = MonitorEventView.model_validate(_project_event(event))
     assert view.prewarm_overlap_ms > 0 and view.input_prepare_ms > 0
@@ -274,7 +395,8 @@ def test_parallel_metrics_reach_monitor_without_double_counting(transport, monke
     assert segments == {"prepare": 6500, "upstream": 20000}
 
 
-def test_parallel_preparation_delivers_real_image_bytes(transport, monkeypatch, tmp_path):
+@pytest.mark.parametrize("count", [1, 5])
+def test_parallel_preparation_delivers_real_image_bytes(transport, monkeypatch, tmp_path, count):
     import json
     instance, state, _ = transport()
     file_id = "file_000000000123456789abcdef01234567"
@@ -297,7 +419,7 @@ def test_parallel_preparation_delivers_real_image_bytes(transport, monkeypatch, 
         return "http://localhost/images/result.png"
     monkeypatch.setattr(protocol, "save_image_bytes", save)
     outputs = list(protocol.stream_image_outputs(instance, protocol.ConversationRequest(
-        model="gpt-image-2", prompt="synthetic", images=[state.input], response_format="b64_json")))
+        model="gpt-image-2", prompt="synthetic", images=[state.input] * count, response_format="b64_json")))
     result = next(output for output in outputs if output.kind == "result")
     assert base64.b64decode(result.data[0]["b64_json"]) == path.read_bytes() == state.bytes
     assert result.data[0]["width"] == 4 and result.data[0]["height"] == 6
@@ -359,11 +481,12 @@ def test_confirmation_cookie_merge_preserves_concurrent_warmup_and_cookie_scope(
     assert next(cookie for cookie in main.jar if cookie.name == "update").domain == "chatgpt.com"
 
 
-def test_real_loopback_http_confirmation_and_warmup_keep_session_identity(monkeypatch):
+@pytest.mark.parametrize("count", [1, 5])
+def test_real_loopback_http_confirmation_and_warmup_keep_session_identity(monkeypatch, count):
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     warm_started, confirm_started = threading.Event(), threading.Event()
-    seen = []
+    seen, registrations, confirmations = [], [], []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -379,9 +502,12 @@ def test_real_loopback_http_confirmation_and_warmup_keep_session_identity(monkey
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             seen.append((self.path, dict(self.headers)))
             if self.path.endswith("/files"):
-                self.reply(json.dumps({"file_id": "file-1", "upload_url": base + "/asset"}), "registered=1")
+                registrations.append(True)
+                self.reply(json.dumps({"file_id": f"file-{len(registrations)}", "upload_url": base + "/asset"}), "registered=1")
             else:
-                confirm_started.set()
+                confirmations.append(self.path)
+                if len(confirmations) == count:
+                    confirm_started.set()
                 assert warm_started.wait(3)
                 self.reply("{}", "confirmed=1")
         def do_PUT(self):
@@ -424,11 +550,13 @@ def test_real_loopback_http_confirmation_and_warmup_keep_session_identity(monkey
     data = BytesIO()
     Image.new("RGB", (2, 2)).save(data, format="PNG")
     try:
-        list(instance._stream_picture_conversation("synthetic", "gpt-image-2", [base64.b64encode(data.getvalue()).decode()]))
+        list(instance._stream_picture_conversation("synthetic", "gpt-image-2", [base64.b64encode(data.getvalue()).decode()] * count))
         assert generated == [True]
         requests_by_path = {path: {k.lower(): v for k, v in headers.items()} for path, headers in seen}
-        asset = requests_by_path["/asset"]
-        assert not set(asset) & {"cookie", "authorization", "oai-session-id"}
+        assert len(registrations) == len(confirmations) == count
+        for path, headers in seen:
+            if path == "/asset":
+                assert not {k.lower() for k in headers} & {"cookie", "authorization", "oai-session-id"}
         confirmed = requests_by_path["/backend-api/files/file-1/uploaded"]
         assert confirmed["authorization"] == "Bearer synthetic-only"
         assert confirmed["oai-session-id"] == "test-session" and "registered=1" in confirmed["cookie"]

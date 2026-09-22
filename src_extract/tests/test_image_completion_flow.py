@@ -146,6 +146,8 @@ def test_bootstrap_recovers_with_fresh_connection_and_keeps_session_options(back
     assert calls == [10, 10]
     assert clock.now == 1010
     assert instance.session.curl_options == {CurlOpt.FRESH_CONNECT: 0}
+    assert instance.image_input_timings()["bootstrap_first_ms"] == 10000
+    assert "bootstrap_retry_ms" in instance.image_input_timings()
 
 
 @pytest.mark.parametrize("deadline,expected", [(None, [10, 10]), (1003, [3])])
@@ -178,3 +180,4 @@ def test_bootstrap_does_not_retry_auth_or_rate_limit_failures(backend, monkeypat
     with pytest.raises(UpstreamHTTPError):
         instance._bootstrap_image()
     assert len(calls) == 1
+    assert "bootstrap_retry_ms" not in instance.image_input_timings()

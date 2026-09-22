@@ -220,6 +220,8 @@ class MonitorEventView(StrictMonitorModel):
     prewarm_overlap_ms: int | None = None
     upload_ms: int | None = None
     bootstrap_ms: int | None = None
+    bootstrap_first_ms: int | None = None
+    bootstrap_retry_ms: int | None = None
     requirements_ms: int | None = None
     prepare_conversation_ms: int | None = None
     generation_start_ms: int | None = None

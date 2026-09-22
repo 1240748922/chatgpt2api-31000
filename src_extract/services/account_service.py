@@ -16,7 +16,7 @@ from threading import Condition, Lock, Thread, local
 from typing import Any, Callable
 from uuid import uuid4
 
-from services.account_maintenance_metrics import collect_token_timings, token_phase, token_request_slot
+from services.account_maintenance_metrics import collect_token_timings, token_phase, token_request_slot, token_write_lock
 from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -229,8 +229,8 @@ class AccountService:
 
     @contextmanager
     def _account_write(self):
-        with self._write_lock:
-            with self._image_slot_condition:
+        with token_write_lock(self._write_lock):
+            with token_write_lock(self._image_slot_condition):
                 self._write_baseline = dict(self._accounts)
                 try:
                     yield
@@ -877,6 +877,21 @@ class AccountService:
                 preserve_index=True,
             )
 
+    @token_phase("account_token_conflict_ms")
+    def _load_credential_conflict(self, keys, expected_generation):
+        subset_loader = getattr(self.storage, "load_accounts_subset_snapshot", None)
+        scoped = expected_generation is not None and callable(subset_loader)
+        if scoped:
+            snapshot = subset_loader(tuple(keys))
+            # A missing source may have rotated to an unknown key on another
+            # replica. Retain full identity reconciliation for that rare case.
+            scoped = any(row.get("access_token") == expected_generation[0] for row in snapshot.items)
+        if not scoped:
+            snapshot = self.storage.load_accounts_snapshot()
+        raw = {str(row["access_token"]): row for row in snapshot.items if row.get("access_token")}
+        remote, _ = self._normalize_loaded_accounts(snapshot.items, recover_interrupted_checks=False)
+        return snapshot, raw, remote, scoped
+
     def _save_accounts(
         self,
         *,
@@ -925,19 +940,19 @@ class AccountService:
                     committed, saved = dict(desired), True
                     break
                 try:
-                    if callable(checked):
-                        changed_keys = {*(row["access_token"] for row in mutation.upserts), *mutation.delete_keys}
-                        checked(mutation, expected_items={key: baseline.get(key) for key in changed_keys})
-                    else:
-                        self.storage.mutate_accounts(mutation)
+                    with token_phase("account_token_commit_ms"):
+                        if callable(checked):
+                            changed_keys = {*(row["access_token"] for row in mutation.upserts), *mutation.delete_keys}
+                            checked(mutation, expected_items={key: baseline.get(key) for key in changed_keys})
+                        else:
+                            self.storage.mutate_accounts(mutation)
                     committed, saved = dict(desired), True
                     break
                 except StorageRevisionConflictError:
                     # Read/normalize/merge in the writer, never under the lock
                     # needed by account selection, metadata reads and completion.
-                    snapshot = self.storage.load_accounts_snapshot()
-                    raw = {str(row["access_token"]): row for row in snapshot.items if row.get("access_token")}
-                    remote, _ = self._normalize_loaded_accounts(snapshot.items, recover_interrupted_checks=False)
+                    snapshot, raw, remote, scoped = self._load_credential_conflict(
+                        keys, expected_credential_generation if callable(checked) else None)
                     if conflict_existing_tokens is not None:
                         conflict_existing_tokens.update(key for key in keys if key not in persisted and key in remote)
                     if expected_credential_generation is not None:
@@ -953,7 +968,9 @@ class AccountService:
                                         if management_id and row.get("management_id") == management_id)
                             committed = {key: raw[key] for key in keys if key in raw}
                             break
-                    merged = self._merge_accounts_after_conflict(persisted, intent, remote)
+                    merge_base = {key: persisted[key] for key in keys if key in persisted} if scoped else persisted
+                    merge_intent = {key: intent[key] for key in keys if key in intent} if scoped else intent
+                    merged = self._merge_accounts_after_conflict(merge_base, merge_intent, remote)
                     if skip_new_conflicts:
                         for key in keys:
                             if key not in persisted and key in remote:
@@ -1482,15 +1499,16 @@ class AccountService:
                 or persisted.get("last_token_refresh_error_at") != now
             ):
                 return False
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
-            "refresh_token 刷新 access_token 失败",
-            {
-                "source": event,
-                "token": anonymize_token(resolved),
-                "error": str(persisted.get("last_token_refresh_error") or ""),
-            },
-        )
+        with token_phase("account_token_log_ms"):
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "refresh_token 刷新 access_token 失败",
+                {
+                    "source": event,
+                    "token": anonymize_token(resolved),
+                    "error": str(persisted.get("last_token_refresh_error") or ""),
+                },
+            )
         return True
 
     @staticmethod
@@ -1769,11 +1787,12 @@ class AccountService:
                 )
             self._image_slot_condition.notify_all()
 
-        log_service.add(
-            LOG_TYPE_ACCOUNT,
-            "refresh_token 已刷新 access_token",
-            {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
-        )
+        with token_phase("account_token_log_ms"):
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "refresh_token 已刷新 access_token",
+                {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
+            )
         return new_token
 
     def _refresh_access_token_owner(

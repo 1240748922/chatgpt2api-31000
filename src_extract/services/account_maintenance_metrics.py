@@ -10,6 +10,10 @@ TOKEN_METRIC_LABELS = {
     "account_token_slot_ms": "刷新并发槽位等待",
     "account_token_http_ms": "刷新凭据请求",
     "account_token_save_ms": "凭据结果保存",
+    "account_token_write_wait_ms": "凭据写入锁等待",
+    "account_token_commit_ms": "凭据数据库提交",
+    "account_token_conflict_ms": "凭据冲突重读",
+    "account_token_log_ms": "凭据日志写入",
     "account_token_singleflight_ms": "等待同账号刷新",
 }
 _timings = ContextVar("image_token_timings", default=None)
@@ -42,6 +46,16 @@ def token_request_slot(factory):
     finally:
         if not entered:
             _add("account_token_slot_ms", started)
+
+
+@contextmanager
+def token_write_lock(lock):
+    with token_phase("account_token_write_wait_ms"):
+        lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def collect_token_timings(function):

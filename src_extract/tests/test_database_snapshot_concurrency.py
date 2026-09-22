@@ -88,6 +88,32 @@ def test_snapshot_is_one_select_including_empty_collections(collection, populate
     assert "FOR UPDATE" not in statements[0].upper()
 
 
+@pytest.mark.parametrize("keys", [(), ("missing",), ("a", "a", "missing")])
+def test_partial_conflict_snapshot_is_bounded_and_keeps_coherent_revision(databases, keys):
+    reader, writer = databases
+    revision = reader.replace_accounts([{"access_token": "a", "quota": 8},
+                                        {"access_token": "unrelated", "quota": 4}]).revision
+    statements, decoded = [], []
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    original = reader._deserialize
+    def decode(data):
+        decoded.append(data)
+        return original(data)
+    reader._deserialize = decode
+    event.listen(reader.engine, "before_cursor_execute", record)
+    try:
+        snapshot = reader.load_accounts_subset_snapshot(keys)
+    finally:
+        event.remove(reader.engine, "before_cursor_execute", record)
+    expected = [{"access_token": "a", "quota": 8}] if "a" in keys else []
+    assert snapshot.items == expected and snapshot.revision == revision
+    assert len(statements) == 1 and len(decoded) == len(expected)
+    with write_during_snapshot(reader, "accounts", lambda: writer.upsert_account({"access_token": "a", "quota": 2})):
+        snapshot = reader.load_accounts_subset_snapshot(keys)
+    assert snapshot.items == expected and snapshot.revision == revision
+
+
 def test_continuous_writes_cannot_starve_or_mislabel_snapshot(collection):
     c = collection
     expected = [{c.key: "existing", "generation": 0}]

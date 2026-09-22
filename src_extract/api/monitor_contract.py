@@ -204,6 +204,10 @@ class MonitorEventView(StrictMonitorModel):
     account_token_slot_ms: int | None = None
     account_token_http_ms: int | None = None
     account_token_save_ms: int | None = None
+    account_token_write_wait_ms: int | None = None
+    account_token_commit_ms: int | None = None
+    account_token_conflict_ms: int | None = None
+    account_token_log_ms: int | None = None
     account_token_singleflight_ms: int | None = None
     egress_wait_ms: int | None = None
     input_prepare_ms: int | None = None

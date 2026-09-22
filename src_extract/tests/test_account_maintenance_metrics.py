@@ -104,3 +104,31 @@ def test_new_token_metrics_survive_monitor_projection_and_contract():
     monitor.stage("token", "image_account_lookup", **values)
     parsed = MonitorEventView.model_validate(_project_event(monitor._events[-1]))
     assert all(getattr(parsed, key) == value for key, value in values.items())
+
+
+def test_save_metrics_separate_lock_commit_and_log(account_flow, monkeypatch):
+    service = account_flow.service
+    clock = Clock()
+    monkeypatch.setattr(accounts, "time", clock)
+    monkeypatch.setattr(metrics, "time", clock)
+    actual_lock = service._write_lock
+    class DelayedLock:
+        def acquire(self):
+            clock.sleep(1)
+            return actual_lock.acquire()
+        def release(self):
+            actual_lock.release()
+    monkeypatch.setattr(service, "_write_lock", DelayedLock())
+    original = service.storage.mutate_accounts_checked
+    def commit(*args, **kwargs):
+        clock.sleep(3)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(service.storage, "mutate_accounts_checked", commit)
+    monkeypatch.setattr(accounts.log_service, "add", lambda *a, **kw: clock.sleep(2))
+    token = service.get_available_access_token()
+    timings = service.get_image_selection_diagnostics()
+    assert timings["account_token_write_wait_ms"] == 1000
+    assert timings["account_token_commit_ms"] == 3000
+    assert timings["account_token_log_ms"] == 2000
+    assert timings["account_token_save_ms"] == timings["account_token_maintenance_ms"] == 6000
+    service.release_image_slot(token)

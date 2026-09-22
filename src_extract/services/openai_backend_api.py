@@ -24,7 +24,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
-from services.image_input_prewarm import input_transfer_pool, put_signed_image
+from services.image_input_prewarm import input_transfer_pool, put_signed_image, snapshot_cookies, merge_upload_cookies
 from services.image_failure import (
     ImageDownloadError,
     ImageFailure,
@@ -1273,7 +1273,7 @@ class OpenAIBackendAPI:
         return {key: max(0, int(value)) for key, value in timings.items()}
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """Upload unchanged image bytes; picture requests may overlap the PUT with bootstrap."""
+        """Upload unchanged bytes; overlap PUT and confirmation with page bootstrap."""
         with self._image_input_step("upload_decode_ms"):
             data = self._decode_image_base64(image)
             if (image and len(image) < 512 and not image.startswith("data:")
@@ -1302,6 +1302,7 @@ class OpenAIBackendAPI:
         }
         future = None
         transfer_timing = {}
+        confirmation_path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         if getattr(self, "_image_prewarm_pending", False):
             self._image_prewarm_pending = False
             # Only after registration succeeds: account 401/upload 429 stays
@@ -1309,9 +1310,16 @@ class OpenAIBackendAPI:
             session_kwargs = proxy_settings.build_session_kwargs_from_profile(
                 self.proxy_profile, impersonate=self.fp["impersonate"], verify=True,
             )
+            confirmation = {
+                "path": confirmation_path, "url": self.base_url + confirmation_path,
+                "headers": self._headers(confirmation_path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                "session_headers": dict(self.session.headers),
+                "cookies": snapshot_cookies(self.session.cookies),
+            }
             future = input_transfer_pool.try_submit(
                 put_signed_image, session_kwargs, upload_meta["upload_url"], put_headers,
                 data, self._image_request_timeout(120), self.deadline_monotonic, transfer_timing,
+                confirmation,
             )
         if future is None:
             with self._image_input_step("upload_put_ms"):
@@ -1336,7 +1344,7 @@ class OpenAIBackendAPI:
                     # Drain even on warmup failure: keep account/egress leases
                     # until the bounded transfer finishes and closes its Session.
                     try:
-                        future.result()
+                        uploaded_cookies = future.result()
                     except Exception as exc:
                         exc.failure_phase = "uploading"
                         exc.failure_phase_ms = max(0, int((transfer_timing.get("ended", 0)
@@ -1344,18 +1352,23 @@ class OpenAIBackendAPI:
                         raise
             finally:
                 put_start = transfer_timing.get("started", warm_end)
-                put_end = transfer_timing.get("ended", put_start)
+                put_end = transfer_timing.get("put_ended", put_start)
                 self._add_image_input_timing("upload_put_ms", (put_end - put_start) * 1000)
+                confirm_start = transfer_timing.get("confirm_started", put_end)
+                confirm_end = transfer_timing.get("confirm_ended", confirm_start)
+                if "confirm_started" in transfer_timing:
+                    self._add_image_input_timing("upload_confirm_ms", (confirm_end - confirm_start) * 1000)
                 self._add_image_input_timing("prewarm_overlap_ms",
-                                            (min(warm_end, put_end) - max(warm_start, put_start)) * 1000)
-        path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
-        with self._image_input_step("upload_confirm_ms"):
-            response = self.session.post(
-                self.base_url + path,
-                headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-                data="{}", timeout=self._image_request_timeout(60),
-            )
-            ensure_ok(response, path)
+                                            (min(warm_end, confirm_end) - max(warm_start, put_start)) * 1000)
+            merge_upload_cookies(self.session.cookies, confirmation["cookies"], uploaded_cookies)
+        if future is None:
+            with self._image_input_step("upload_confirm_ms"):
+                response = self.session.post(
+                    self.base_url + confirmation_path,
+                    headers=self._headers(confirmation_path, {"Content-Type": "application/json", "Accept": "application/json"}),
+                    data="{}", timeout=self._image_request_timeout(60),
+                )
+                ensure_ok(response, confirmation_path)
         return {"file_id": upload_meta["file_id"], "file_name": file_name, "file_size": len(data),
                 "mime_type": mime_type, "width": width, "height": height}
 

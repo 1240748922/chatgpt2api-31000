@@ -175,6 +175,31 @@ class DatabaseStorageBackend(StorageBackend):
     def load_accounts_snapshot(self) -> StorageSnapshot:
         return self._load_snapshot("accounts")
 
+    def load_accounts_subset_snapshot(self, tokens: Sequence[str]) -> StorageSnapshot:
+        """One statement for conflict recovery, NOT a full cache revision.
+
+        Keep the revision even if every requested key has been deleted. Reading
+        just the indexed credential keys avoids decoding the entire account pool
+        when a concurrent completion changed the same account's quota.
+        """
+        keys = tuple(dict.fromkeys(tokens))
+        statement = (
+            select(StorageRevisionModel.version, AccountModel.data)
+            .select_from(StorageRevisionModel)
+            .outerjoin(AccountModel, AccountModel.access_token.in_(keys))
+            .where(StorageRevisionModel.collection == "accounts")
+            .order_by(AccountModel.id.asc())
+        )
+        with self.Session() as session:
+            rows = session.execute(statement).all()
+        if not rows:
+            raise NoResultFound("missing accounts storage revision")
+        return StorageSnapshot(
+            items=[item for _version, data in rows if data is not None
+                   and (item := self._deserialize(data)) is not None],
+            revision=self._revision_value("accounts", rows[0][0]),
+        )
+
     def get_collection_revision(self, collection: StorageCollection) -> str:
         """Read a collection revision without loading and decoding its rows."""
         session = self.Session()

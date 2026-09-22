@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+from curl_cffi.requests.cookies import Cookies
 
 from services import openai_backend_api as api
 from services import image_input_prewarm as prewarm
@@ -23,7 +24,7 @@ def response(code=200, data=None, text=""):
 @pytest.fixture
 def transport(monkeypatch):
     pools = []
-    def build(*, parallel=True, fail="", capacity=1, deadline=None):
+    def build(*, parallel=True, fail="", capacity=1, deadline=None, confirm_delay=0, warm_delay=.04):
         pool = prewarm.NonQueuingPool(capacity)
         pools.append(pool)
         monkeypatch.setattr(api, "input_transfer_pool", pool)
@@ -43,10 +44,11 @@ def transport(monkeypatch):
             time.sleep(seconds)
 
         class MainSession:
-            headers = {"Sec-Ch-Ua": "synthetic", "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": "test"}
+            headers = {"Sec-Ch-Ua": "synthetic", "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": "test",
+                       "User-Agent": "synthetic-UA", "OAI-Session-Id": "synthetic-session"}
             curl_options = {}
             def __init__(self):
-                self.cookies = {}
+                self.cookies = Cookies({"registration": "account-cookie"})
             def post(self, url, **kwargs):
                 assert threading.get_ident() == state.caller
                 assert kwargs["headers"]["Authorization"] == "Bearer synthetic-at"
@@ -62,6 +64,9 @@ def transport(monkeypatch):
                 assert url.endswith("/uploaded")
                 assert all(worker.closed for worker in state.workers)
                 state.events.append("confirm")
+                delay(confirm_delay, kwargs["timeout"])
+                if fail == "confirm401":
+                    return response(401, {"error": {"code": "token_invalid"}})
                 return response(429, {"error": {"code": "file_upload_throttled"}}) if fail == "confirm429" else response()
             def put(self, url, **kwargs):
                 assert threading.get_ident() == state.caller
@@ -75,10 +80,11 @@ def transport(monkeypatch):
                 state.warm_started.set()
                 if parallel:
                     assert state.put_started.wait(2), "PUT was not started concurrently"
-                delay(.04, kwargs["timeout"])
+                delay(warm_delay, kwargs["timeout"])
                 if fail in {"bootstrap", "both"}:
                     return response(403, {"detail": "synthetic warmup rejected"})
                 self.cookies["warmup"] = "session-local"
+                state.events.append("bootstrap_done")
                 return response(text='<script src="https://chatgpt.com/synthetic.js"></script>')
             def close(self):
                 state.events.append("main_closed")
@@ -86,6 +92,8 @@ def transport(monkeypatch):
         class TransferSession:
             def __init__(self, **kwargs):
                 self.closed = False
+                self.cookies = Cookies()
+                self.headers = {}
                 state.workers.append(self)
                 state.session_kwargs.append(kwargs)
             def __enter__(self):
@@ -95,6 +103,7 @@ def transport(monkeypatch):
                 state.events.append("transfer_closed")
             def put(self, url, **kwargs):
                 assert threading.get_ident() != state.caller
+                assert not self.cookies and not self.headers
                 assert not {key.lower() for key in kwargs["headers"]} & {"cookie", "authorization", "oai-session-id"}
                 assert kwargs["headers"]["User-Agent"] == "synthetic-UA"
                 state.events.append("parallel_put")
@@ -103,6 +112,18 @@ def transport(monkeypatch):
                 assert state.warm_started.wait(2), "bootstrap did not overlap"
                 delay(.06, kwargs["timeout"])
                 return response(403, {"detail": "synthetic signed asset failed"}) if fail in {"put", "both"} else response()
+            def post(self, url, **kwargs):
+                assert threading.get_ident() != state.caller
+                assert url == "https://chatgpt.com/backend-api/files/file-1/uploaded"
+                assert kwargs["headers"]["Authorization"] == "Bearer synthetic-at"
+                assert self.headers["OAI-Session-Id"] == "synthetic-session"
+                assert self.cookies["registration"] == "account-cookie"
+                state.events.append("confirm")
+                delay(confirm_delay, kwargs["timeout"])
+                self.cookies["confirmed"] = "worker-cookie"
+                if fail == "confirm401":
+                    return response(401, {"error": {"code": "token_invalid"}})
+                return response(429, {"error": {"code": "file_upload_throttled"}}) if fail == "confirm429" else response()
 
         monkeypatch.setattr(prewarm.requests, "Session", TransferSession)
         instance = api.OpenAIBackendAPI.__new__(api.OpenAIBackendAPI)
@@ -118,6 +139,8 @@ def transport(monkeypatch):
             assert all(worker.closed for worker in state.workers)
             assert state.events.count("confirm") == state.registrations
             assert instance.session.cookies["warmup"] == "session-local"
+            if state.workers:
+                assert instance.session.cookies["confirmed"] == "worker-cookie"
             assert instance.pow_script_sources
             state.events.append("requirements")
         monkeypatch.setattr(instance, "_get_chat_requirements", requirements)
@@ -142,7 +165,7 @@ def test_upload_and_bootstrap_overlap_without_sharing_session(transport):
     run(instance, state)
     assert state.events.count("bootstrap") == 1
     assert state.events.index("register") < state.events.index("bootstrap")
-    assert state.events.index("transfer_closed") < state.events.index("confirm") < state.events.index("requirements")
+    assert state.events.index("confirm") < state.events.index("transfer_closed") < state.events.index("requirements")
     assert state.events.count("generate") == 1
     assert state.payloads == [state.bytes]
     assert state.session_kwargs == [{"proxy": "http://synthetic-proxy.invalid:8080", "impersonate": "chrome110", "verify": True}]
@@ -167,7 +190,7 @@ def test_no_capacity_falls_back_to_serial_without_waiting(transport, mode):
         release.set()
 
 
-@pytest.mark.parametrize("failure", ["register401", "register429", "put", "bootstrap", "both", "confirm429"])
+@pytest.mark.parametrize("failure", ["register401", "register429", "put", "bootstrap", "both", "confirm429", "confirm401"])
 def test_failure_preserves_phase_closes_transfer_and_never_submits_generation(transport, failure):
     instance, state, pool = transport(fail=failure)
     with pytest.raises(Exception) as caught:
@@ -182,7 +205,7 @@ def test_failure_preserves_phase_closes_transfer_and_never_submits_generation(tr
     assert "input_prepare_ms" in timing
     if failure in {"register429", "confirm429"}:
         assert classify_image_exception(caught.value).code == "file_upload_throttled"
-    if failure == "register401":
+    if failure in {"register401", "confirm401"}:
         assert classify_image_exception(caught.value).code == "auth_invalid"
     # Future capacity is returned once its cleanup has finished, including failures.
     pool._executor.shutdown(wait=True)
@@ -203,7 +226,7 @@ def test_no_reference_images_keep_original_flow(transport):
     instance, state, _ = transport(parallel=False)
     run(instance, state, count=0)
     assert not state.workers
-    assert state.events == ["bootstrap", "requirements", "prepare", "generate", "sse_closed"]
+    assert state.events == ["bootstrap", "bootstrap_done", "requirements", "prepare", "generate", "sse_closed"]
     assert instance.image_input_timings() == {}
 
 
@@ -287,6 +310,134 @@ def test_pool_submission_failure_releases_slot(monkeypatch):
     assert pool.try_submit(lambda: None) is None
     assert pool._slots.acquire(blocking=False)
     pool._slots.release()
+
+
+def test_upload_confirmation_overlaps_page_warmup_not_just_bytes(transport):
+    instance, state, _ = transport(confirm_delay=.12, warm_delay=.14)
+    run(instance, state)
+    assert state.events.index("confirm") < state.events.index("bootstrap_done")
+    assert state.events.index("bootstrap_done") < state.events.index("transfer_closed")
+    timings = instance.image_input_timings()
+    assert timings["upload_confirm_ms"] >= 100
+    assert timings["prewarm_overlap_ms"] > timings["upload_put_ms"] + 30
+    assert abs(timings["upload_ms"] + timings["bootstrap_ms"] - timings["prewarm_overlap_ms"]
+               - timings["input_prepare_ms"]) < 30
+
+
+def test_confirmation_deadline_drains_worker_and_does_not_generate(transport):
+    instance, state, _ = transport(confirm_delay=.12, warm_delay=.02, deadline=.11)
+    with pytest.raises(Exception) as caught:
+        run(instance, state)
+    assert caught.value.failure_phase == "uploading"
+    assert "confirm" in state.events and "generate" not in state.events
+    assert all(worker.closed for worker in state.workers)
+    assert all(0 < timeout <= .11 for timeout in state.timeouts)
+    assert caught.value.image_input_timings["upload_confirm_ms"] > 0
+
+
+def test_confirmation_cookie_merge_preserves_concurrent_warmup_and_cookie_scope():
+    from copy import deepcopy
+    main = Cookies()
+    for name in ("unchanged", "update", "conflict", "remove"):
+        main.set(name, "before", domain="chatgpt.com", path="/backend-api", secure=True)
+    baseline = prewarm.snapshot_cookies(main)
+    worker = Cookies()
+    for cookie in baseline.values():
+        worker.jar.set_cookie(deepcopy(cookie))
+    worker.set("update", "confirmed", domain="chatgpt.com", path="/backend-api", secure=True)
+    worker.set("conflict", "worker", domain="chatgpt.com", path="/backend-api", secure=True)
+    worker.delete("remove", domain="chatgpt.com", path="/backend-api")
+    worker.set("added", "worker", domain="chatgpt.com", path="/backend-api", secure=True)
+    main.set("conflict", "warmup", domain="chatgpt.com", path="/backend-api", secure=True)
+    main.set("warmup-only", "main", domain="chatgpt.com", path="/", secure=True)
+    prewarm.merge_upload_cookies(main, baseline, prewarm.snapshot_cookies(worker))
+    assert main.get("update") == "confirmed" and main.get("conflict") == "warmup"
+    assert main.get("remove") is None and main.get("added") == "worker"
+    assert main.get("warmup-only") == "main" and main.get("unchanged") == "before"
+    assert all(cookie.secure for cookie in main.jar)
+    assert next(cookie for cookie in main.jar if cookie.name == "update").path == "/backend-api"
+    assert next(cookie for cookie in main.jar if cookie.name == "update").domain == "chatgpt.com"
+
+
+def test_real_loopback_http_confirmation_and_warmup_keep_session_identity(monkeypatch):
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    warm_started, confirm_started = threading.Event(), threading.Event()
+    seen = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def reply(self, data, cookie=""):
+            encoded = data.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(encoded)))
+            if cookie:
+                self.send_header("Set-Cookie", cookie + "; Path=/")
+            self.end_headers()
+            self.wfile.write(encoded)
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append((self.path, dict(self.headers)))
+            if self.path.endswith("/files"):
+                self.reply(json.dumps({"file_id": "file-1", "upload_url": base + "/asset"}), "registered=1")
+            else:
+                confirm_started.set()
+                assert warm_started.wait(3)
+                self.reply("{}", "confirmed=1")
+        def do_PUT(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append((self.path, dict(self.headers)))
+            self.reply("{}")
+        def do_GET(self):
+            warm_started.set()
+            assert confirm_started.wait(3), "confirmation was still serialized behind warmup"
+            self.reply('<script src="https://chatgpt.com/synthetic.js"></script>', "warmed=1")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    base = f"http://127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    pool = prewarm.NonQueuingPool(1)
+    monkeypatch.setattr(api, "input_transfer_pool", pool)
+    instance = api.OpenAIBackendAPI.__new__(api.OpenAIBackendAPI)
+    instance.access_token = "synthetic-only"
+    instance.base_url = base
+    instance.user_agent = "test-UA"
+    instance.fp = {"impersonate": "chrome110"}
+    instance.proxy_profile = SimpleNamespace(proxy_url="", skip_ssl_verify=False)
+    instance.deadline_monotonic = time.monotonic() + 10
+    instance.progress_callback = None
+    instance.session = api.requests.Session(trust_env=False)
+    instance.session.headers.update({"User-Agent": "test-UA", "OAI-Session-Id": "test-session",
+        "Sec-Ch-Ua": "test", "Sec-Ch-Ua-Mobile": "?0", "Sec-Ch-Ua-Platform": "test"})
+    original_kwargs = api.proxy_settings.build_session_kwargs_from_profile
+    monkeypatch.setattr(api.proxy_settings, "build_session_kwargs_from_profile",
+                        lambda *a, **kw: {**original_kwargs(*a, **kw), "trust_env": False})
+    generated = []
+    def requirements(**kw):
+        assert instance.session.cookies.get("registered") == "1"
+        assert instance.session.cookies.get("confirmed") == "1"
+        assert instance.session.cookies.get("warmed") == "1"
+    instance._get_chat_requirements = requirements
+    instance._prepare_image_conversation = lambda *a: None
+    instance._start_image_generation = lambda *a: generated.append(True) or SimpleNamespace(close=lambda: None)
+    instance._iter_timed_sse_payloads = lambda *a, **kw: iter(())
+    data = BytesIO()
+    Image.new("RGB", (2, 2)).save(data, format="PNG")
+    try:
+        list(instance._stream_picture_conversation("synthetic", "gpt-image-2", [base64.b64encode(data.getvalue()).decode()]))
+        assert generated == [True]
+        requests_by_path = {path: {k.lower(): v for k, v in headers.items()} for path, headers in seen}
+        asset = requests_by_path["/asset"]
+        assert not set(asset) & {"cookie", "authorization", "oai-session-id"}
+        confirmed = requests_by_path["/backend-api/files/file-1/uploaded"]
+        assert confirmed["authorization"] == "Bearer synthetic-only"
+        assert confirmed["oai-session-id"] == "test-session" and "registered=1" in confirmed["cookie"]
+    finally:
+        pool._executor.shutdown(wait=True)
+        instance.session.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
 
 
 def test_failed_preparation_metrics_survive_generation_attempt_and_log_api(transport, log_api, monkeypatch):

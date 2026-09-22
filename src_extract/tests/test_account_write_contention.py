@@ -164,6 +164,42 @@ def test_targeted_save_merges_real_same_account_change(account_flow, change):
         assert rows[0]["file_upload_blocked_until"] == 5000000000
 
 
+@pytest.mark.parametrize("unrelated_count", [1, 11000])
+def test_credential_quota_conflict_does_not_reload_the_whole_pool(account_flow, monkeypatch, unrelated_count):
+    f = account_flow
+    old = deepcopy(f.writer.load_accounts()[0])
+    f.writer.upsert_account({**old, "quota": 3, "file_upload_blocked_until": 5000000000})
+    f.writer.mutate_accounts(StorageMutation(upserts=tuple(
+        {"access_token": f"unrelated-import-{index}", "quota": 5} for index in range(unrelated_count))))
+    monkeypatch.setattr(f.reader, "load_accounts_snapshot", lambda:
+                        pytest.fail("credential conflict reloaded the whole account pool"))
+    assert f.run()[0].kind == "result"
+    rows = {row["access_token"]: row for row in f.writer.load_accounts()}
+    assert rows["new-test-token"]["quota"] == 3
+    assert rows["new-test-token"]["file_upload_blocked_until"] == 5000000000
+    assert rows["unrelated-import-0"]["quota"] == 5
+    assert len(rows) == unrelated_count + 1
+    assert "old-test-token" not in rows
+
+
+def test_conflicted_remote_rotation_still_follows_authoritative_identity(account_flow):
+    f = account_flow
+    old = deepcopy(f.service._accounts["old-test-token"])
+    remote = {**old, "access_token": "remote-winner", "refresh_token": "remote-refresh",
+              "last_token_refresh_at": "remote-generation"}
+    f.writer.mutate_accounts(StorageMutation(upserts=(remote,), delete_keys=("old-test-token",)))
+    f.service._image_inflight["old-test-token"] = 1
+    with pytest.raises(RefreshCredentialsChangedError):
+        f.service._apply_refreshed_tokens(
+            "old-test-token", {"access_token": "stale-winner", "refresh_token": "stale-refresh"},
+            "test", expected_refresh_token="test-refresh")
+    assert f.writer.load_accounts() == [remote]
+    assert f.service.resolve_access_token("old-test-token") == "remote-winner"
+    assert f.service._image_inflight == {"remote-winner": 1}
+    f.service.release_image_slot("old-test-token")
+    assert f.service._image_inflight == {}
+
+
 @pytest.mark.parametrize("change", ["deleted", "credentials", "destination_collision"])
 def test_stale_token_rotation_does_not_overwrite_remote_credentials(account_flow, change):
     f = account_flow

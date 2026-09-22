@@ -1,7 +1,8 @@
-"""Bounded, non-queuing overlap of a signed image transfer and page warmup."""
+"""Bounded overlap of image transfer/confirmation and page warmup."""
 import os
 import threading
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 
 from curl_cffi import requests
@@ -50,17 +51,64 @@ def _capacity():
 input_transfer_pool = NonQueuingPool(_capacity())
 
 
-def put_signed_image(session_kwargs, url, headers, data, timeout, deadline, timing):
-    """Worker owns its Session; no account cookies/Authorization are copied."""
+def snapshot_cookies(cookies):
+    return {(cookie.domain, cookie.path, cookie.name): deepcopy(cookie) for cookie in cookies.jar}
+
+
+def merge_upload_cookies(cookies, baseline, uploaded):
+    """Three-way merge: never overwrite cookies changed by concurrent warmup."""
+    def values(cookie):
+        return vars(cookie) if cookie is not None else None
+
+    current = snapshot_cookies(cookies)
+    for key in baseline.keys() | uploaded.keys():
+        before, after, live = baseline.get(key), uploaded.get(key), current.get(key)
+        if values(before) == values(after) or values(live) != values(before):
+            continue
+        if after is None:
+            if live is not None:
+                cookies.jar.clear(*key)
+        else:
+            cookies.jar.set_cookie(deepcopy(after))
+
+
+def put_signed_image(session_kwargs, url, headers, data, timeout, deadline, timing, confirmation=None):
+    """Own Session: asset PUT has no credentials; optional confirm is upstream-only."""
+    def remaining(budget):
+        if deadline is None:
+            return budget
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ImageFailureError(failure=image_failure("task_interrupted"))
+        return min(budget, left)
+
     timing["started"] = time.perf_counter()
     try:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ImageFailureError(failure=image_failure("task_interrupted"))
-            timeout = min(timeout, remaining)
+        timeout = remaining(timeout)
         with requests.Session(**session_kwargs) as session:
-            response = session.put(url, headers=headers, data=data, timeout=timeout)
-            ensure_ok(response, "image_upload", credential_scope="signed_asset")
+            try:
+                response = session.put(url, headers=headers, data=data, timeout=remaining(timeout))
+                ensure_ok(response, "image_upload", credential_scope="signed_asset")
+            finally:
+                timing["put_ended"] = time.perf_counter()
+            if confirmation is not None:
+                timing["confirm_started"] = time.perf_counter()
+                try:
+                    # Do not install account cookies/default headers until the
+                    # signed-asset transfer is over. Confirmation uses the same
+                    # upstream identity and proxy, but never the main Session.
+                    session.cookies.clear()
+                    for cookie in confirmation["cookies"].values():
+                        session.cookies.jar.set_cookie(deepcopy(cookie))
+                    session.headers.update(confirmation["session_headers"])
+                    response = session.post(
+                        confirmation["url"], headers=confirmation["headers"], data="{}",
+                        timeout=remaining(60),
+                    )
+                    ensure_ok(response, confirmation["path"])
+                    return snapshot_cookies(session.cookies)
+                finally:
+                    timing["confirm_ended"] = time.perf_counter()
     finally:
         timing["ended"] = time.perf_counter()
+        timing.setdefault("put_ended", timing["ended"])

@@ -66,6 +66,9 @@ EVENT_METRIC_PAIRS = (
     ("等待入口", "handler_queue_ms"),
     ("首包", "stream_first_queue_ms"),
     ("等待账号", "account_wait_ms"),
+    ("快照检查", "account_snapshot_check_ms"),
+    ("候选取号", "account_candidate_total_ms"),
+    ("凭据维护", "account_token_maintenance_ms"),
     ("等待出口", "egress_wait_ms"),
     ("上传", "upload_ms"),
     ("初始化", "bootstrap_ms"),
@@ -204,6 +207,7 @@ IMAGE_FIELDS = {
 }
 
 EVENT_FIELDS = {
+    "account_candidate_attempts",
     "time",
     "call_id",
     "event",
@@ -256,6 +260,7 @@ EVENT_FIELDS = {
 }
 
 INTEGER_FIELDS = {
+    "account_candidate_attempts",
     "elapsed_ms",
     "stage_elapsed_ms",
     "duration_ms",

@@ -34,6 +34,7 @@ from services.image_failure import (
     classify_image_exception,
     classify_upstream_message,
     classify_task_failure,
+    empty_completed_image_turn_key,
     extract_message_facts,
     image_failure,
     is_terminal_message_status,
@@ -2974,6 +2975,9 @@ class OpenAIBackendAPI:
         conversation_transport_failure: ImageFailure | None = None
         conversation_transport_error: Exception | None = None
         poll_trace: list[dict[str, Any]] = []
+        empty_turn_key = ""
+        empty_turn_since = 0.0
+        empty_turn_checks = 0
 
         def _raise_final_failure(
             failure: ImageFailure,
@@ -3037,6 +3041,8 @@ class OpenAIBackendAPI:
                         (time.perf_counter() - conversation_query_started) * 1000,
                     )
             except UpstreamHTTPError as exc:
+                empty_turn_key = ""
+                empty_turn_checks = 0
                 failure = classify_image_exception(exc)
                 probe.update(conversation_query="failed", failure_code=failure.code)
                 setattr(exc, "failure", failure)
@@ -3055,6 +3061,8 @@ class OpenAIBackendAPI:
                     upstream_error=str(exc),
                 )
             except requests.exceptions.RequestException as exc:
+                empty_turn_key = ""
+                empty_turn_checks = 0
                 failure = classify_image_exception(exc)
                 probe.update(conversation_query="failed", failure_code=failure.code)
                 setattr(exc, "failure", failure)
@@ -3219,6 +3227,34 @@ class OpenAIBackendAPI:
                             last_assistant_text if conversation_failure is not None else ""
                         ),
                     )
+
+            # An empty completed assistant turn is different from a tool call
+            # still producing an image. Require stable state and successful
+            # empty task probes for 15s before allowing the ordinary retry path.
+            # Any pending tool/task, transport failure or document change resets
+            # this grace period; an image found above always wins.
+            candidate_empty_key = (
+                empty_completed_image_turn_key(conversation)
+                if not file_ids and not sediment_ids and task_check_ok and task_count == 0
+                else ""
+            )
+            if candidate_empty_key:
+                if candidate_empty_key != empty_turn_key:
+                    empty_turn_since = time.monotonic()
+                    empty_turn_checks = 0
+                empty_turn_key = candidate_empty_key
+                empty_turn_checks += 1
+                empty_ms = max(0, int((time.monotonic() - empty_turn_since) * 1000))
+                probe["empty_terminal_ms"] = empty_ms
+                if empty_turn_checks >= 3 and empty_ms >= 15000:
+                    probe["failure_code"] = "no_image_generated"
+                    _raise_final_failure(
+                        image_failure("no_image_generated"),
+                        raw_error="completed empty image turn remained unchanged with no backend tasks for 15 seconds",
+                    )
+            else:
+                empty_turn_key = ""
+                empty_turn_checks = 0
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})

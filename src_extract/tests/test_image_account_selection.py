@@ -20,6 +20,7 @@ class _SelectionProbe:
     _account_matches_plan_type = AccountService._account_matches_plan_type
     _account_matches_any_plan_type = AccountService._account_matches_any_plan_type
     _account_matches_source_type = AccountService._account_matches_source_type
+    _token_needs_refresh = AccountService._token_needs_refresh
 
     def __init__(self, accounts: list[dict]) -> None:
         self._accounts = OrderedDict(
@@ -67,6 +68,30 @@ def test_selection_prefers_recently_successful_unknown_over_cold_unknown(monkeyp
     ])
 
     assert _select(probe) == "warm"
+
+
+def test_funded_ready_token_is_preferred_over_rt_maintenance(monkeypatch):
+    stale = {**_account("stale", quota=8, unknown=False), "refresh_token": "synthetic-rt"}
+    healthy = _account("healthy", quota=8, unknown=False)
+    probe = _SelectionProbe([stale, healthy])
+    monkeypatch.setattr(probe, "_token_needs_refresh", lambda token: token == "stale")
+    assert _select(probe) == "healthy"
+    # Exhausted/busy alternatives still fall back to the refreshable account.
+    probe._image_inflight["healthy"] = 1000
+    assert _select(probe) == "stale"
+
+
+def test_rt_preference_preserves_quota_priority_and_bounds_lookahead(monkeypatch):
+    rows = [{**_account(f"stale-{i}", quota=8, unknown=False), "refresh_token": "synthetic-rt"}
+            for i in range(1000)]
+    probe = _SelectionProbe(rows + [_account("healthy", quota=8, unknown=False)])
+    checks = []
+    monkeypatch.setattr(probe, "_token_needs_refresh", lambda token: checks.append(token) or token != "healthy")
+    assert _select(probe) == "stale-0"
+    assert len(checks) < 100  # A large expired pool must not be fully scanned.
+    probe = _SelectionProbe([_account("unknown", warm=True), rows[0]])
+    monkeypatch.setattr(probe, "_token_needs_refresh", lambda token: True)
+    assert _select(probe) == "stale-0"
 
 
 def test_unknown_quota_scan_is_bounded_oldest_first_and_skips_recent_attempts(monkeypatch):

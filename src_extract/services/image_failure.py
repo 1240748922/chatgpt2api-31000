@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -496,7 +497,7 @@ _IMAGE_QUOTA_MESSAGE_MARKERS = (
 )
 
 
-def _looks_like_image_quota_message(value: Any) -> bool:
+def _looks_like_image_quota_message(value: Any, *, allow_deferred: bool = True) -> bool:
     """Recognize quota exhaustion when upstream omits a structured error code."""
     if isinstance(value, str):
         text = value
@@ -511,8 +512,17 @@ def _looks_like_image_quota_message(value: Any) -> bool:
     else:
         text = _message_text(value)
     normalized = str(text or "").strip().casefold()
-    return bool(normalized) and any(
-        marker.casefold() in normalized for marker in _IMAGE_QUOTA_MESSAGE_MARKERS
+    if any(marker.casefold() in normalized for marker in _IMAGE_QUOTA_MESSAGE_MARKERS):
+        return True
+    # The upstream now offers to schedule a free image after quota resets,
+    # without using its previous "Free plan limit" wording. Require all three
+    # signals; a generic upgrade suggestion or a quoted prompt is not a limit.
+    return allow_deferred and (
+        any(word in normalized for word in ("图像", "图片", "image"))
+        and (
+            ("升级订阅" in normalized and "用量" in normalized and "重置" in normalized)
+            or ("upgrade" in normalized and "usage" in normalized and "reset" in normalized)
+        )
     )
 
 
@@ -986,6 +996,45 @@ def classify_conversation_failure(data: Any) -> ImageFailure | None:
     return failure
 
 
+def empty_completed_image_turn_key(data: Any) -> str:
+    """Identify only the empty-text + completed-recap shape, not pending tools.
+
+    This is NOT sufficient to declare a failure. The caller must also confirm
+    successful empty task queries and unchanged state across a grace period.
+    """
+    messages = _current_conversation_turn(data)
+    has_empty_text = False
+    has_recap = False
+    for message in messages:
+        metadata = _mapping(message.get("metadata"))
+        content = _mapping(message.get("content"))
+        kind = str(content.get("content_type") or "").lower()
+        if (
+            _mapping(message.get("author")).get("role") != "assistant"
+            or not is_terminal_message_status(message.get("status") or metadata.get("status"))
+            or str(message.get("recipient") or "all") != "all"
+            or metadata.get("async_task_type")
+            or metadata.get("async_task_id")
+            or metadata.get("turn_use_case") == "image_gen"
+            or kind not in {"text", "reasoning_recap"}
+        ):
+            return ""
+        if kind == "text":
+            parts = content.get("parts", [])
+            if not isinstance(parts, list) or _message_text(message) or any(
+                not isinstance(part, str) for part in parts
+            ):
+                return ""
+            has_empty_text = True
+        else:
+            has_recap = True
+    if not (has_empty_text and has_recap):
+        return ""
+    # Include changes to node contents/metadata, not just the number of nodes.
+    # Return a digest so neither internal recap text nor credentials are logged.
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def extract_message_facts(value: Any) -> dict[str, Any]:
     facts: dict[str, Any] = {}
 
@@ -1140,7 +1189,13 @@ def classify_message_facts(
     )
     if structured_failure is not None:
         return structured_failure
-    if _looks_like_image_quota_message(raw_detail):
+    if _looks_like_image_quota_message(
+        raw_detail,
+        allow_deferred=(
+            normalized_role in {"assistant", "tool"}
+            and normalized_content_type in {"text", "system_error"}
+        ),
+    ):
         return image_failure("image_quota_exhausted", raw_detail=raw_detail)
 
     if normalized_role == "assistant" and normalized_content_type == "text" and (

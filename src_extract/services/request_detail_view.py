@@ -18,7 +18,10 @@ _TIMELINE_CATEGORIES = (
 _TIMELINE_STEPS = (
     ("handler_queue_ms", "等待入口", "entry", "run_in_threadpool"),
     ("stream_first_queue_ms", "读取首包", "entry", "首个响应事件"),
-    ("account_wait_ms", "等待账号", "entry", "账号池筛选"),
+    ("account_wait_ms", "等待账号", "entry", "快照检查、候选取号与凭据维护总计；不与子项重复相加"),
+    ("account_snapshot_check_ms", "账号快照检查", "entry", "包含在等待账号内"),
+    ("account_candidate_total_ms", "候选账号取号", "entry", "筛选与槽位等待，包含在等待账号内"),
+    ("account_token_maintenance_ms", "账号凭据维护", "entry", "AT 刷新、同步等待及保存，包含在等待账号内"),
     ("egress_wait_ms", "等待出口", "entry", "代理出口准备"),
     ("egress_acquire_ms", "出口租约", "entry", "代理节点并发"),
     ("upload_ms", "上传输入图", "prepare", "参考图上传"),

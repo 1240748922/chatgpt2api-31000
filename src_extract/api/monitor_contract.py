@@ -196,6 +196,10 @@ class MonitorEventView(StrictMonitorModel):
     handler_queue_ms: int | None = None
     stream_first_queue_ms: int | None = None
     account_wait_ms: int | None = None
+    account_snapshot_check_ms: int | None = None
+    account_candidate_total_ms: int | None = None
+    account_token_maintenance_ms: int | None = None
+    account_candidate_attempts: int | None = None
     egress_wait_ms: int | None = None
     upload_ms: int | None = None
     bootstrap_ms: int | None = None

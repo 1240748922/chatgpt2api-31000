@@ -2336,8 +2336,14 @@ class AccountService:
         limit = max(1, int(config.image_account_concurrency or 1))
         cursor = self._image_index % count
         first_available = first_warm = None
+        maintenance_candidate = None
+        maintenance_offset = 0
         ready = matched = limited = busy = upload_limited = 0
         for offset in range(count):
+            # Look briefly beyond a funded account needing RT maintenance.
+            # Do not turn a large expired pool into a full scan on every lease.
+            if maintenance_candidate is not None and offset - maintenance_offset >= 64:
+                break
             ordinal = (cursor + offset) % count
             token = keys[ordinal]
             item = self._accounts[token]
@@ -2361,6 +2367,11 @@ class AccountService:
             if self._is_unlimited_image_quota_account(item) or (
                 not item.get("image_quota_unknown") and int(item.get("quota") or 0) > 0
             ):
+                if item.get("refresh_token") and self._token_needs_refresh(token):
+                    if maintenance_candidate is None:
+                        maintenance_candidate = (token, ordinal)
+                        maintenance_offset = offset
+                    continue
                 self._image_index = (ordinal + 1) % count
                 setter = getattr(self, "_set_image_selection_diagnostics", None)
                 if callable(setter):
@@ -2377,7 +2388,7 @@ class AccountService:
                 first_available = (token, ordinal)
             if first_warm is None and item.get("image_quota_unknown") and item.get("last_image_success_at"):
                 first_warm = (token, ordinal)
-        chosen = first_warm or first_available
+        chosen = maintenance_candidate or first_warm or first_available
         if chosen:
             self._image_index = (chosen[1] + 1) % count
         setter = getattr(self, "_set_image_selection_diagnostics", None)

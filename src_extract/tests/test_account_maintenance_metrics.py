@@ -128,6 +128,8 @@ def test_save_metrics_separate_lock_commit_and_log(account_flow, monkeypatch):
     token = service.get_available_access_token()
     timings = service.get_image_selection_diagnostics()
     assert timings["account_token_write_wait_ms"] == 1000
+    assert timings["account_token_writer_lock_ms"] == 1000
+    assert timings["account_token_dispatch_lock_ms"] == 0
     assert timings["account_token_commit_ms"] == 3000
     assert timings["account_token_log_ms"] == 2000
     assert timings["account_token_save_ms"] == timings["account_token_maintenance_ms"] == 6000

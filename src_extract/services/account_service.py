@@ -192,6 +192,10 @@ class AccountService:
         self._account_snapshot_refresh_lock = Lock()
         self._account_snapshot_refresh_dispatch_lock = Lock()
         self._account_snapshot_refresh_scheduled = False
+        # Present only while a detached snapshot is being read. The latest
+        # authoritative receipt per changed key protects publication from
+        # rolling back writes which committed after that snapshot's SELECT.
+        self._snapshot_write_journal: dict | None = None
         # Image completions must release their account slot immediately. The
         # account row update is useful state, but it must not make a user-facing
         # image request wait behind collection-level revision conflicts.
@@ -229,8 +233,8 @@ class AccountService:
 
     @contextmanager
     def _account_write(self):
-        with token_write_lock(self._write_lock):
-            with token_write_lock(self._image_slot_condition):
+        with token_write_lock(self._write_lock, "account_token_writer_lock_ms"):
+            with token_write_lock(self._image_slot_condition, "account_token_dispatch_lock_ms"):
                 self._write_baseline = dict(self._accounts)
                 try:
                     yield
@@ -519,9 +523,7 @@ class AccountService:
             return False
         if not self._account_snapshot_refresh_lock.acquire(blocking=wait_for_refresh):
             return False
-        if not self._write_lock.acquire(blocking=wait_for_refresh):
-            self._account_snapshot_refresh_lock.release()
-            return False
+        owns_write_lock = False
         try:
             with self._lock:
                 if (
@@ -530,6 +532,7 @@ class AccountService:
                 ):
                     return False
                 expected_revision = self._accounts_revision
+                self._snapshot_write_journal = {}
 
             # Database-backed replicas can check the revision row without
             # deserializing all account payloads.  The full snapshot is only
@@ -542,7 +545,7 @@ class AccountService:
                     current_revision = None
                 if current_revision is not None and current_revision == expected_revision:
                     with self._lock:
-                        if self._accounts_revision == expected_revision:
+                        if self._accounts_revision == expected_revision and not self._snapshot_write_journal:
                             self._account_snapshot_checked_at = time.monotonic()
                     return False
 
@@ -565,11 +568,23 @@ class AccountService:
             # metadata reads and image completion. Reconcile the live view only
             # after reacquiring it so results arriving during this copy survive.
             prepared_persisted_accounts = deepcopy(loaded)
+            # Reading/normalizing/copying a large pool may take seconds. Only
+            # publication participates in writer serialization; token saves
+            # and imports can commit while the detached snapshot is prepared.
+            if not self._write_lock.acquire(blocking=wait_for_refresh):
+                return False
+            owns_write_lock = True
             with self._image_slot_condition:
                 if self._accounts_revision != expected_revision:
                     return False
-                self._account_snapshot_checked_at = time.monotonic()
+                if not self._overlay_snapshot_writes_locked(loaded, prepared_persisted_accounts, revision):
+                    # An adapter without ordered receipts cannot safely merge
+                    # a concurrent commit. Leave the live view intact and try
+                    # again later; never guess which credentials are newer.
+                    return False
                 if revision == expected_revision:
+                    if not self._snapshot_write_journal:
+                        self._account_snapshot_checked_at = time.monotonic()
                     return False
                 # Image completions update the dispatch view before the
                 # coalesced DB writer runs. Do not erase their cooldown/quota
@@ -603,8 +618,46 @@ class AccountService:
                 )
                 return True
         finally:
-            self._write_lock.release()
+            if owns_write_lock:
+                self._write_lock.release()
+            with self._lock:
+                self._snapshot_write_journal = None
             self._account_snapshot_refresh_lock.release()
+
+    @staticmethod
+    def _ordered_account_revision(revision: str | None) -> int | None:
+        prefix, separator, number = str(revision or "").partition(":")
+        if prefix == "accounts" and separator and number.isdecimal():
+            return int(number)
+        return None
+
+    def _journal_account_write_locked(self, revisions, committed) -> None:
+        journal = self._snapshot_write_journal
+        if journal is not None:
+            for key, revision in revisions.items():
+                journal[key] = (self._ordered_account_revision(revision), deepcopy(committed.get(key)))
+
+    def _overlay_snapshot_writes_locked(self, loaded, persisted, revision) -> bool:
+        journal = self._snapshot_write_journal or {}
+        if not journal:
+            return True
+        snapshot_version = self._ordered_account_revision(revision)
+        if snapshot_version is None or any(version is None for version, _row in journal.values()):
+            return False
+        for key, (version, row) in journal.items():
+            if version <= snapshot_version:
+                # The SELECT already includes this commit, possibly followed
+                # by a newer remote deletion/replacement: remote state wins.
+                continue
+            if row is None:
+                loaded.pop(key, None)
+                persisted.pop(key, None)
+            else:
+                loaded[key] = self._normalize_account(row) or dict(row)
+                persisted[key] = deepcopy(row)
+        # Keep the full snapshot revision. A receipt for a few rows must not
+        # acknowledge unrelated remote writes absent from the snapshot.
+        return True
 
     def _schedule_accounts_snapshot_refresh(self, *, max_age_seconds: float | None = None) -> None:
         """Refresh a changed account snapshot without blocking image dispatch."""
@@ -929,6 +982,7 @@ class AccountService:
         # adapters and callers, but all normal application mutations are scoped.
         checked = checked if account_tokens is not None else None
         revision = self._accounts_revision
+        journal_revisions: dict[str, str | None] = {}
         committed = dict(baseline)
         saved = False
         self._accounts = dict(before)
@@ -940,12 +994,15 @@ class AccountService:
                     committed, saved = dict(desired), True
                     break
                 try:
+                    changed_keys = {*(row["access_token"] for row in mutation.upserts), *mutation.delete_keys}
                     with token_phase("account_token_commit_ms"):
                         if callable(checked):
-                            changed_keys = {*(row["access_token"] for row in mutation.upserts), *mutation.delete_keys}
-                            checked(mutation, expected_items={key: baseline.get(key) for key in changed_keys})
+                            receipt = checked(mutation, expected_items={key: baseline.get(key) for key in changed_keys})
                         else:
-                            self.storage.mutate_accounts(mutation)
+                            receipt = self.storage.mutate_accounts(mutation)
+                    # A commit receipt proves only the rows actually written,
+                    # not unchanged rows also present in account_tokens.
+                    journal_revisions.update({key: getattr(receipt, "revision", None) for key in changed_keys})
                     committed, saved = dict(desired), True
                     break
                 except StorageRevisionConflictError:
@@ -967,6 +1024,7 @@ class AccountService:
                             keys.update(key for key, row in remote.items()
                                         if management_id and row.get("management_id") == management_id)
                             committed = {key: raw[key] for key in keys if key in raw}
+                            journal_revisions = {key: snapshot.revision for key in keys}
                             break
                     merge_base = {key: persisted[key] for key in keys if key in persisted} if scoped else persisted
                     merge_intent = {key: intent[key] for key in keys if key in intent} if scoped else intent
@@ -978,6 +1036,7 @@ class AccountService:
                     changed = self._account_mutation(remote, merged, snapshot.revision)
                     keys.update(row["access_token"] for row in changed.upserts)
                     keys.update(changed.delete_keys)
+                    journal_revisions = {key: snapshot.revision for key in keys}
                     baseline = {key: raw[key] for key in keys if key in raw}
                     desired = {key: merged[key] for key in keys if key in merged}
                     committed = dict(baseline)
@@ -990,13 +1049,18 @@ class AccountService:
             # the authoritative rows where possible, not an uncommitted import.
             try:
                 snapshot = self.storage.load_accounts_snapshot()
+                journal_revisions = {key: snapshot.revision for key in keys}
                 committed = {str(row["access_token"]): row for row in snapshot.items
                              if row.get("access_token") in keys}
             except Exception:
+                journal_revisions = {key: None for key in keys}
                 committed = {key: persisted[key] for key in keys if key in persisted}
             raise
         finally:
-            self._lock.acquire()
+            with token_phase("account_token_write_wait_ms"):
+                with token_phase("account_token_dispatch_lock_ms"):
+                    self._lock.acquire()
+            self._journal_account_write_locked(journal_revisions, committed)
             view = dict(self._accounts)
             rotation_ids = {row.get("management_id") for key, row in committed.items() if key not in before}
             before_by_id = {row.get("management_id"): key for key, row in before.items()

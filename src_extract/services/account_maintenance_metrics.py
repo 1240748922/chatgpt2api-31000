@@ -11,6 +11,8 @@ TOKEN_METRIC_LABELS = {
     "account_token_http_ms": "刷新凭据请求",
     "account_token_save_ms": "凭据结果保存",
     "account_token_write_wait_ms": "凭据写入锁等待",
+    "account_token_writer_lock_ms": "账号写入串行锁等待",
+    "account_token_dispatch_lock_ms": "账号状态锁等待",
     "account_token_commit_ms": "凭据数据库提交",
     "account_token_conflict_ms": "凭据冲突重读",
     "account_token_log_ms": "凭据日志写入",
@@ -49,9 +51,13 @@ def token_request_slot(factory):
 
 
 @contextmanager
-def token_write_lock(lock):
+def token_write_lock(lock, metric=None):
     with token_phase("account_token_write_wait_ms"):
-        lock.acquire()
+        if metric:
+            with token_phase(metric):
+                lock.acquire()
+        else:
+            lock.acquire()
     try:
         yield
     finally:

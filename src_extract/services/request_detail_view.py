@@ -27,6 +27,8 @@ _TIMELINE_STEPS = (
     ("account_token_http_ms", "刷新凭据请求", "entry", "包含在账号凭据维护内，不重复相加"),
     ("account_token_save_ms", "凭据结果保存", "entry", "包含在账号凭据维护内，不重复相加"),
     ("account_token_write_wait_ms", "凭据写入锁等待", "entry", "包含在凭据结果保存内"),
+    ("account_token_writer_lock_ms", "账号写入串行锁等待", "entry", "包含在凭据写入锁等待内，不重复相加"),
+    ("account_token_dispatch_lock_ms", "账号状态锁等待", "entry", "包含在凭据写入锁等待内，不重复相加"),
     ("account_token_commit_ms", "凭据数据库提交", "entry", "连接、事务锁和提交；包含在凭据结果保存内"),
     ("account_token_conflict_ms", "凭据冲突重读", "entry", "冲突后的读取与规范化；包含在凭据结果保存内"),
     ("account_token_log_ms", "凭据日志写入", "entry", "包含在凭据结果保存内"),

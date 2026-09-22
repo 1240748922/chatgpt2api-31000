@@ -98,6 +98,54 @@ def test_populated_fast_path_keeps_normal_snapshot_ttl(replica):
     assert replica.pending == []
 
 
+def test_snapshot_copy_does_not_block_dispatch_or_drop_concurrent_result(replica, monkeypatch):
+    from threading import Event
+
+    service, state = replica.service, replica.state
+    ready = _account("ready", quota=8, unknown=False)
+    service._accounts["ready"] = dict(ready)
+    service._persisted_accounts["ready"] = dict(ready)
+    state.accounts.update(ready=dict(ready), imported=_account("imported", quota=8, unknown=False))
+    replica.clock.sleep(5)
+    copying, finish_copy = Event(), Event()
+    original_copy = accounts_module.deepcopy
+
+    def slow_snapshot_copy(value):
+        if isinstance(value, dict) and set(value) == {"ready", "imported"}:
+            copying.set()
+            assert finish_copy.wait(5), "snapshot copy was not released"
+        return original_copy(value)
+
+    monkeypatch.setattr(accounts_module, "deepcopy", slow_snapshot_copy)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        refresh = executor.submit(service._refresh_accounts_snapshot_if_stale, wait_for_refresh=True)
+        try:
+            assert copying.wait(2)
+
+            def use_ready_account():
+                token = service.get_available_access_token()
+                assert token == "ready"
+                # The same lock/view mutation used by deferred image completion.
+                with service._image_slot_condition:
+                    service._accounts[token] = {**service._accounts[token], "success": 1, "quota": 7}
+                service.release_image_slot(token)
+
+            # No RT/OAuth, DB or queue waits. The old snapshot copy held this
+            # dispatch lock for its entire duration and blocked this future.
+            executor.submit(use_ready_account).result(timeout=1)
+        finally:
+            finish_copy.set()
+        assert refresh.result(timeout=2)
+    assert service._accounts["ready"]["quota"] == 7
+    assert service._accounts["ready"]["success"] == 1
+    assert service._persisted_accounts["ready"]["quota"] == 8
+    assert "imported" in service._accounts
+    assert service._image_inflight == {}
+    # Baseline and live view remain independent after the prepared copy.
+    service._accounts["imported"]["quota"] = 4
+    assert service._persisted_accounts["imported"]["quota"] == 8
+
+
 def test_non_database_backend_does_not_reload_every_half_second(replica, monkeypatch):
     replica.service.storage = SimpleNamespace(get_backend_info=lambda: {"type": "git"})
     replica.clock.sleep(2)

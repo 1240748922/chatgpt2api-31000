@@ -1,8 +1,8 @@
 // Keep the import panel mounted while minimized: drafts, selected job and
 // the existing polling controller survive. This component owns no API calls.
 import {d as defineComponent, b as vnode, r as ref, p as watch, J as nextTick,
-  aK as ModalShell, aA as CloseButton, l as Button} from "./index-BhEm-7EJ.js?v=20260922-account-cleanup-v11";
-import {M as ModalHeader} from "./ModalHeader-DOAbsAT0.js?v=20260922-account-cleanup-v11";
+  aK as ModalShell, aA as CloseButton, l as Button} from "./index-BhEm-7EJ.js?v=20260922-account-snapshot-v12";
+import {M as ModalHeader} from "./ModalHeader-DOAbsAT0.js?v=20260922-account-snapshot-v12";
 
 const icon = path => vnode("svg", {width: 16, height: 16, viewBox: "0 0 24 24", fill: "none",
   stroke: "currentColor", "stroke-width": 1.7, "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true"},

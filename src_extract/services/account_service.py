@@ -473,10 +473,17 @@ class AccountService:
         revision: str,
         snapshot_checked: bool = True,
         preserve_index: bool = False,
+        prepared_persisted_accounts: dict[str, dict] | None = None,
     ) -> None:
         token_rotations = self._passive_token_rotations_locked(accounts)
         self._accounts = accounts
-        self._persisted_accounts = deepcopy(persisted_accounts)
+        # A refresh can prepare its private baseline before taking the dispatch
+        # lock. Other callers keep the existing independent-copy behavior.
+        self._persisted_accounts = (
+            deepcopy(persisted_accounts)
+            if prepared_persisted_accounts is None
+            else prepared_persisted_accounts
+        )
         self._accounts_revision = revision
         for new_token, alias_sources in token_rotations:
             self._move_account_runtime_token_locked(new_token, alias_sources)
@@ -553,6 +560,10 @@ class AccountService:
                         self._account_snapshot_checked_at = time.monotonic()
                 return False
 
+            # Copy the detached snapshot outside the lock used by selection,
+            # metadata reads and image completion. Reconcile the live view only
+            # after reacquiring it so results arriving during this copy survive.
+            prepared_persisted_accounts = deepcopy(loaded)
             with self._image_slot_condition:
                 if self._accounts_revision != expected_revision:
                     return False
@@ -587,6 +598,7 @@ class AccountService:
                     refreshed,
                     persisted_accounts=loaded,
                     revision=revision,
+                    prepared_persisted_accounts=prepared_persisted_accounts,
                 )
                 return True
         finally:
@@ -2458,58 +2470,89 @@ class AccountService:
         Access Token 仅在临近过期时通过现有 single-flight 机制刷新；刷新失败或
         请求截止时必须释放刚占用的图片槽。
         """
-        self._refresh_accounts_snapshot_if_stale(allow_full_reload=False)
-        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-            raise ImageAccountSelectionError(
-                "deadline_exceeded",
-                "image request deadline exceeded before account selection",
-            )
-        attempted_tokens = set(excluded_tokens or set())
-        while True:
-            access_token = self._acquire_next_candidate_token(
-                excluded_tokens=attempted_tokens,
-                plan_type=plan_type,
-                source_type=source_type,
-                plan_types=plan_types,
-                deadline_monotonic=deadline_monotonic,
-                requires_file_upload=requires_file_upload,
-            )
+        phase_seconds = {
+            "account_snapshot_check_ms": 0.0,
+            "account_candidate_total_ms": 0.0,
+            "account_token_maintenance_ms": 0.0,
+        }
+        candidate_attempts = 0
+
+        def timed(metric, operation, *args, **kwargs):
+            started = time.monotonic()
             try:
-                active_token = self.ensure_access_token(
-                    access_token,
-                    event="image_request_token_maintenance",
-                    image_scope=True,
-                    raise_on_error=True,
-                    deadline_monotonic=deadline_monotonic,
+                return operation(*args, **kwargs)
+            finally:
+                phase_seconds[metric] += max(0.0, time.monotonic() - started)
+
+        try:
+            timed(
+                "account_snapshot_check_ms", self._refresh_accounts_snapshot_if_stale,
+                allow_full_reload=False,
+            )
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise ImageAccountSelectionError(
+                    "deadline_exceeded",
+                    "image request deadline exceeded before account selection",
                 )
-                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                    raise ImageAccountSelectionError(
-                        "deadline_exceeded",
-                        "image request deadline exceeded during token maintenance",
+            attempted_tokens = set(excluded_tokens or set())
+            while True:
+                candidate_attempts += 1
+                access_token = timed(
+                    "account_candidate_total_ms", self._acquire_next_candidate_token,
+                    excluded_tokens=attempted_tokens,
+                    plan_type=plan_type,
+                    source_type=source_type,
+                    plan_types=plan_types,
+                    deadline_monotonic=deadline_monotonic,
+                    requires_file_upload=requires_file_upload,
+                )
+                try:
+                    active_token = timed(
+                        "account_token_maintenance_ms", self.ensure_access_token,
+                        access_token,
+                        event="image_request_token_maintenance",
+                        image_scope=True,
+                        raise_on_error=True,
+                        deadline_monotonic=deadline_monotonic,
                     )
-                return active_token
-            except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
-                    TimeoutError, StorageRevisionConflictError) as exc:
-                # A stale/expired credential must not turn a large healthy pool
-                # into a customer-visible no_available_account. Release this
-                # lease, exclude the account for this request, and immediately
-                # obtain another candidate while the request deadline remains.
-                self.release_image_slot(access_token)
-                attempted_tokens.add(access_token)
-                if isinstance(exc, StorageRevisionConflictError):
-                    logger.warning({
-                        "event": "image_account_selection_retry",
-                        "reason": "account_write_conflict",
-                        "excluded_count": len(attempted_tokens),
-                    })
-                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                    raise ImageAccountSelectionError(
-                        "deadline_exceeded",
-                        "image request deadline exceeded during token maintenance",
-                    )
-            except BaseException:
-                self.release_image_slot(access_token)
-                raise
+                    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                        raise ImageAccountSelectionError(
+                            "deadline_exceeded",
+                            "image request deadline exceeded during token maintenance",
+                        )
+                    return active_token
+                except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
+                        TimeoutError, StorageRevisionConflictError) as exc:
+                    # A stale/expired credential must not turn a large healthy pool
+                    # into a customer-visible no_available_account. Release this
+                    # lease, exclude the account for this request, and immediately
+                    # obtain another candidate while the request deadline remains.
+                    self.release_image_slot(access_token)
+                    attempted_tokens.add(access_token)
+                    if isinstance(exc, StorageRevisionConflictError):
+                        logger.warning({
+                            "event": "image_account_selection_retry",
+                            "reason": "account_write_conflict",
+                            "excluded_count": len(attempted_tokens),
+                        })
+                    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                        raise ImageAccountSelectionError(
+                            "deadline_exceeded",
+                            "image request deadline exceeded during token maintenance",
+                        )
+                except BaseException:
+                    self.release_image_slot(access_token)
+                    raise
+        finally:
+            # Candidate acquisition resets its diagnostics on every internal
+            # retry. Publish aggregate phases only after the whole lookup, also
+            # when it fails; these phases are nested within account_wait_ms.
+            setter = getattr(self, "_set_image_selection_diagnostics", None)
+            if callable(setter):
+                setter(
+                    **{key: int(seconds * 1000) for key, seconds in phase_seconds.items()},
+                    account_candidate_attempts=candidate_attempts,
+                )
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         self._refresh_accounts_snapshot_if_stale()

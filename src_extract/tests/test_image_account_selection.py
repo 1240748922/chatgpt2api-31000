@@ -133,6 +133,64 @@ def test_image_selection_skips_account_that_fails_token_maintenance():
     assert probe.released == ["stale"]
 
 
+@pytest.mark.parametrize("deadline_seconds", [5, 20])
+def test_account_lookup_phase_timings_include_internal_retries_and_errors(monkeypatch, deadline_seconds):
+    import services.account_service as module
+    from test_image_recovery import Clock
+
+    clock = Clock()
+    monkeypatch.setattr(module, "time", clock)
+
+    class Probe:
+        get_available_access_token = AccountService.get_available_access_token
+        _set_image_selection_diagnostics = AccountService._set_image_selection_diagnostics
+        get_image_selection_diagnostics = AccountService.get_image_selection_diagnostics
+
+        def __init__(self):
+            self.candidates = iter(("stale", "healthy"))
+            self.released = []
+
+        def _refresh_accounts_snapshot_if_stale(self, **kwargs):
+            assert kwargs["allow_full_reload"] is False
+            clock.sleep(2)
+
+        def _acquire_next_candidate_token(self, **kwargs):
+            self._set_image_selection_diagnostics(selection_wait_ms=1000)
+            clock.sleep(1)
+            return next(self.candidates)
+
+        def ensure_access_token(self, token, **kwargs):
+            clock.sleep(3 if token == "stale" else 4)
+            if token == "stale":
+                raise TerminalRefreshTokenError(400, "invalid_refresh_token")
+            return token
+
+        def release_image_slot(self, token):
+            self.released.append(token)
+
+    probe = Probe()
+    deadline = clock.now + deadline_seconds
+    if deadline_seconds == 5:
+        with pytest.raises(ImageAccountSelectionError):
+            probe.get_available_access_token(deadline_monotonic=deadline)
+    else:
+        assert probe.get_available_access_token(deadline_monotonic=deadline) == "healthy"
+    diagnostic = probe.get_image_selection_diagnostics()
+    assert diagnostic["account_snapshot_check_ms"] == 2000
+    assert diagnostic["account_candidate_total_ms"] == (1000 if deadline_seconds == 5 else 2000)
+    assert diagnostic["account_token_maintenance_ms"] == (3000 if deadline_seconds == 5 else 7000)
+    assert diagnostic["account_candidate_attempts"] == (1 if deadline_seconds == 5 else 2)
+    assert diagnostic["selection_wait_ms"] == 1000  # last selection retains its existing meaning
+    assert probe.released == ["stale"]
+    # The raw event whitelist must retain the phases for saved per-attempt logs.
+    from services.realtime_monitor_service import RealtimeMonitorService
+    monitor = RealtimeMonitorService.__new__(RealtimeMonitorService)
+    event = monitor._event("synthetic-call", "image_account_lookup", {}, diagnostic)
+    for key in ("account_snapshot_check_ms", "account_candidate_total_ms",
+                "account_token_maintenance_ms", "account_candidate_attempts"):
+        assert event[key] == diagnostic[key]
+
+
 def test_busy_image_pool_exits_short_wait_with_diagnostics(monkeypatch):
     probe = AccountService.__new__(AccountService)
     probe._lock = Lock()

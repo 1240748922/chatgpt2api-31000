@@ -2058,7 +2058,7 @@ class AccountService:
             else:
                 needs_refresh = self._token_needs_refresh(active_token, force=force)
             needs_refresh = needs_refresh or account.get("last_remote_check_result") == "invalid"
-            if AccountService._strict_admission() and self._token_expires_in(active_token) is None:
+            if AccountService._strict_admission() and event != "get_text_access_token" and self._token_expires_in(active_token) is None:
                 needs_refresh = True
             refresh_backoff = not force and self._recent_token_refresh_error(account)
             refresh_token = str(account.get("refresh_token") or "").strip()

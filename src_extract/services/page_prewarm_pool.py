@@ -31,6 +31,7 @@ class PagePrewarmPool:
         self.lock, self.stop_event = Lock(), Event()
         self.entries, self.pending, self.threads = {}, set(), []
         self.mode = "not_started"
+        self.cooldown_until = 0.0
         self.counters = dict(hit=0, miss=0, expired=0, discarded=0, failed=0, built=0)
 
     def candidates(self):
@@ -72,7 +73,8 @@ class PagePrewarmPool:
     def status(self):
         with self.lock:
             return {**self.counters, "ready": len(self.entries), "building": len(self.pending),
-                    "target": self.capacity, "ttl_seconds": self.ttl, "scope": "local_instance", "mode": self.mode}
+                    "target": self.capacity, "ttl_seconds": self.ttl, "scope": "local_instance", "mode": self.mode,
+                    "cooldown_seconds": max(0, int(self.cooldown_until - time.monotonic()))}
 
     def start(self, accounts):
         self.threads = [thread for thread in self.threads if thread.is_alive()]
@@ -88,11 +90,27 @@ class PagePrewarmPool:
             self.threads.append(thread)
             thread.start()
 
+    def defer_failure(self, exc):
+        # Public-page throttling is shared network pressure, not an account
+        # credential failure. Pause all local refill workers, not just this one.
+        try:
+            retry = max(5, int(getattr(exc, "retry_after", None) or 5))
+        except (TypeError, ValueError, OverflowError):
+            retry = 5
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + retry)
+            self.counters["failed"] += 1
+
     def _work(self, accounts, rate):
         from services.openai_backend_api import OpenAIBackendAPI
         from services.account_maintenance_policy import evaluate_pressure
         from services.maintenance_pressure import local_pressure_snapshot
         while not self.stop_event.is_set():
+            with self.lock:
+                cooldown = self.cooldown_until - time.monotonic()
+            if cooldown > 0:
+                self.stop_event.wait(min(cooldown, 60))
+                continue
             backend = None
             token = None
             owned = False
@@ -131,9 +149,8 @@ class PagePrewarmPool:
                 if current and generation(current) == generation(backend.account):
                     self.put(backend)
                     backend = None
-            except Exception:
-                with self.lock:
-                    self.counters["failed"] += 1
+            except Exception as exc:
+                self.defer_failure(exc)
                 delay = max(delay, 5)
             finally:
                 if backend is not None:

@@ -149,3 +149,13 @@ def test_hit_log_is_a_flag_not_fake_elapsed_time(monkeypatch):
     assert diagnostic["events"][0]["page_prewarm_hit"] == 1
     timeline = build_request_timeline_presentation({"input_prepare_ms": 2000, "page_prewarm_age_ms": 30000}, [], wall_duration_ms=2000)
     assert sum(segment["value_ms"] for segment in timeline["segments"]) == 2000
+
+
+def test_public_page_retry_after_defers_entire_local_refill_pool():
+    pool = PagePrewarmPool(1, 30)
+    pool.defer_failure(SimpleNamespace(retry_after=900))
+    assert pool.cooldown_until - time.monotonic() > 895
+    assert pool.status()["failed"] == 1
+    assert pool.status()["cooldown_seconds"] >= 895
+    pool.defer_failure(SimpleNamespace(retry_after=1))
+    assert pool.cooldown_until - time.monotonic() > 895

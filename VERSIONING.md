@@ -1,12 +1,44 @@
 # 稳定版本、升级和回退
 
-## 2026-09-24：3.2.32（发布验证中）
+## 2026-09-24 当前发布：3.2.32
 
-本版整合严格凭据准入、跨实例生图/刷新互斥、真正的请求前页面库存及简化可用性面板。
-功能、参数、失败边界见 [3.2.32 说明](./docs/ready-pool-prewarm.md)。
-只有构建与 PostgreSQL 回归成功后才会在后续部署提交中锁定新镜像 SHA；当前 Compose 默认仍保留已发布的上一版镜像。
-首次升级需暂停新请求并排空旧实例，再统一更新所有 app 与 importer，避免旧实例未登记租约却被新后台刷新。
+- 应用提交：`074f2c8cefdd0dda3bdbdd1072b699ba5f95f120`。
+- 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-074f2c8`，也发布到 `latest`。
+- [GitHub Actions：PostgreSQL 回归及构建发布](https://github.com/1240748922/chatgpt2api-31000/actions/runs/35896696203)均成功，`Build and push` 步骤已核实。
+- 整合严格凭据准入、跨实例生图/刷新互斥、请求前页面库存及精简可用性面板；原导号批量加速、导入窗口、生图/超分并发及代理配置保留。
+- 验证：460 项本地 Python 测试、4 项 GitHub PostgreSQL 17 测试、4 组 Node 检查通过；本地因没有 Docker 引擎而跳过的 4 项 PostgreSQL 测试已在 CI 实跑。
+- 详细参数、互斥边界及回退：[3.2.32 说明](./docs/ready-pool-prewarm.md)。镜像构建成功不代表服务器已经更新，未通过本机 Docker 或服务器真实账号做生图压测。
 
+**先把服务器 `.env` 中的 `CHATGPT2API_IMAGE_TAG` 改为 `sha-074f2c8`，或移除该项使用 Compose 默认值。`git pull` 不会修改 `.env`。**
+
+首次从 3.2.31 升级不要混跑：暂停外部新请求和新导入，等待在途任务结束，备份数据库/配置，然后执行：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+这会有一次统一切换窗口，不是无中断滚动升级；不删除数据卷、不重建 PostgreSQL。网关等待全部应用就绪，恢复后 `/version` 应为 **3.2.32**，浏览器按 Ctrl+F5 刷新。逐实例核验：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+所有输出应为 `074f2c8cefdd0dda3bdbdd1072b699ba5f95f120`。查看账号可用性详情应显示严格准入；已知就绪数量会低于总账号数。预热命中通过请求事件 `page_prewarm_hit=1` 判断，未命中是正常冷回退，不应排队等库存。
+
+上一版回退镜像为 `sha-471fc63`，回退也需要先排空并统一重建 app/importer。新表保留即可，不要手工清除 RT 发送记录。单独关闭预热可配置 `CHATGPT2API_PAGE_PREWARM_TARGET=0`。
+
+后续仅锁定已发布镜像的部署提交使用 `[skip ci]`，不代表又有一个新的应用镜像。
+
+---
 
 ## 2026-09-24 上一版：3.2.31（阶段一）
 

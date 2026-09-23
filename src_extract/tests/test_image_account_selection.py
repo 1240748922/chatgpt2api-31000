@@ -153,6 +153,9 @@ def test_image_selection_skips_account_that_fails_token_maintenance():
         def release_image_slot(self, access_token):
             self.released.append(access_token)
 
+        def _validate_image_lease(self, token, **kwargs):
+            return token
+
     probe = MaintenanceProbe()
     assert probe.get_available_access_token() == "healthy"
     assert probe.released == ["stale"]
@@ -192,6 +195,9 @@ def test_account_lookup_phase_timings_include_internal_retries_and_errors(monkey
 
         def release_image_slot(self, token):
             self.released.append(token)
+
+        def _validate_image_lease(self, token, **kwargs):
+            return token
 
     probe = Probe()
     deadline = clock.now + deadline_seconds

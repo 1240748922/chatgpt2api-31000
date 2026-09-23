@@ -409,6 +409,7 @@ class AccountService:
                 recover_interrupted_checks
                 and normalized.get("last_remote_check_result") == "pending"
                 and normalized.get("pending_auth_scope") != "image"
+                and not normalized.get("pending_auth_verification_id")
             ):
                 normalized["last_remote_check_result"] = "error"
                 normalized["last_remote_check_error"] = (
@@ -1097,8 +1098,9 @@ class AccountService:
             self._image_slot_condition.notify_all()
         return saved
 
-    @staticmethod
+    @classmethod
     def _is_account_selectable(
+        cls,
         account: dict,
         *,
         allow_limited: bool,
@@ -1118,6 +1120,10 @@ class AccountService:
             refresh_confirmed_invalid=bool(account.get("refresh_token_invalid_at")),
         )
         if credential_availability.status == "unavailable":
+            return False
+        # Recoverable does not mean dispatchable while RT refresh is backing
+        # off. Keep valid ATs usable, but do not lease expired ones repeatedly.
+        if credential_availability.status == "recoverable" and cls._recent_token_refresh_error(account):
             return False
         if account.get("last_remote_check_result") != "pending":
             return True
@@ -1595,11 +1601,43 @@ class AccountService:
             limit=2000,
         )
 
-    def _recent_token_refresh_error(self, account: dict) -> bool:
-        last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
+    @classmethod
+    def _recent_token_refresh_error(cls, account: dict) -> bool:
+        last_error_at = cls._parse_time(account.get("last_token_refresh_error_at"))
         if last_error_at is None:
             return False
-        return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
+        return (datetime.now(timezone.utc) - last_error_at).total_seconds() < cls._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
+
+    @staticmethod
+    def _require_usable_access_token(access_token: str, account: dict | None) -> str:
+        """A skipped/failed refresh must never return a known unusable AT.
+
+        This is a temporary selection failure, not evidence that the RT or
+        account should be permanently invalidated. No upstream I/O is needed.
+        """
+        if account is None:
+            raise RefreshCredentialsChangedError()
+        token = str(account.get("access_token") or access_token or "").strip()
+        availability = project_upstream_credential_availability(
+            token,
+            access_confirmed_invalid=account.get("last_remote_check_result") == "invalid",
+        )
+        if availability.access.status == "invalid":
+            raise OAuthRefreshError(
+                503, "access_token_unavailable", "Access token requires successful recovery before use."
+            )
+        return token
+
+    @classmethod
+    def _auth_verification_in_backoff(cls, account: dict) -> bool:
+        if account.get("last_remote_check_result") != "pending":
+            return False
+        last_error = cls._parse_time(account.get("last_remote_check_error_at"))
+        return cls._recent_token_refresh_error(account) or bool(
+            last_error is not None
+            and (datetime.now(timezone.utc) - last_error).total_seconds()
+            < cls._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS
+        )
 
     def _request_access_token_refresh(
         self,
@@ -1936,7 +1974,10 @@ class AccountService:
             if not account:
                 raise RefreshCredentialsChangedError()
             active_token = str(account.get("access_token") or resolved_token or access_token)
-            needs_refresh = self._token_needs_refresh(active_token, force=force)
+            needs_refresh = (
+                self._token_needs_refresh(active_token, force=force)
+                or account.get("last_remote_check_result") == "invalid"
+            )
             refresh_backoff = not force and self._recent_token_refresh_error(account)
             refresh_token = str(account.get("refresh_token") or "").strip()
             current_generation = self._credential_generation(active_token, account)
@@ -1946,11 +1987,11 @@ class AccountService:
             ):
                 raise RefreshCredentialsChangedError()
             if not refresh_token:
-                return active_token
+                return self._require_usable_access_token(active_token, account)
             if account.get("refresh_token_invalid_at") and not force:
                 remaining = self._token_expires_in(active_token)
                 if remaining is None or remaining > 0:
-                    return active_token
+                    return self._require_usable_access_token(active_token, account)
                 raise TerminalRefreshTokenError(
                     400,
                     "invalid_refresh_token",
@@ -1976,7 +2017,7 @@ class AccountService:
                         owner = future is None
                         if future is None:
                             if image_busy or not needs_refresh or refresh_backoff:
-                                return active_token
+                                return self._require_usable_access_token(active_token, account)
                             future = Future()
                             self._oauth_refresh_flights[key] = future
             else:
@@ -1985,7 +2026,7 @@ class AccountService:
                     owner = future is None
                     if future is None:
                         if not needs_refresh or refresh_backoff:
-                            return active_token
+                            return self._require_usable_access_token(active_token, account)
                         future = Future()
                         self._oauth_refresh_flights[key] = future
             if owner:
@@ -2005,11 +2046,14 @@ class AccountService:
             try:
                 with token_phase("account_token_singleflight_ms") if not owner else nullcontext():
                     if deadline_monotonic is None:
-                        return future.result()
-                    remaining = deadline_monotonic - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("image request deadline exceeded while waiting for token refresh")
-                    return future.result(timeout=remaining)
+                        refreshed_token = future.result()
+                    else:
+                        remaining = deadline_monotonic - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("image request deadline exceeded while waiting for token refresh")
+                        refreshed_token = future.result(timeout=remaining)
+                current_token, current = self._get_account_for_token(refreshed_token)
+                return self._require_usable_access_token(current_token, current)
             except TerminalRefreshTokenError as exc:
                 expected_access_token = str(
                     getattr(exc, "expected_access_token", active_token) or active_token
@@ -2052,7 +2096,7 @@ class AccountService:
                             != expected_credentials
                         ):
                             raise RefreshCredentialsChangedError() from exc
-                        return current_token
+                        return self._require_usable_access_token(current_token, current)
                     raise RefreshCredentialsChangedError() from exc
                 raise
             except RefreshCredentialsChangedError:
@@ -2064,7 +2108,7 @@ class AccountService:
                     raise
                 # A concurrent successful exchange already produced a usable AT.
                 if latest_generation[2] != current_generation[2]:
-                    return str(current.get("access_token") or current_token or active_token)
+                    return self._require_usable_access_token(current_token, current)
                 if credential_attempt == 0:
                     access_token = current_token
                     continue
@@ -2074,7 +2118,7 @@ class AccountService:
                     raise
                 current_token, current = self._get_account_for_token(active_token)
                 if current:
-                    return str(current.get("access_token") or current_token or active_token)
+                    return self._require_usable_access_token(current_token, current)
                 raise RefreshCredentialsChangedError()
             finally:
                 if owner:
@@ -2621,7 +2665,7 @@ class AccountService:
                             "deadline_exceeded",
                             "image request deadline exceeded during token maintenance",
                         )
-                    return active_token
+                    return self._validate_image_lease(active_token, requires_file_upload=requires_file_upload)
                 except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
                         TimeoutError, StorageRevisionConflictError) as exc:
                     # A stale/expired credential must not turn a large healthy pool
@@ -2655,6 +2699,20 @@ class AccountService:
                     account_candidate_attempts=candidate_attempts,
                 )
 
+    def _validate_image_lease(self, access_token: str, *, requires_file_upload: bool = False) -> str:
+        # Maintenance may have waited on I/O while another request rejected
+        # this credential. Recheck only this row, not the full pool/database.
+        with self._image_slot_condition:
+            token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(token)
+            if account is None:
+                raise RefreshCredentialsChangedError()
+            if not self._is_image_account_available(account) or (
+                requires_file_upload and upload_blocked(account)
+            ):
+                raise OAuthRefreshError(503, "account_not_ready", "Account is awaiting recovery.")
+            return self._require_usable_access_token(token, account)
+
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         self._refresh_accounts_snapshot_if_stale()
         attempted = set(excluded_tokens or set())
@@ -2678,7 +2736,7 @@ class AccountService:
             attempted.add(access_token)
             try:
                 return self.ensure_access_token(access_token, event="get_text_access_token")
-            except (TerminalRefreshTokenError, RefreshCredentialsChangedError):
+            except (OAuthRefreshError, RefreshCredentialsChangedError):
                 continue
 
     def mark_text_used(self, access_token: str) -> None:
@@ -2952,7 +3010,8 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("last_remote_check_result") == "pending"
-                and item.get("pending_auth_scope") == "image"
+                and (item.get("pending_auth_scope") == "image" or item.get("pending_auth_verification_id"))
+                and not self._auth_verification_in_backoff(item)
                 and (token := str(item.get("access_token") or "").strip())
             ]
 
@@ -4306,10 +4365,13 @@ class AccountService:
             next_item["last_remote_check_event"] = event
             current_result = str(current.get("last_remote_check_result") or "")
             next_item["last_remote_check_result"] = (
-                "invalid" if current_result == "invalid" else "error"
+                current_result if current_result in {"invalid", "pending"} else "error"
             )
-            next_item["pending_auth_remove_invalid"] = None
-            next_item["pending_auth_scope"] = None
+            # Verification transport failures are not successful recovery.
+            # Persist the quarantine marker/scope across snapshots and restarts.
+            if current_result != "pending":
+                next_item["pending_auth_remove_invalid"] = None
+                next_item["pending_auth_scope"] = None
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -4558,7 +4620,9 @@ class AccountService:
             pending_generation = self._credential_generation(access_token, persisted)
             self._image_slot_condition.notify_all()
         scheduled = self._schedule_account_refresh_after_image_failure(access_token, force=True)
-        if not scheduled:
+        if not scheduled and not self._auth_verification_in_backoff(
+            self.get_account(access_token, refresh_snapshot=False) or {}
+        ):
             self._record_remote_check_error(
                 access_token,
                 event,
@@ -4740,10 +4804,10 @@ class AccountService:
             account = self.get_account(access_token) or {}
             event = str(account.get("last_remote_check_event") or "account_failure")
             if account.get("last_remote_check_result") == "pending":
-                if account.get("pending_auth_scope") == "image":
-                    self._verify_pending_auth(access_token, event)
-                else:
-                    self.fetch_remote_info(access_token, event)
+                # Verification is allowed to probe rejected credentials; the
+                # business-token guard must not prevent terminal classification
+                # of an expired account that has no recovery RT.
+                self._verify_pending_auth(access_token, event)
             else:
                 self.fetch_remote_info(access_token, event)
         except Exception as exc:
@@ -4774,7 +4838,9 @@ class AccountService:
                     access_token,
                     force=force,
                 )
-                if not scheduled:
+                if not scheduled and not self._auth_verification_in_backoff(
+                    self.get_account(access_token, refresh_snapshot=False) or {}
+                ):
                     self._record_remote_check_error(
                         access_token,
                         "image_failure",
@@ -4821,6 +4887,10 @@ class AccountService:
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token) or {}
+            # Even forced post-failure rescheduling must respect a recorded
+            # outage. The lifecycle watcher resumes due work; no tight loop.
+            if self._auth_verification_in_backoff(account):
+                return False
             requested_scope = (
                 "image" if account.get("pending_auth_scope") == "image" else "account"
             )
@@ -4920,6 +4990,7 @@ class AccountService:
                                 rerun_requested
                                 and account is not None
                                 and account.get("last_remote_check_result") == "pending"
+                                and not self._auth_verification_in_backoff(account)
                                 and resolved_token not in self._image_failure_refresh_pending_set
                             ):
                                 self._image_failure_refresh_pending.append(resolved_token)

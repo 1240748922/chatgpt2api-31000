@@ -1,5 +1,42 @@
 # 稳定版本、升级和回退
 
+## 2026-09-24 当前发布：3.2.31（阶段一）
+
+- 应用提交：`471fc6345f93acaf26d78795d769da6edfd27f07`。
+- 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-471fc63`，同时发布到 `latest`。
+- [GitHub Actions 构建与发布](https://github.com/1240748922/chatgpt2api-31000/actions/runs/35890716722)已成功；Compose 默认标签已指向本次应用提交。
+- 包含账号可用性统计和性能驱动的周期维护；**不包含**跨实例刷新租约、严格未知 AT 准入和请求前预热库存。说明及策略回退见 [阶段一文档](./docs/account-readiness-maintenance.md)。
+- 426 项 Python 回归、4 组 Node 检查通过，无数据库迁移；导号加速、生图/超分并发及代理配置保留。
+
+先确认服务器 `.env`：如果存在 `CHATGPT2API_IMAGE_TAG`，改为 `sha-471fc63`，或删除该配置以跟随 Compose 默认值。已有 `latest` 也会拉到本次发布，但使用明确 SHA 更便于回退和核验。`git pull` 不会覆盖服务器 `.env`。
+
+低峰暂停新请求、等在途请求结束后执行（不要删除数据卷）：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+本命令更新应用、导入进程和网关，不重建 PostgreSQL。网关需等待应用就绪，启动初期可稍后重试 `/version`；返回的 `version` 应为 `3.2.31`。镜像拉取如返回 401/403，使用服务器已有 GHCR 登录配置，并检查它具有该镜像的读取权限，不要把 token 贴到日志或聊天中。
+
+逐容器核验应用提交：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+每个输出应为 `471fc6345f93acaf26d78795d769da6edfd27f07`。上一应用版本为 `3.2.30` / `sha-9eb6e5b`，需要完整回退时将 `.env` 镜像标签改为它再拉取、重建；仅回退同步策略也可使用文档中的 `idle` 开关。
+
+镜像对应应用提交；其后的部署文件提交只锁定上述已构建的标签，使用 `[skip ci]` 避免为部署文档重复构建。该部署提交没有自己的新镜像标签。
+
+**下面保留的是历史发布记录，其中“当前”等称呼只对应当时版本，不代表本次默认镜像。**
+
 ## 新维护方案之前的稳定版本
 
 | 项目 | 固定版本 |

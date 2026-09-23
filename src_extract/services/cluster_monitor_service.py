@@ -133,7 +133,8 @@ def cluster_operations_snapshot() -> dict[str, Any]:
 def cluster_image_load_snapshot() -> dict[str, Any]:
     """Coalesce maintenance polling; never called on image dispatch's hot path."""
     global _load_cache
-    key = (*account_shard_settings(), os.getenv("CHATGPT2API_MONITOR_CLUSTER_SECRET", ""))
+    key = (*account_shard_settings(), os.getenv("CHATGPT2API_MONITOR_CLUSTER_SECRET", ""),
+           os.getenv("CHATGPT2API_MAINTENANCE_IMPORTER_URL", ""))
     with _load_lock:
         if _load_cache is not None and _load_cache[0] == key and time.monotonic() - _load_cache[1] < 2:
             return deepcopy(_load_cache[2])
@@ -161,10 +162,18 @@ def _collect_image_load_snapshot() -> dict[str, Any]:
                         snapshots.append(snapshot)
                 except (OSError, ValueError, RuntimeError, urllib.error.URLError):
                     continue
+    reports = [snapshot.get("maintenance_health") for snapshot in snapshots]
+    importer = os.getenv("CHATGPT2API_MAINTENANCE_IMPORTER_URL", "").strip().rstrip("/")
+    if importer:
+        try:
+            reports.append(_request_json(importer + "/internal/monitor/load", _secret(), 2).get("maintenance_health"))
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+            pass
     return {
         "cluster": {"expected": count, "responding": len(snapshots)},
+        "maintenance_cluster": {"expected": count + int(bool(importer)), "responding": len(reports)},
         "threadpool": {"image": _pool_sum(snapshots, "image")},
-        "maintenance_health": [snapshot.get("maintenance_health") for snapshot in snapshots],
+        "maintenance_health": reports,
     }
 
 

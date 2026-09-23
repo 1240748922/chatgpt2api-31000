@@ -1269,7 +1269,8 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         from services.account_maintenance_policy import account_maintenance_policy
         result = await run_in_threadpool(account_service.readiness_summary)
-        return {**result, "maintenance": account_maintenance_policy.status()}
+        from services.page_prewarm_pool import page_prewarm_pool
+        return {**result, "maintenance": account_maintenance_policy.status(), "prewarm": page_prewarm_pool.status()}
 
     @router.get("/api/accounts")
     async def get_accounts(

@@ -1,7 +1,7 @@
 """Read-only image credential readiness; unknown expiry is not proven validity.
 
-This projection does not mutate credentials or change the dispatch policy. It is
-the rollout inventory for strict admission, independent of quota and occupancy.
+This projection is independent of quota and occupancy. Strict dispatch and the
+read-only inventory share it; local JWT expiry is not proof of signature validity.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from services.account_credentials import access_token_timestamps
 
 READINESS_LABELS = {
     "ready": "凭据就绪",
+    "refreshing": "正在续期",
+    "uncertain": "续期结果待确认",
     "unknown": "有效期未知",
     "expiring": "有效期不足",
     "expired": "AT 已过期",
@@ -67,7 +69,7 @@ def summarize_projections(projections, minimum_validity_seconds: float, *, now: 
     renewable = manual = 0
     for item in projections:
         counts[item["state"]] += 1
-        if item["state"] in {"unknown", "expired", "expiring", "quarantined", "invalid"}:
+        if item["state"] in {"unknown", "expired", "expiring", "quarantined", "invalid", "uncertain"}:
             renewable += int(item["has_refresh_path"])
             manual += int(not item["has_refresh_path"])
     return {

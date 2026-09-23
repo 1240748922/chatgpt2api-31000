@@ -1,11 +1,11 @@
 import {d as defineComponent, b as h, r as ref, s as onMounted, x as onUnmounted, m as api, O as Icon}
-  from "./index-BhEm-7EJ.js?v=20260924-account-readiness-v13";
-import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260924-readiness-v1";
+  from "./index-BhEm-7EJ.js?v=20260924-ready-prewarm-v14";
+import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260924-readiness-v2";
 
 export default defineComponent({
   name:"AccountAvailability",
   setup() {
-    const snapshot = ref(null), busy = ref(false), error = ref("");
+    const snapshot = ref(null), busy = ref(false), error = ref(""), dialog = ref(null);
     let disposed = false, timer;
     async function refresh() {
       if (disposed || busy.value || document.hidden) return;
@@ -18,34 +18,50 @@ export default defineComponent({
       } finally { if (!disposed) busy.value = false; }
     }
     onMounted(() => { refresh(); timer = window.setInterval(refresh, 15000); });
-    onUnmounted(() => { disposed = true; window.clearInterval(timer); });
+    onUnmounted(() => { disposed = true; window.clearInterval(timer); dialog.value?.close(); });
+    const iconButton = (name, icon, click, disabled=false) => h("button", {type:"button", "aria-label":name,
+      title:name, disabled, onClick:click, class:"rounded-lg p-2 text-muted-foreground hover:bg-muted"}, [h(Icon,{icon,width:16})]);
+    const number = n => Number.isSafeInteger(n) && n >= 0 ? n.toLocaleString() : "--";
     return () => {
       const view = availabilityDisplay(snapshot.value), maintenance = snapshot.value?.maintenance;
-      const signals = maintenance?.signals || {};
+      const signals = maintenance?.signals || {}, prewarm = snapshot.value?.prewarm || {};
       const ms = x => typeof x === "number" && Number.isFinite(x) ? `${Math.round(x)}ms` : "--";
+      const tile = (key, label, value) => h("div", {key, class:"rounded-lg bg-muted/40 p-3", "data-availability-metric":key}, [
+        h("div", {class:"text-xs text-muted-foreground"}, label),
+        h("div", {class:"mt-1 text-xl font-semibold tabular-nums text-foreground"}, value),
+      ]);
       return h("section", {"aria-label":"账号可用性", class:"rounded-xl border border-border bg-card p-4", style:"min-width:0;margin:12px 0"}, [
         h("div", {class:"flex flex-wrap items-center justify-between gap-2"}, [
-          h("div", {}, [h("h2", {class:"font-semibold text-foreground"}, "账号可用性"),
-            h("p", {class:"text-xs text-muted-foreground"}, "全池凭据预评估 · 不等于实时空闲槽位")]),
-          h("button", {type:"button", "aria-label":"刷新账号可用性", title:"刷新账号可用性", disabled:busy.value,
-            class:"rounded-lg border border-border p-2", onClick:refresh}, [h(Icon, {icon:"lucide:refresh-cw", width:16})]),
+          h("h2", {class:"text-sm font-medium text-foreground"}, "账号可用性"),
+          h("div", {class:"flex items-center gap-2 text-xs text-muted-foreground"}, [
+            h("span", {title:view.reason}, view.mode),
+            h("button", {type:"button", class:"rounded-lg px-2 py-1 hover:bg-muted", onClick:()=>dialog.value?.showModal()}, "详情"),
+            iconButton("刷新账号可用性","lucide:refresh-cw",refresh,busy.value),
+          ]),
         ]),
-        h("div", {style:"display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-top:12px"},
-          view.states.map(item => h("div", {key:item.key, class:"rounded-lg bg-muted/40 p-3", "data-readiness-state":item.key}, [
-            h("div", {class:"text-xs text-muted-foreground"}, item.label),
-            h("div", {class:"mt-1 text-lg font-semibold tabular-nums", style:item.key === "ready" ? "color:#059669" : ""}, item.value),
-          ]))),
-        h("p", {class:"mt-3 text-sm"}, `已知有效期且满足当前额度规则：文生图候选 ${view.generation} · 图生图候选 ${view.edits}`),
-        h("p", {class:"mt-1 text-xs text-muted-foreground"}, `有 RT 可尝试恢复 ${view.renewable} · 需补充凭据 ${view.manual} · 额度未知 ${view.quotaUnknown} · 上传冷却 ${view.uploadLimited}（补充指标不互斥）`),
-        h("div", {class:"mt-3 rounded-lg border border-border p-3", "aria-label":"后台同步策略"}, [
-          h("p", {class:"text-sm font-medium"}, `后台账号维护：${view.mode} · 每批 ${view.batch} 个 · ${view.policy}`),
-          h("p", {class:"mt-1 text-xs text-muted-foreground"}, view.reason),
-          h("p", {class:"mt-1 text-xs text-muted-foreground"}, `最近决策使用的最慢实例指标：数据库 P95 ${ms(signals.database_ms)} · 写锁等待 P95 ${ms(signals.writer_wait_ms)} · 账号接口 P95 ${ms(signals.upstream_ms)} · 活跃生图 ${view.active}（仅参考）`),
-          maintenance?.sampled_at ? h("p", {class:"mt-1 text-xs text-muted-foreground"}, `调度采样：${new Date(maintenance.sampled_at * 1000).toLocaleTimeString()} · 耗时样本窗口 60 秒`) : null,
+        h("div", {style:"display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:8px"}, [
+          tile("generation","文生图候选",view.generation), tile("edits","图生图候选",view.edits),
+          tile("recovery","可尝试恢复",view.renewable), tile("manual","待补凭据",view.manual),
         ]),
-        h("p", {class:"mt-2 text-xs text-muted-foreground"}, view.note),
-        snapshot.value?.sampled_at ? h("p", {class:"mt-1 text-xs text-muted-foreground"}, `采样时间：${new Date(snapshot.value.sampled_at).toLocaleTimeString()} · ${view.stale ? "账号快照更新延迟" : "约每 15 秒刷新"}`) : null,
         error.value ? h("p", {role:"status", class:"mt-2 text-xs text-amber-600"}, error.value) : null,
+        h("dialog", {ref:dialog, "aria-label":"账号可用性详情", class:"rounded-xl border border-border bg-card text-foreground p-5",
+          style:"width:min(640px,calc(100vw - 32px));max-height:80vh;overflow:auto;margin:auto", onClick:e=>{if(e.target===dialog.value){const r=e.target.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.value.close();}}}, [
+          h("div", {class:"flex items-center justify-between"}, [h("h3",{class:"text-sm font-medium"},"账号可用性详情"),
+            iconButton("关闭可用性详情","lucide:x",()=>dialog.value?.close())]),
+          h("p", {class:"mt-2 text-xs text-muted-foreground"}, snapshot.value?.policy === "strict" ? "严格准入 · 未知或过期 AT 不参与生图" : "兼容准入 · 凭据就绪预评估"),
+          h("div", {style:"display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:16px"}, view.states.map(item=>
+            h("div", {key:item.key,"data-readiness-state":item.key,class:"text-sm flex justify-between gap-2"},[
+              h("span",{class:"text-muted-foreground"},item.label),h("span",{class:"tabular-nums"},item.value)]))),
+          h("div", {class:"mt-4 border-t border-border pt-3 text-xs text-muted-foreground", "aria-label":"后台同步策略"},[
+            h("p",{},`后台维护：${view.mode} · 每批 ${view.batch} 个 · ${view.policy}`),
+            h("p",{class:"mt-2"},view.reason),
+            h("p",{class:"mt-2"},`数据库 P95 ${ms(signals.database_ms)} · 写锁 P95 ${ms(signals.writer_wait_ms)} · 账号接口 P95 ${ms(signals.upstream_ms)}`),
+            h("p",{class:"mt-2"},`活跃生图 ${view.active}（参考值） · 额度未知 ${view.quotaUnknown} · 上传冷却 ${view.uploadLimited}`),
+            h("p",{class:"mt-2"},`本实例预热：${number(prewarm.ready)} / ${number(prewarm.target)} · 命中 ${number(prewarm.hit)} · 未命中 ${number(prewarm.miss)}`),
+            h("p",{class:"mt-2"},view.note),
+            snapshot.value?.sampled_at ? h("p",{class:"mt-2"},`采样：${new Date(snapshot.value.sampled_at).toLocaleTimeString()} · ${view.stale ? "快照更新延迟" : "约每 15 秒刷新"}`) : null,
+          ]),
+        ]),
       ]);
     };
   },

@@ -16,6 +16,7 @@ from utils.helper import ensure_ok
 
 
 INPUT_METRIC_LABELS = {
+    "page_prewarm_age_ms": "请求前预热库存年龄",
     "input_prepare_ms": "上传与预热总耗时",
     "upload_decode_ms": "输入图读取与解码",
     "upload_register_ms": "申请上传地址",

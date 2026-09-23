@@ -31,7 +31,11 @@ def test_readiness_renders_refreshes_and_does_not_break_import_or_navigation(ui,
     ui.close()
     panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
     pw.expect(panel).to_be_visible()
-    assert panel.locator("[data-readiness-state]").count() == 7
+    # Only four summary cards; diagnosis lives in a bounded native dialog.
+    assert panel.locator("[data-availability-metric]").count() == 4
+    ui.page.screenshot(path=str(ROOT / f".runtime/account-availability-compact-{width}.png"), full_page=True)
+    panel.get_by_role("button", name="详情", exact=True).click()
+    assert panel.locator("[data-readiness-state]").count() == 9
     pw.expect(panel.locator('[data-readiness-state="ready"]')).to_contain_text("8,000")
     pw.expect(panel).to_contain_text("活跃生图 300")
     pw.expect(panel).to_contain_text("正常同步")
@@ -40,9 +44,12 @@ def test_readiness_renders_refreshes_and_does_not_break_import_or_navigation(ui,
     ui.page.screenshot(path=str(ROOT / f".runtime/account-availability-{width}.png"), full_page=True)
     ui.availability["counts"]["ready"] = 0
     ui.availability["maintenance"].update(mode="paused", batch_size=0, reasons=["数据库操作耗时较高"])
+    panel.get_by_role("button", name="关闭可用性详情").click()
     panel.get_by_role("button", name="刷新账号可用性").click()
+    panel.get_by_role("button", name="详情", exact=True).click()
     pw.expect(panel).to_contain_text("数据库操作耗时较高")
     pw.expect(panel.locator('[data-readiness-state="ready"]')).to_contain_text("0")
+    panel.get_by_role("button", name="关闭可用性详情").click()
     # Same SPA instance, not reloads: the shared runtime and route bindings
     # must survive repeated transitions in either direction.
     for _ in range(2):
@@ -65,11 +72,11 @@ def test_availability_failure_keeps_last_sample_and_does_not_disable_import(ui):
     ui.open()
     ui.close()
     panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
-    pw.expect(panel).to_contain_text("8,000")
+    pw.expect(panel).to_contain_text("7,900")
     ui.availability_status = 503
     panel.get_by_role("button", name="刷新账号可用性").click()
     pw.expect(panel.get_by_role("status")).to_contain_text("不影响导入")
-    pw.expect(panel).to_contain_text("8,000")
+    pw.expect(panel).to_contain_text("7,900")
     # HTTP failure is expected; JS/module/render errors are not.
     ui.errors[:] = [error for error in ui.errors if "503" not in error]
     ui.reopen()

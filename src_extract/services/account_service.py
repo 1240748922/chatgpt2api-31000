@@ -17,6 +17,8 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from services.account_maintenance_metrics import collect_token_timings, token_phase, token_request_slot, token_write_lock
+from services.credential_coordinator import CredentialCoordinator, CredentialBusy, LeasedToken, resource
+from services.account_readiness import credential_readiness
 from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -187,6 +189,7 @@ class AccountService:
         ] | None = None,
     ):
         self.storage = storage_backend
+        self._credential_coordinator = CredentialCoordinator(storage_backend) if hasattr(storage_backend, "engine") else None
         self._proxy_reference_mutation = proxy_reference_mutation
         self._lock = Lock()
         # Serialize mutations, NOT account reads/leases. Database I/O must never
@@ -224,6 +227,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._account_snapshot_checked_at = time.monotonic()
         self._image_inflight: dict[str, int] = {}
+        self._credential_blocked: dict[str, tuple] = {}
         self._image_index = 0
         self._image_shard_count, self._image_shard_index = account_shard_settings()
         self._image_failure_refresh_lock = Lock()
@@ -913,6 +917,7 @@ class AccountService:
             return
         for token in removed_tokens:
             self._image_inflight.pop(token, None)
+            self._credential_blocked.pop(token, None)
         self._token_aliases = {
             source: target
             for source, target in self._token_aliases.items()
@@ -1942,7 +1947,31 @@ class AccountService:
             self._log_credential_event("refresh_token 已刷新 access_token", detail, defer=defer_log)
         return new_token
 
-    def _refresh_access_token_owner(
+    def _refresh_access_token_owner(self, active_token, refresh_token, account, **options):
+        if not AccountService._strict_admission():
+            return self._refresh_access_token_uncoordinated(active_token, refresh_token, account, **options)
+        coordinator = self._credential_coordinator
+        if coordinator is None:
+            raise CredentialBusy("credential_coordination_unavailable")
+        try:
+            ticket = coordinator.begin_refresh(account)
+        except CredentialBusy as exc:
+            if exc.reason in {"credential_changed", "refresh_already_exchanged"}:
+                self._refresh_accounts_snapshot_if_stale(wait_for_refresh=True, max_age_seconds=0)
+                raise RefreshCredentialsChangedError() from exc
+            raise
+        try:
+            result = self._refresh_access_token_uncoordinated(active_token, refresh_token, account, **options)
+        except BaseException as exc:
+            # Explicit OAuth rejection did not issue credentials. Ambiguous I/O
+            # or a commit failure may have rotated RT: never automatically replay.
+            safe = isinstance(exc, OAuthRefreshError) and exc.status_code in {400, 401, 403, 429}
+            coordinator.finish_refresh(ticket, "idle" if safe else "uncertain")
+            raise
+        coordinator.finish_refresh(ticket, "done")
+        return result
+
+    def _refresh_access_token_uncoordinated(
         self,
         active_token: str,
         refresh_token: str,
@@ -2029,6 +2058,8 @@ class AccountService:
             else:
                 needs_refresh = self._token_needs_refresh(active_token, force=force)
             needs_refresh = needs_refresh or account.get("last_remote_check_result") == "invalid"
+            if AccountService._strict_admission() and self._token_expires_in(active_token) is None:
+                needs_refresh = True
             refresh_backoff = not force and self._recent_token_refresh_error(account)
             refresh_token = str(account.get("refresh_token") or "").strip()
             current_generation = self._credential_generation(active_token, account)
@@ -2262,7 +2293,7 @@ class AccountService:
                 and not account.get("refresh_token_invalid_at")
                 and not self._recent_token_refresh_error(account)
                 and (token := str(account.get("access_token") or "").strip())
-                and self._token_needs_refresh(token)
+                and (self._token_needs_refresh(token) or (AccountService._strict_admission() and self._token_expires_in(token) is None))
             ),
             key=lambda token: self._jwt_exp(token),
         )
@@ -2508,6 +2539,22 @@ class AccountService:
                 max_age_seconds=self._EMPTY_POOL_SNAPSHOT_TTL_SECONDS if ready_count == 0 else None,
             )
 
+    def _credential_temporarily_blocked(self, token, account):
+        blocked = getattr(self, "_credential_blocked", {}).get(token)
+        if blocked is None:
+            return False
+        until, credentials = blocked
+        return until > time.monotonic() and credentials == self._credential_generation(token, account)
+
+    def page_prewarm_candidate(self, excluded):
+        self._refresh_accounts_snapshot_if_stale(wait_for_refresh=False, allow_full_reload=False)
+        with self._image_slot_condition:
+            return self._find_available_image_token_locked(
+                excluded, None, None, None,
+                minimum_validity_seconds=max(self._IMAGE_TOKEN_MIN_VALIDITY_SECONDS,
+                                             float(config.image_request_timeout_secs or 300) + 180),
+            )[0]
+
     def _find_available_image_token_locked(
             self,
             excluded_tokens: set[str],
@@ -2523,6 +2570,22 @@ class AccountService:
         the dispatch lock. A short key snapshot is cheap; only validate as many
         rows as needed. Exhaustion still scans all rows for accurate outcomes.
         """
+        if AccountService._strict_admission():
+            from services.page_prewarm_pool import page_prewarm_pool
+            validity = minimum_validity_seconds or self._IMAGE_TOKEN_MIN_VALIDITY_SECONDS
+            for token in page_prewarm_pool.candidates():
+                item = self._accounts.get(token)
+                if (item and token not in excluded_tokens and self._image_account_belongs_to_instance(item)
+                    and self._is_image_account_available(item)
+                    and self._account_matches_plan_type(item, plan_type)
+                    and self._account_matches_any_plan_type(item, plan_types)
+                    and self._account_matches_source_type(item, source_type)
+                    and (not requires_file_upload or not upload_blocked(item))
+                    and credential_readiness(item, validity)["state"] == "ready"
+                    and not self._image_refresh_is_inflight(token, item)
+                    and not self._credential_temporarily_blocked(token, item)
+                    and int(self._image_inflight.get(token, 0)) < max(1, int(config.image_account_concurrency or 1))):
+                    return token, 1, 1, 0
         keys = tuple(self._accounts)
         count = len(keys)
         if not count:
@@ -2559,6 +2622,12 @@ class AccountService:
                 continue
             if requires_file_upload and upload_blocked(item, now):
                 upload_limited += 1
+                continue
+            if AccountService._strict_admission() and (
+                credential_readiness(item, validity, now=now)["state"] != "ready"
+                or self._image_refresh_is_inflight(token, item)
+                or self._credential_temporarily_blocked(token, item)
+            ):
                 continue
             ready += 1
             if int(self._image_inflight.get(token, 0)) >= limit:
@@ -2661,7 +2730,22 @@ class AccountService:
             "no image account is ready for current model/status filters",
         )
 
+    @staticmethod
+    def _strict_admission():
+        return bool(env_int("CHATGPT2API_STRICT_IMAGE_CREDENTIALS", 1, 0, 1))
+
+    @staticmethod
+    def _release_shared_image_slot(access_token):
+        if isinstance(access_token, LeasedToken):
+            try:
+                access_token.release()
+            except Exception:
+                # Fail closed. A failed cleanup must not trigger regeneration or
+                # hide the image result; this exact lease expires conservatively.
+                logger.warning({"event": "credential_lease_release_deferred"})
+
     def release_image_slot(self, access_token: str) -> None:
+        self._release_shared_image_slot(access_token)
         if not access_token:
             return
         with self._image_slot_condition:
@@ -2734,6 +2818,21 @@ class AccountService:
                     minimum_validity_seconds=minimum_validity_seconds,
                 )
                 try:
+                    if AccountService._strict_admission():
+                        if self._credential_coordinator is None:
+                            raise CredentialBusy("credential_coordination_unavailable")
+                        account = self.get_account(access_token, refresh_snapshot=False)
+                        budget = max(1, (deadline_monotonic - time.monotonic()) if deadline_monotonic else
+                                     float(config.image_request_timeout_secs or 300))
+                        with token_phase("account_credential_lease_ms"):
+                            leased = self._credential_coordinator.acquire_image(
+                                account, minimum_validity=minimum_validity_seconds,
+                                duration=budget + 120, limit=max(1, int(config.image_account_concurrency or 1)),
+                                requires_upload=requires_file_upload)
+                        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                            self._release_shared_image_slot(leased)
+                            raise ImageAccountSelectionError("deadline_exceeded")
+                        return leased
                     active_token = timed(
                         "account_token_maintenance_ms", self.ensure_access_token,
                         access_token,
@@ -2748,7 +2847,7 @@ class AccountService:
                             "image request deadline exceeded during token maintenance",
                         )
                     return self._validate_image_lease(active_token, requires_file_upload=requires_file_upload)
-                except (TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
+                except (CredentialBusy, TerminalRefreshTokenError, RefreshCredentialsChangedError, OAuthRefreshError,
                         TimeoutError, StorageRevisionConflictError) as exc:
                     # A stale/expired credential must not turn a large healthy pool
                     # into a customer-visible no_available_account. Release this
@@ -2756,6 +2855,15 @@ class AccountService:
                     # obtain another candidate while the request deadline remains.
                     self.release_image_slot(access_token)
                     attempted_tokens.add(access_token)
+                    if isinstance(exc, CredentialBusy):
+                        with self._image_slot_condition:
+                            current = self._accounts.get(access_token)
+                            if current:
+                                duration = 30 if exc.reason in {"refresh_outcome_uncertain", "credential_refresh_pending"} else 1
+                                self._credential_blocked[access_token] = (
+                                    time.monotonic() + duration, self._credential_generation(access_token, current))
+                        if exc.reason == "credential_changed":
+                            self._schedule_accounts_snapshot_refresh(max_age_seconds=0)
                     if isinstance(exc, StorageRevisionConflictError):
                         logger.warning({
                             "event": "image_account_selection_retry",
@@ -5134,6 +5242,7 @@ class AccountService:
         expected_last_token_refresh_at: str | None = None,
         defer_persistence: bool = False,
     ) -> dict | None:
+        self._release_shared_image_slot(access_token)
         if not access_token:
             return None
         now = datetime.now(timezone.utc)
@@ -6192,6 +6301,12 @@ class AccountService:
                 checked_at = self._account_snapshot_checked_at
             now = time.time()
             projections = [credential_readiness(item, validity, now=now) for item in items]
+            if AccountService._strict_admission() and self._credential_coordinator is not None:
+                blocked = self._credential_coordinator.blocked_states()
+                for item, projection in zip(items, projections):
+                    if projection["state"] != "disabled" and (state := blocked.get(resource(item))):
+                        projection["state"] = state
+                        projection["has_refresh_path"] = False
             result = summarize_projections(projections, validity, now=now)
             candidates = [item for item, projection in zip(items, projections)
                           if projection["state"] == "ready" and self._is_image_account_available(item)]
@@ -6201,7 +6316,8 @@ class AccountService:
                 "quota_unknown": sum(bool(item.get("image_quota_unknown")) for item in items),
                 "upload_limited": sum(upload_blocked(item, now) for item in items),
                 "snapshot_age_seconds": max(0, int(time.monotonic() - checked_at)),
-                "note": "就绪预评估，不等于实时空闲槽位；当前仍沿用原调度策略，未知凭据严格拦截尚未启用。",
+                "policy": "strict" if AccountService._strict_admission() else "readiness_preview",
+                "note": "候选数不等于空闲槽位；实际派发还需满足模型、分片、额度及请求有效期预算。",
             })
             with self._oauth_refresh_flights_lock:
                 result["refreshing_local"] = len(self._oauth_refresh_flights)

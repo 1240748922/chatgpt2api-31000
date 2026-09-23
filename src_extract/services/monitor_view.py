@@ -301,6 +301,8 @@ BOOLEAN_FIELDS = {
 
 EVENT_FIELDS.update(TOKEN_METRIC_LABELS)
 EVENT_METRIC_PAIRS += tuple((label, key) for key, label in TOKEN_METRIC_LABELS.items())
+EVENT_FIELDS.add("page_prewarm_hit")
+INTEGER_FIELDS.add("page_prewarm_hit")
 EVENT_FIELDS.update(INPUT_METRIC_LABELS)
 EVENT_METRIC_PAIRS += tuple((label, key) for key, label in INPUT_METRIC_LABELS.items())
 EVENT_FIELDS.update(POSTPROCESS_METRIC_LABELS)
@@ -574,6 +576,7 @@ def _project_event(value: object) -> dict[str, Any]:
         for part in (
             "已切换账号" if bool(event.get("switched_account")) else "",
             account_text,
+            ("请求前预热命中" if event.get("page_prewarm_hit") else "请求前预热未命中，正常冷启动") if "page_prewarm_hit" in event else "",
             _text(event.get("public_error")) or _text(event.get("error")),
         )
         if part

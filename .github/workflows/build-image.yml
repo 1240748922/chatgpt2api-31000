@@ -2,7 +2,7 @@ name: Build and publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/ready-pool-prewarm"]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,34 @@ env:
   IMAGE_NAME: ghcr.io/1240748922/chatgpt2api-31000
 
 jobs:
+  coordination-regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: disposable-test-only
+          POSTGRES_DB: credential_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d credential_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest sqlalchemy psycopg2-binary
+      - name: Verify real PostgreSQL credential interleavings
+        env:
+          PYTHONPATH: src_extract
+          TEST_POSTGRES_URL: postgresql+psycopg2://test:disposable-test-only@localhost:5432/credential_test
+        run: python -m pytest src_extract/tests/test_credential_coordinator_postgres.py -q --tb=short
+
   build-and-publish:
+    needs: coordination-regression
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:

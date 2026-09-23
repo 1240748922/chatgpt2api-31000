@@ -46,7 +46,7 @@ def evaluate_pressure(snapshot, *, now=None):
     now = time.time() if now is None else now
     if not isinstance(snapshot, dict):
         return "paused", ["partial"]
-    cluster = snapshot.get("cluster") or {}
+    cluster = snapshot.get("maintenance_cluster") or snapshot.get("cluster") or {}
     if not isinstance(cluster, dict):
         return "paused", ["partial"]
     expected, responding = cluster.get("expected", 1), cluster.get("responding", 1)

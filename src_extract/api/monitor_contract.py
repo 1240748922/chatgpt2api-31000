@@ -198,6 +198,7 @@ class MonitorEventView(StrictMonitorModel):
     account_wait_ms: int | None = None
     account_snapshot_check_ms: int | None = None
     account_candidate_total_ms: int | None = None
+    account_credential_lease_ms: int | None = None
     account_token_maintenance_ms: int | None = None
     account_candidate_attempts: int | None = None
     account_token_lookup_ms: int | None = None
@@ -217,6 +218,8 @@ class MonitorEventView(StrictMonitorModel):
     upload_register_ms: int | None = None
     upload_put_ms: int | None = None
     upload_confirm_ms: int | None = None
+    page_prewarm_hit: int | None = None
+    page_prewarm_age_ms: int | None = None
     prewarm_overlap_ms: int | None = None
     upload_ms: int | None = None
     bootstrap_ms: int | None = None

@@ -57,6 +57,8 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         _configure_threadpool()
         credential_log_runner.start()
+        from services.page_prewarm_pool import page_prewarm_pool
+        page_prewarm_pool.start(account_service)
         singleton_background = account_shard_settings()[1] == 0
         import_service = None
         startup_maintenance_thread: Thread | None = None
@@ -120,6 +122,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             stop_event.set()
+            await run_in_threadpool(page_prewarm_pool.stop())
             if startup_maintenance_thread is not None:
                 startup_maintenance_thread.join(timeout=1)
             if import_service is not None:

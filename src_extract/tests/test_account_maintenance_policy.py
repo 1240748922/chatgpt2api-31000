@@ -230,3 +230,21 @@ def test_cluster_health_cache_is_coalesced_and_cannot_be_mutated_by_viewer(monke
     clock[0] += 3
     cluster.cluster_image_load_snapshot()
     assert len(calls) == 2
+
+
+def test_importer_pressure_is_included_without_inflating_image_counts(monkeypatch):
+    from services import cluster_monitor_service as cluster
+    monkeypatch.setenv("CHATGPT2API_MAINTENANCE_IMPORTER_URL", "http://importer:80")
+    monkeypatch.setenv("CHATGPT2API_MONITOR_CLUSTER_SECRET", "synthetic-secret")
+    monkeypatch.setattr(cluster, "account_shard_settings", lambda: (1, 0))
+    monkeypatch.setattr(cluster, "_local_image_load", lambda: {"threadpool":{"image":{"active":7,"waiting":0}}, "maintenance_health":report()})
+    monkeypatch.setattr(cluster, "_request_json", lambda *a: {"maintenance_health":report(database_pool_utilization=1)})
+    snapshot = cluster._collect_image_load_snapshot()
+    assert snapshot["cluster"] == {"expected":1,"responding":1}
+    assert snapshot["maintenance_cluster"] == {"expected":2,"responding":2}
+    assert evaluate_pressure(snapshot, now=1000)[0] == "paused"
+    def unavailable(*a):
+        raise OSError("unavailable")
+    monkeypatch.setattr(cluster, "_request_json", unavailable)
+    snapshot = cluster._collect_image_load_snapshot()
+    assert evaluate_pressure(snapshot, now=1000) == ("paused", ["partial"])

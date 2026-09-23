@@ -2586,6 +2586,7 @@ def _generate_single_image(
                 access_token=token,
                 proxy_profile=fallback_profile,
                 reserve_image_egress=fallback_profile is None,
+                use_page_prewarm=True,
                 deadline_monotonic=request.deadline_monotonic or None,
             )
             if request.trace_image_perf:

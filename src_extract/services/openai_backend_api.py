@@ -226,6 +226,8 @@ class OpenAIBackendAPI:
             proxy: str = "",
             proxy_url: str | None = None,
             deadline_monotonic: float | None = None,
+            use_page_prewarm: bool = False,
+            transferable_session: bool = False,
     ) -> None:
         """初始化后端客户端。
 
@@ -272,6 +274,7 @@ class OpenAIBackendAPI:
                 impersonate=self.fp["impersonate"],
                 verify=True,
                 curl_infos=list(HTTP_TIMING_INFOS),
+                use_thread_local_curl=not transferable_session,
             ))
         except Exception:
             if bool(getattr(self.proxy_profile, "image_egress_reserved", False)):
@@ -303,6 +306,23 @@ class OpenAIBackendAPI:
             "OAI-Client-Version": self.client_version,
             "OAI-Client-Build-Number": self.client_build_number,
         })
+        self._page_prewarmed = False
+        self._page_prewarm_metrics = {}
+        if use_page_prewarm:
+            from services.page_prewarm_pool import page_prewarm_pool
+            warm, age = page_prewarm_pool.take(self.account, self.proxy_profile)
+            self._page_prewarm_metrics = {"page_prewarm_hit": int(warm is not None), "page_prewarm_age_ms": age}
+            if warm is not None:
+                self.session.close()
+                # Transfer only immutable page/fingerprint state and the owned
+                # session, never a callback, request deadline or conversation.
+                for name in ("session", "fp", "user_agent", "device_id", "session_id",
+                             "pow_script_sources", "pow_data_build", "client_version", "client_build_number"):
+                    setattr(self, name, getattr(warm, name))
+                warm.session = None
+                warm.close()
+                self._page_prewarmed = True
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
@@ -3810,9 +3830,12 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
-        self._image_input_timings = {}
-        self._image_prewarm_pending = bool(images)
-        self._image_prewarm_done = False
+        self._image_input_timings = dict(getattr(self, "_page_prewarm_metrics", {}))
+        self._page_prewarm_metrics = {}
+        self._image_prewarm_pending = bool(images) and not getattr(self, "_page_prewarmed", False)
+        self._image_prewarm_done = getattr(self, "_page_prewarmed", False)
+        if images and self._image_prewarm_done:
+            self._page_prewarmed = False  # One claim, including edit/upload calls.
         if images:
             input_started = time.perf_counter()
             error = None
@@ -3900,6 +3923,9 @@ class OpenAIBackendAPI:
         duplicate an image job. Both attempts share a twenty-second budget and
         the caller's overall deadline; auth and rate-limit failures are final.
         """
+        if getattr(self, "_page_prewarmed", False):
+            self._page_prewarmed = False
+            return
         deadline = time.monotonic() + self._image_request_timeout(20)
         if not isinstance(getattr(self, "_image_input_timings", None), dict):
             self._image_input_timings = {}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Literal
 
@@ -50,6 +51,7 @@ def _positive_timestamp(claims: dict[str, object], name: str) -> int | None:
     return value if 0 < value < 253402300800 else None
 
 
+@lru_cache(maxsize=65536)
 def access_token_timestamps(access_token: str) -> tuple[int | None, int | None]:
     claims = decode_access_token_payload(access_token)
     return _positive_timestamp(claims, "iat"), _positive_timestamp(claims, "exp")

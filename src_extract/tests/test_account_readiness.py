@@ -32,7 +32,7 @@ def test_states_are_exclusive_and_credentials_are_never_returned():
              row(token(2100), last_remote_check_result="pending"), row(token(2200), status="异常"),
              row(token(2300), status="禁用")]
     result = summarize_readiness(items, 300, now=1000)
-    assert result["counts"] == {state: 1 for state in result["counts"]}
+    assert result["counts"] == {state: (0 if state in {"refreshing", "uncertain"} else 1) for state in result["counts"]}
     assert sum(result["counts"].values()) == result["total"] == 7
     assert result["refresh_candidates"] == 1
     assert result["needs_credentials"] == 4

@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, make_url
+from sqlalchemy import create_engine, event, make_url, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool
@@ -99,7 +99,14 @@ def initialize_application_database(database_url: str) -> Engine:
     """Create the current application schema."""
     engine = create_database_engine(database_url)
     with _schema_lock:
-        DatabaseBase.metadata.create_all(engine)
+        if engine.dialect.name == "postgresql":
+            # Eight replicas may start the additive schema migration together.
+            # Serialize only DDL; never account operations or upstream calls.
+            with engine.begin() as connection:
+                connection.execute(text("SELECT pg_advisory_xact_lock(hashtext('chatgpt2api-schema'))"))
+                DatabaseBase.metadata.create_all(connection)
+        else:
+            DatabaseBase.metadata.create_all(engine)
     return engine
 
 

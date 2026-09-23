@@ -7,6 +7,7 @@ from services.maintenance_pressure import pressure_samples
 
 
 TOKEN_METRIC_LABELS = {
+    "account_credential_lease_ms": "凭据共享租约",
     "account_token_lookup_ms": "凭据读取与锁等待",
     "account_token_slot_ms": "刷新并发槽位等待",
     "account_token_http_ms": "刷新凭据请求",

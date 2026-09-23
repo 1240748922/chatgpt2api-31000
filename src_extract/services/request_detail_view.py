@@ -21,6 +21,7 @@ _TIMELINE_STEPS = (
     ("account_wait_ms", "等待账号", "entry", "快照检查、候选取号与凭据维护总计；不与子项重复相加"),
     ("account_snapshot_check_ms", "账号快照检查", "entry", "包含在等待账号内"),
     ("account_candidate_total_ms", "候选账号取号", "entry", "筛选与槽位等待，包含在等待账号内"),
+    ("account_credential_lease_ms", "凭据共享租约", "entry", "单账号权威复核及跨实例互斥；包含在等待账号内"),
     ("account_token_maintenance_ms", "账号凭据维护", "entry", "AT 刷新、同步等待及保存，包含在等待账号内"),
     ("account_token_lookup_ms", "凭据读取与锁等待", "entry", "包含在账号凭据维护内，不重复相加"),
     ("account_token_slot_ms", "刷新并发槽位等待", "entry", "包含在账号凭据维护内，不重复相加"),

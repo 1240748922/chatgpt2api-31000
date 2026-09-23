@@ -709,7 +709,7 @@ class RealtimeMonitorService:
         compact = {
             key: value for key, value in event.items()
             if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS,
-                       "public_error", "account_failure", "switched_account"}
+                       "public_error", "account_failure", "switched_account", "page_prewarm_hit"}
             or (str(key).endswith("_ms") and _int_ms(value) > 0)
         }
         snapshot["events"].append(compact)
@@ -942,7 +942,7 @@ class RealtimeMonitorService:
                     for key, value in event.items()
                     if key in {"time", "event", "label", "index", "total", "attempt", "status"}
                     or key in CANONICAL_FAILURE_FIELDS
-                    or key in {"public_error", "account_failure", "switched_account"}
+                    or key in {"public_error", "account_failure", "switched_account", "page_prewarm_hit"}
                     or key in RAW_DIAGNOSTIC_FIELDS
                     or (str(key).endswith("_ms") and _int_ms(value) > 0)
                 }
@@ -1028,6 +1028,7 @@ class RealtimeMonitorService:
                 "download_ms",
                 *POSTPROCESS_METRIC_LABELS,
                 *INPUT_METRIC_LABELS,
+                "page_prewarm_hit",
                 *TOKEN_METRIC_LABELS,
                 "response_ms",
                 "stream_ms",

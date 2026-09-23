@@ -2,6 +2,7 @@
 export const readinessLabels = {
   ready: "凭据就绪", unknown: "有效期未知", expiring: "有效期不足", expired: "AT 已过期",
   quarantined: "鉴权待核验", invalid: "确认异常", disabled: "已禁用",
+  refreshing: "正在续期", uncertain: "续期结果待确认",
 };
 export function availabilityDisplay(value) {
   const count = x => Number.isSafeInteger(x) && x >= 0 ? x.toLocaleString() : "--";

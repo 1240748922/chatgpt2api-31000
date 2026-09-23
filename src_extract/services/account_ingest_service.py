@@ -310,6 +310,9 @@ class AccountIngestService:
     def _refresh_error(exc):
         # Never publish upstream text: it may echo a credential or proxy URL.
         from services.account_service import TerminalRefreshTokenError, OAuthRefreshError
+        from services.credential_coordinator import CredentialBusy
+        if isinstance(exc, CredentialBusy):
+            return exc.reason
         if isinstance(exc, TerminalRefreshTokenError):
             return "refresh_token_invalid"
         if isinstance(exc, OAuthRefreshError):
@@ -361,21 +364,37 @@ class AccountIngestService:
         if not pending:
             return
         workers = account_import_worker_count(len(pending))
+        # One O(pool) snapshot per RT batch, not per RT/network call. Existing
+        # RT imports must not rotate an already managed account behind its back.
+        with self.accounts._lock:
+            existing_rows = tuple(self.accounts._accounts.values())
+        existing_rt = {item["refresh_token"]: item for item in existing_rows if item.get("refresh_token")}
 
         def exchange(entry):
             began = time.monotonic()
+            ticket = None
+            coordinator = self.accounts._credential_coordinator
+            known = existing_rt.get(entry[1]["refresh_token"])
+            if known is not None:
+                return dict(known), "", 0, None
             try:
+                if self.accounts._strict_admission():
+                    ticket = coordinator.begin_refresh(entry[1], imported=True)
                 updated = self.accounts._request_access_token_refresh(entry[1]["refresh_token"], entry[1], request_slot=account_import_slot)
                 prepared = self.accounts._prepare_account_payload({**entry[1], **updated})
                 if prepared is None:
                     raise ValueError("missing access token")
-                return prepared, "", int((time.monotonic()-began)*1000)
+                return prepared, "", int((time.monotonic()-began)*1000), ticket
             except Exception as exc:
-                return None, self._refresh_error(exc), int((time.monotonic()-began)*1000)
+                if ticket:
+                    from services.account_service import OAuthRefreshError
+                    safe = isinstance(exc, OAuthRefreshError) and exc.status_code in {400, 401, 403, 429}
+                    coordinator.finish_refresh(ticket, "idle" if safe else "uncertain")
+                return None, self._refresh_error(exc), int((time.monotonic()-began)*1000), None
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="import-rt") as executor:
             for future, entry in bounded_future_results(executor, exchange, pending, max_in_flight=workers):
-                prepared, error, duration = future.result()
+                prepared, error, duration, ticket = future.result()
                 with self.transaction() as session:
                     self._owned(session, job_id, owner, "refreshing", start)
                     session.add(AccountIngestRefresh(job_id=job_id, offset=entry[0],
@@ -388,9 +407,13 @@ class AccountIngestService:
                                     "account_label": self._import_account_label(entry[1], entry[0]+1),
                                     "status": "failed" if error else "success",
                                     "stage": "refresh",
-                                    "message": error or "RT 已兑换",
+                                    "message": error or ("复用已有账号凭据" if entry[1]["refresh_token"] in existing_rt else "RT 已兑换"),
                                     "error_code": error or "",
                                 }])
+                if ticket:
+                    # Mark consumed only after the durable credential-bearing
+                    # import checkpoint exists. Crash before here stays fenced.
+                    self.accounts._credential_coordinator.finish_refresh(ticket, "done")
 
     def save_batch(self, job_id, owner, *, refresh=False):
         status = "refreshing" if refresh else "saving"

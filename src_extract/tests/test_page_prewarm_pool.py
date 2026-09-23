@@ -159,3 +159,18 @@ def test_public_page_retry_after_defers_entire_local_refill_pool():
     assert pool.status()["cooldown_seconds"] >= 895
     pool.defer_failure(SimpleNamespace(retry_after=1))
     assert pool.cooldown_until - time.monotonic() > 895
+
+
+def test_inventory_failure_preserves_cold_session(monkeypatch):
+    from services import openai_backend_api as module
+    from services.page_prewarm_pool import page_prewarm_pool
+    monkeypatch.setattr(module.account_service, "get_account", lambda *a, **kw: {"access_token":"synthetic"})
+    monkeypatch.setattr(module.proxy_settings, "get_profile", lambda *a, **kw: ProxyRuntimeProfile())
+    def failure(*a):
+        raise RuntimeError("synthetic inventory failure")
+    monkeypatch.setattr(page_prewarm_pool, "take", failure)
+    with module.OpenAIBackendAPI(access_token="synthetic") as backend:
+        session = backend.session
+        backend.adopt_page_prewarm()
+        assert backend.session is session and not backend._page_prewarmed
+        assert backend._page_prewarm_metrics["page_prewarm_hit"] == 0

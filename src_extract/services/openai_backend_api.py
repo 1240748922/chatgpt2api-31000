@@ -314,7 +314,13 @@ class OpenAIBackendAPI:
     def adopt_page_prewarm(self):
         """Call only after egress admission; recheck TTL after any queue wait."""
         from services.page_prewarm_pool import page_prewarm_pool
-        warm, age = page_prewarm_pool.take(self.account, self.proxy_profile)
+        if not getattr(self, "account", None):
+            return
+        try:
+            warm, age = page_prewarm_pool.take(self.account, self.proxy_profile)
+        except Exception:
+            # Optional inventory must never turn a healthy cold path into 500.
+            warm, age = None, 0
         self._page_prewarm_metrics = {"page_prewarm_hit": int(warm is not None), "page_prewarm_age_ms": age}
         if warm is not None:
             self.session.close()

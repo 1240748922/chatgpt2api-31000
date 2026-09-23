@@ -21,6 +21,10 @@ class _SelectionProbe:
     _account_matches_any_plan_type = AccountService._account_matches_any_plan_type
     _account_matches_source_type = AccountService._account_matches_source_type
     _token_needs_refresh = AccountService._token_needs_refresh
+    _token_expires_in = AccountService._token_expires_in
+    _image_token_needs_refresh = AccountService._image_token_needs_refresh
+    _image_refresh_is_inflight = AccountService._image_refresh_is_inflight
+    _IMAGE_TOKEN_MIN_VALIDITY_SECONDS = AccountService._IMAGE_TOKEN_MIN_VALIDITY_SECONDS
 
     def __init__(self, accounts: list[dict]) -> None:
         self._accounts = OrderedDict(
@@ -91,7 +95,7 @@ def test_rt_preference_preserves_quota_priority_and_bounds_lookahead(monkeypatch
     assert len(checks) < 100  # A large expired pool must not be fully scanned.
     probe = _SelectionProbe([_account("unknown", warm=True), rows[0]])
     monkeypatch.setattr(probe, "_token_needs_refresh", lambda token: True)
-    assert _select(probe) == "stale-0"
+    assert _select(probe) == "unknown"
 
 
 def test_unknown_quota_scan_is_bounded_oldest_first_and_skips_recent_attempts(monkeypatch):
@@ -133,6 +137,7 @@ def test_upload_cooldown_keeps_text_generation_available():
 def test_image_selection_skips_account_that_fails_token_maintenance():
     class MaintenanceProbe:
         get_available_access_token = AccountService.get_available_access_token
+        _image_token_validity_window = AccountService._image_token_validity_window
         _IMAGE_POOL_WAIT_SECONDS = 0
 
         def __init__(self):
@@ -171,6 +176,7 @@ def test_account_lookup_phase_timings_include_internal_retries_and_errors(monkey
 
     class Probe:
         get_available_access_token = AccountService.get_available_access_token
+        _image_token_validity_window = AccountService._image_token_validity_window
         _set_image_selection_diagnostics = AccountService._set_image_selection_diagnostics
         get_image_selection_diagnostics = AccountService.get_image_selection_diagnostics
 

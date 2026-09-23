@@ -91,6 +91,10 @@ def test_refresh_failure_does_not_poison_the_next_request(service_factory, monke
         raise OAuthRefreshError(503, "temporarily_unavailable", "synthetic outage")
 
     monkeypatch.setattr(service, "_request_access_token_refresh", temporary_failure)
+    # Ready credentials now win before an expired candidate. Exercise the
+    # failed recovery explicitly, then verify repeated dispatch honors backoff.
+    with pytest.raises(OAuthRefreshError):
+        service.ensure_access_token(expired, image_scope=True, raise_on_error=True)
     for _ in range(3):
         assert service.get_available_access_token() == "healthy-test"
         service.release_image_slot("healthy-test")

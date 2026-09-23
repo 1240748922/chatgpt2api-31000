@@ -38,6 +38,7 @@ from services.account_operation_events import (
     normalize_account_operation_event,
 )
 from services.config import config
+from services.credential_event_log import defer_credential_log
 from services.image_failure import ImageFailure, classify_image_exception, image_failure
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -120,6 +121,11 @@ class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+    # The 24-hour window is for background renewal, not foreground image work.
+    # Cover the whole remaining request budget plus clock/network headroom.
+    _IMAGE_TOKEN_MIN_VALIDITY_SECONDS = env_int(
+        "CHATGPT2API_IMAGE_TOKEN_MIN_VALIDITY_SECONDS", 300, 60, 86400,
+    )
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _POOL_HEALTH_REFRESH_BATCH_SIZE = 10
     _UNKNOWN_QUOTA_SYNC_BATCH_SIZE = env_int(
@@ -1432,6 +1438,30 @@ class AccountService:
         return remaining is not None and remaining <= cls._ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 
     @classmethod
+    def _image_token_validity_window(cls, deadline_monotonic: float | None = None) -> float:
+        budget = (
+            max(0.0, deadline_monotonic - time.monotonic())
+            if deadline_monotonic is not None else config.image_request_timeout_secs
+        )
+        return max(cls._IMAGE_TOKEN_MIN_VALIDITY_SECONDS, budget + 60)
+
+    def _image_token_needs_refresh(
+        self, access_token: str, minimum_validity_seconds: float, *, has_refresh_token: bool = True,
+    ) -> bool:
+        remaining = self._token_expires_in(access_token)
+        if remaining is None:
+            # Preserve support for opaque credentials and custom refresh adapters.
+            return has_refresh_token and self._token_needs_refresh(access_token)
+        return remaining <= minimum_validity_seconds
+
+    def _image_refresh_is_inflight(self, token: str, account: dict) -> bool:
+        lock = getattr(self, "_oauth_refresh_flights_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            return self._credential_generation(token, account) in self._oauth_refresh_flights
+
+    @classmethod
     def _token_issued_at(cls, access_token: str) -> datetime | None:
         issued_at = access_token_issued_at(access_token)
         if issued_at is None:
@@ -1531,6 +1561,7 @@ class AccountService:
         expected_refresh_token: str | None = None,
         expected_last_token_refresh_at: str | None = None,
         terminal: bool = False,
+        defer_log: bool = False,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._account_write():
@@ -1570,16 +1601,28 @@ class AccountService:
             ):
                 return False
         with token_phase("account_token_log_ms"):
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
+            self._log_credential_event(
                 "refresh_token 刷新 access_token 失败",
                 {
                     "source": event,
                     "token": anonymize_token(resolved),
                     "error": str(persisted.get("last_token_refresh_error") or ""),
                 },
+                defer=defer_log,
             )
         return True
+
+    @staticmethod
+    def _log_credential_event(summary: str, detail: dict, *, defer: bool) -> None:
+        try:
+            if defer:
+                defer_credential_log(log_service.add, LOG_TYPE_ACCOUNT, summary, detail)
+            else:
+                log_service.add(LOG_TYPE_ACCOUNT, summary, detail)
+        except Exception as exc:
+            # Account state has already committed. Diagnostics must not turn a
+            # success into a failure or mask a retryable recovery error.
+            logger.warning({"event": "credential_event_log_failed", "error_type": type(exc).__name__})
 
     @staticmethod
     def _credential_error_text(
@@ -1788,6 +1831,7 @@ class AccountService:
         expected_access_token: str | None = None,
         expected_refresh_token: str,
         expected_last_token_refresh_at: str | None = None,
+        defer_log: bool = False,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         expected_access_token = expected_access_token or old_access_token
@@ -1890,11 +1934,8 @@ class AccountService:
             self._image_slot_condition.notify_all()
 
         with token_phase("account_token_log_ms"):
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
-                "refresh_token 已刷新 access_token",
-                {"source": event, "token": anonymize_token(new_token), "rotated": rotated},
-            )
+            detail = {"source": event, "token": anonymize_token(new_token), "rotated": rotated}
+            self._log_credential_event("refresh_token 已刷新 access_token", detail, defer=defer_log)
         return new_token
 
     def _refresh_access_token_owner(
@@ -1939,6 +1980,7 @@ class AccountService:
                 expected_last_token_refresh_at=str(
                     account.get("last_token_refresh_at") or ""
                 ),
+                defer_log=image_scope,
             )
             if recorded:
                 raise
@@ -1953,6 +1995,7 @@ class AccountService:
             expected_last_token_refresh_at=str(
                 account.get("last_token_refresh_at") or ""
             ),
+            defer_log=image_scope,
         )
 
     def _maintain_access_token(
@@ -1966,6 +2009,7 @@ class AccountService:
         expected_credentials: _CredentialGeneration | None = None,
         skip_if_image_busy: bool = False,
         deadline_monotonic: float | None = None,
+        idle_only: bool = False,
     ) -> str:
         if not access_token:
             return ""
@@ -1974,10 +2018,13 @@ class AccountService:
             if not account:
                 raise RefreshCredentialsChangedError()
             active_token = str(account.get("access_token") or resolved_token or access_token)
-            needs_refresh = (
-                self._token_needs_refresh(active_token, force=force)
-                or account.get("last_remote_check_result") == "invalid"
-            )
+            if image_scope and not force:
+                needs_refresh = self._image_token_needs_refresh(
+                    active_token, self._image_token_validity_window(deadline_monotonic),
+                )
+            else:
+                needs_refresh = self._token_needs_refresh(active_token, force=force)
+            needs_refresh = needs_refresh or account.get("last_remote_check_result") == "invalid"
             refresh_backoff = not force and self._recent_token_refresh_error(account)
             refresh_token = str(account.get("refresh_token") or "").strip()
             current_generation = self._credential_generation(active_token, account)
@@ -1999,7 +2046,7 @@ class AccountService:
                 )
 
             key = current_generation
-            if skip_if_image_busy:
+            if skip_if_image_busy or idle_only:
                 with self._image_slot_condition:
                     current_token = self._resolve_access_token_locked(active_token)
                     current = self._accounts.get(current_token)
@@ -2011,7 +2058,7 @@ class AccountService:
                         if expected_credentials is not None or credential_attempt > 0:
                             raise RefreshCredentialsChangedError()
                         continue
-                    image_busy = int(self._image_inflight.get(current_token, 0)) > 1
+                    image_busy = int(self._image_inflight.get(current_token, 0)) > (0 if idle_only else 1)
                     with self._oauth_refresh_flights_lock:
                         future = self._oauth_refresh_flights.get(key)
                         owner = future is None
@@ -2084,6 +2131,7 @@ class AccountService:
                     expected_refresh_token=expected_refresh_token,
                     expected_last_token_refresh_at=expected_last_token_refresh_at,
                     terminal=True,
+                    defer_log=image_scope,
                 )
                 if not recorded:
                     current_token, _current_refresh, current = self._credential_snapshot(
@@ -2137,6 +2185,7 @@ class AccountService:
         expected_credentials: _CredentialGeneration | None = None,
         skip_if_image_busy: bool = False,
         deadline_monotonic: float | None = None,
+        idle_only: bool = False,
     ) -> str:
         """Return a usable AT, renewing it through RT only when needed."""
         return self._maintain_access_token(
@@ -2148,6 +2197,7 @@ class AccountService:
             expected_credentials=expected_credentials,
             skip_if_image_busy=skip_if_image_busy,
             deadline_monotonic=deadline_monotonic,
+            idle_only=idle_only,
         )
 
     def force_refresh_access_token(
@@ -2197,16 +2247,21 @@ class AccountService:
     def list_expiring_access_tokens(self) -> list[str]:
         self._refresh_accounts_snapshot_if_stale()
         with self._lock:
-            return [
-                token
-                for account in self._accounts.values()
+            accounts = list(self._accounts.values())
+        # Normalize/expiry decoding and sorting need not block image dispatch.
+        return sorted(
+            (
+                token for account in accounts
                 if account.get("status") in {"正常", "限流"}
                 and account.get("last_remote_check_result") != "pending"
                 and str(account.get("refresh_token") or "").strip()
                 and not account.get("refresh_token_invalid_at")
+                and not self._recent_token_refresh_error(account)
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
-            ]
+            ),
+            key=lambda token: self._jwt_exp(token),
+        )
 
     def list_tokens(self) -> list[str]:
         self._refresh_accounts_snapshot_if_stale()
@@ -2319,6 +2374,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline_monotonic: float | None = None,
             requires_file_upload: bool = False,
+            minimum_validity_seconds: float | None = None,
     ) -> str:
         selection_started = time.monotonic()
         selection_loops = 0
@@ -2361,6 +2417,7 @@ class AccountService:
                         source_type,
                         plan_types,
                         requires_file_upload=requires_file_upload,
+                        minimum_validity_seconds=minimum_validity_seconds,
                     )
                 )
                 diagnostics = self.get_image_selection_diagnostics()
@@ -2454,6 +2511,7 @@ class AccountService:
             source_type: str | None,
             plan_types: set[str] | tuple[str, ...] | None,
             requires_file_upload: bool = False,
+            minimum_validity_seconds: float | None = None,
     ) -> tuple[str | None, int, int, int]:
         """Round-robin with quota priority; stop at the first best candidate.
 
@@ -2470,10 +2528,15 @@ class AccountService:
         cursor = self._image_index % count
         first_available = first_warm = None
         maintenance_candidate = None
+        maintenance_rank = 3
         maintenance_offset = 0
+        validity = (
+            self._IMAGE_TOKEN_MIN_VALIDITY_SECONDS
+            if minimum_validity_seconds is None else minimum_validity_seconds
+        )
         ready = matched = limited = busy = upload_limited = 0
         for offset in range(count):
-            # Look briefly beyond a funded account needing RT maintenance.
+            # Look briefly beyond an account needing credential maintenance.
             # Do not turn a large expired pool into a full scan on every lease.
             if maintenance_candidate is not None and offset - maintenance_offset >= 64:
                 break
@@ -2497,14 +2560,25 @@ class AccountService:
             if int(self._image_inflight.get(token, 0)) >= limit:
                 busy += 1
                 continue
-            if self._is_unlimited_image_quota_account(item) or (
+            funded = self._is_unlimited_image_quota_account(item) or (
                 not item.get("image_quota_unknown") and int(item.get("quota") or 0) > 0
-            ):
-                if item.get("refresh_token") and self._token_needs_refresh(token):
-                    if maintenance_candidate is None:
-                        maintenance_candidate = (token, ordinal)
-                        maintenance_offset = offset
-                    continue
+            )
+            warm = bool(item.get("image_quota_unknown") and item.get("last_image_success_at"))
+            needs_maintenance = (
+                self._image_refresh_is_inflight(token, item)
+                or self._image_token_needs_refresh(
+                    token, validity, has_refresh_token=bool(item.get("refresh_token")),
+                )
+                or item.get("last_remote_check_result") == "invalid"
+            )
+            if needs_maintenance:
+                rank = 0 if funded else 1 if warm else 2
+                if maintenance_candidate is None:
+                    maintenance_offset = offset
+                if maintenance_candidate is None or rank < maintenance_rank:
+                    maintenance_candidate, maintenance_rank = (token, ordinal), rank
+                continue
+            if funded:
                 self._image_index = (ordinal + 1) % count
                 setter = getattr(self, "_set_image_selection_diagnostics", None)
                 if callable(setter):
@@ -2519,9 +2593,11 @@ class AccountService:
                 return token, ready, matched, limited
             if first_available is None:
                 first_available = (token, ordinal)
-            if first_warm is None and item.get("image_quota_unknown") and item.get("last_image_success_at"):
+            if first_warm is None and warm:
                 first_warm = (token, ordinal)
-        chosen = maintenance_candidate or first_warm or first_available
+        # A known quota is not worth an OAuth round trip when an immediately
+        # usable account exists. Preserve quota/warmth priority within each tier.
+        chosen = first_warm or first_available or maintenance_candidate
         if chosen:
             self._image_index = (chosen[1] + 1) % count
         setter = getattr(self, "_set_image_selection_diagnostics", None)
@@ -2612,8 +2688,8 @@ class AccountService:
         定时池健康检查和明确的账号级失败异步刷新，不能在每个图片请求的热路径
         同步执行三路账号查询，否则上游抖动会把业务并发放大成预检线程和队列。
 
-        Access Token 仅在临近过期时通过现有 single-flight 机制刷新；刷新失败或
-        请求截止时必须释放刚占用的图片槽。
+        前台仅在 AT 不足以覆盖请求预算及安全余量时通过 single-flight 刷新。
+        提前 24 小时续期由后台完成；刷新失败或截止时释放刚占用的图片槽。
         """
         phase_seconds = {
             "account_snapshot_check_ms": 0.0,
@@ -2621,6 +2697,7 @@ class AccountService:
             "account_token_maintenance_ms": 0.0,
         }
         candidate_attempts = 0
+        minimum_validity_seconds = self._image_token_validity_window(deadline_monotonic)
 
         def timed(metric, operation, *args, **kwargs):
             started = time.monotonic()
@@ -2650,6 +2727,7 @@ class AccountService:
                     plan_types=plan_types,
                     deadline_monotonic=deadline_monotonic,
                     requires_file_upload=requires_file_upload,
+                    minimum_validity_seconds=minimum_validity_seconds,
                 )
                 try:
                     active_token = timed(
@@ -5725,10 +5803,12 @@ class AccountService:
                     if force
                     else self.ensure_access_token
                 )
+                refresh_options = {"idle_only": True} if event == "renew_expiring_access_tokens" else {}
                 refreshed_token = operation(
                     active_token,
                     raise_on_error=True,
                     event=event,
+                    **refresh_options,
                 )
             except (KeyboardInterrupt, SystemExit):
                 raise

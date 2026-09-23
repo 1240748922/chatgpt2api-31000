@@ -37,6 +37,25 @@ def test_batch_yields_after_time_slice(monkeypatch):
     assert len(calls) == 1
 
 
+def test_renewal_processes_multiple_small_idle_batches(monkeypatch):
+    calls = []
+    monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
+    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (True, {}))
+    service = SimpleNamespace(renew_expiring_access_tokens=lambda tokens: calls.append(tokens))
+    assert maintenance.renew_idle_batch(service, list("abcdef"), Event()) == 6
+    assert calls == [["a", "b"], ["c", "d"], ["e", "f"]]
+
+
+def test_renewal_stops_when_load_rises_and_leaves_remaining_tokens(monkeypatch):
+    load = iter([True, False])
+    calls = []
+    monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
+    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (next(load), {}))
+    service = SimpleNamespace(renew_expiring_access_tokens=lambda tokens: calls.append(tokens))
+    assert maintenance.renew_idle_batch(service, list("abcdef"), Event()) == 2
+    assert calls == [["a", "b"]]
+
+
 def test_missing_replica_prevents_maintenance(monkeypatch):
     monkeypatch.setattr(maintenance_load, "_cluster_monitor_snapshot", lambda: {
         "cluster": {"expected": 8, "responding": 7},

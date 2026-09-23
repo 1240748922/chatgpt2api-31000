@@ -19,6 +19,7 @@ from api.support import (
 from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
+from services.credential_event_log import credential_log_runner
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.genbox_push_service import (
     shutdown_genbox_push_service,
@@ -55,6 +56,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _configure_threadpool()
+        credential_log_runner.start()
         singleton_background = account_shard_settings()[1] == 0
         import_service = None
         startup_maintenance_thread: Thread | None = None
@@ -145,6 +147,7 @@ def create_app() -> FastAPI:
                         "error": str(exc),
                     })
                 backup_service.stop()
+            await run_in_threadpool(credential_log_runner.shutdown, wait=True)
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
     app.add_middleware(

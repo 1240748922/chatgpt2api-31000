@@ -125,6 +125,9 @@ def test_save_metrics_separate_lock_commit_and_log(account_flow, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(service.storage, "mutate_accounts_checked", commit)
     monkeypatch.setattr(accounts.log_service, "add", lambda *a, **kw: clock.sleep(2))
+    # Exercise the timing boundaries with an inline diagnostic sink; production
+    # foreground success events now enqueue rather than wait for this DB write.
+    monkeypatch.setattr(accounts, "defer_credential_log", lambda write, *a: write(*a))
     token = service.get_available_access_token()
     timings = service.get_image_selection_diagnostics()
     assert timings["account_token_write_wait_ms"] == 1000

@@ -10,6 +10,15 @@ from utils.log import logger
 
 
 def sync_idle_batch(service, tokens: list[str], stop_event: Event) -> int:
+    return _run_idle_batches(service.sync_accounts_and_quota, tokens, stop_event, "quota")
+
+
+def renew_idle_batch(service, tokens: list[str], stop_event: Event) -> int:
+    """Replenish ready credentials in small batches before less urgent checks."""
+    return _run_idle_batches(service.renew_expiring_access_tokens, tokens, stop_event, "renewal")
+
+
+def _run_idle_batches(operation, tokens: list[str], stop_event: Event, kind: str) -> int:
     width = env_int("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", 2, 1, 8)
     # At most one small batch remains in flight if traffic rises during a check.
     started = time.monotonic()
@@ -21,11 +30,12 @@ def sync_idle_batch(service, tokens: list[str], stop_event: Event) -> int:
         if not allowed:
             break
         batch = tokens[offset:offset + width]
-        result = service.sync_accounts_and_quota(batch) or {}
+        result = operation(batch) or {}
         logger.info({
-            "event": "account_maintenance_quota_batch",
+            "event": f"account_maintenance_{kind}_batch",
             "attempted": len(batch),
             "synced": result.get("synced", 0),
+            "refreshed": result.get("refreshed", 0),
             "failed": len(result.get("errors") or []),
         })
         processed += len(batch)

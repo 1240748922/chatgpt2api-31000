@@ -15,7 +15,7 @@ TOKEN_METRIC_LABELS = {
     "account_token_dispatch_lock_ms": "账号状态锁等待",
     "account_token_commit_ms": "凭据数据库提交",
     "account_token_conflict_ms": "凭据冲突重读",
-    "account_token_log_ms": "凭据日志写入",
+    "account_token_log_ms": "凭据日志提交",
     "account_token_singleflight_ms": "等待同账号刷新",
 }
 _timings = ContextVar("image_token_timings", default=None)

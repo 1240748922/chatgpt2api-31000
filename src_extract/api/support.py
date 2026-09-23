@@ -10,7 +10,7 @@ from fastapi import HTTPException, Request
 
 from services.account_service import account_service
 from services.maintenance_load import maintenance_is_allowed, configured_thresholds
-from services.account_maintenance import sync_idle_batch
+from services.account_maintenance import sync_idle_batch, renew_idle_batch
 from services.account_replenishment_service import account_replenishment_service
 from services.auth_service import auth_service
 from services.config import config
@@ -87,10 +87,6 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
             try:
                 allowed, load = maintenance_is_allowed()
                 if allowed:
-                    tokens = account_service.list_unknown_quota_tokens()
-                    if tokens:
-                        checked = sync_idle_batch(account_service, tokens, stop_event)
-                        print(f"[account-watcher] unknown quota checked={checked} selected={len(tokens)}")
                     if time.monotonic() >= next_lifecycle and not (limited_pending or expiring_pending):
                         limited_pending.extend(account_service.list_limited_tokens())
                         expiring_pending.extend(account_service.list_expiring_access_tokens())
@@ -102,8 +98,18 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
                         account_service.resume_pending_auth_verifications(limit=2)
                     allowed, _ = maintenance_is_allowed()
                     if allowed and not stop_event.is_set() and expiring_pending:
-                        expiring = [expiring_pending.popleft() for _ in range(min(2, len(expiring_pending)))]
-                        account_service.renew_expiring_access_tokens(expiring)
+                        # More than two cheap renewals can complete per idle
+                        # cycle, but every small batch rechecks the load gate.
+                        expiring = list(islice(expiring_pending, 50))
+                        checked = renew_idle_batch(account_service, expiring, stop_event)
+                        for _ in range(checked):
+                            expiring_pending.popleft()
+                    allowed, _ = maintenance_is_allowed()
+                    if allowed and not stop_event.is_set():
+                        tokens = account_service.list_unknown_quota_tokens()
+                        if tokens:
+                            checked = sync_idle_batch(account_service, tokens, stop_event)
+                            print(f"[account-watcher] unknown quota checked={checked} selected={len(tokens)}")
                     limited = list(islice(limited_pending, 50))
                     checked = sync_idle_batch(account_service, limited, stop_event)
                     for _ in range(checked):

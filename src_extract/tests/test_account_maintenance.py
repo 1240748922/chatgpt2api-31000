@@ -7,11 +7,15 @@ from services import account_maintenance as maintenance
 from services import maintenance_load, cluster_monitor_service as monitor
 
 
-def test_batch_stops_before_starting_more_work_when_traffic_rises(monkeypatch):
+def decision(allowed):
+    return {"allowed": allowed, "batch_size": 2 if allowed else 0, "mode": "normal" if allowed else "paused", "reason_codes": []}
+
+
+def test_batch_stops_before_starting_more_work_when_pressure_rises(monkeypatch):
     load = iter([True, False])
     calls = []
     monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
-    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (next(load), {}))
+    monkeypatch.setattr(maintenance, "account_maintenance_decision", lambda: decision(next(load)))
     service = SimpleNamespace(sync_accounts_and_quota=lambda tokens: calls.append(tokens))
     assert maintenance.sync_idle_batch(service, list("abcdef"), Event()) == 2
     assert calls == [["a", "b"]]
@@ -31,7 +35,7 @@ def test_batch_yields_after_time_slice(monkeypatch):
         calls.append(tokens)
         elapsed[0] += 21
     monkeypatch.setattr(maintenance, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
-    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (True, {}))
+    monkeypatch.setattr(maintenance, "account_maintenance_decision", lambda: decision(True))
     monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
     assert maintenance.sync_idle_batch(SimpleNamespace(sync_accounts_and_quota=sync), list("abcd"), Event()) == 2
     assert len(calls) == 1
@@ -40,7 +44,7 @@ def test_batch_yields_after_time_slice(monkeypatch):
 def test_renewal_processes_multiple_small_idle_batches(monkeypatch):
     calls = []
     monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
-    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (True, {}))
+    monkeypatch.setattr(maintenance, "account_maintenance_decision", lambda: decision(True))
     service = SimpleNamespace(renew_expiring_access_tokens=lambda tokens: calls.append(tokens))
     assert maintenance.renew_idle_batch(service, list("abcdef"), Event()) == 6
     assert calls == [["a", "b"], ["c", "d"], ["e", "f"]]
@@ -50,7 +54,7 @@ def test_renewal_stops_when_load_rises_and_leaves_remaining_tokens(monkeypatch):
     load = iter([True, False])
     calls = []
     monkeypatch.setenv("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", "2")
-    monkeypatch.setattr(maintenance, "maintenance_is_allowed", lambda: (next(load), {}))
+    monkeypatch.setattr(maintenance, "account_maintenance_decision", lambda: decision(next(load)))
     service = SimpleNamespace(renew_expiring_access_tokens=lambda tokens: calls.append(tokens))
     assert maintenance.renew_idle_batch(service, list("abcdef"), Event()) == 2
     assert calls == [["a", "b"]]

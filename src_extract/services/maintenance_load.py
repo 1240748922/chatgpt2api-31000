@@ -87,9 +87,9 @@ def cluster_image_load() -> dict[str, Any]:
 def maintenance_is_allowed() -> tuple[bool, dict[str, Any]]:
     """Return whether non-user-facing maintenance may run now.
 
-    Every automatic maintenance task respects the image load gate. Account
-    replenishment can still be started manually through the registration tool,
-    but low inventory never bypasses this gate.
+    Registration, retention and backups retain this gate. Periodic account
+    sync/renewal uses account_maintenance_policy unless configured as idle.
+    Manual operations remain independent; low inventory never bypasses this gate.
     """
 
     load = cluster_image_load()

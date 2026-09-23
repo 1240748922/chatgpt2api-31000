@@ -25,6 +25,7 @@ from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
 from services.image_input_prewarm import input_transfer_pool, put_signed_image, snapshot_cookies, merge_upload_cookies, prepare_image_upload
+from services.maintenance_pressure import measure_account_upstream
 from services.image_failure import (
     ImageDownloadError,
     ImageFailure,
@@ -594,6 +595,7 @@ class OpenAIBackendAPI:
         })
         return default_account
 
+    @measure_account_upstream
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:

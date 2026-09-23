@@ -38,11 +38,16 @@ def decode_access_token_payload(access_token: str) -> dict[str, object]:
 
 
 def _positive_timestamp(claims: dict[str, object], name: str) -> int | None:
-    try:
-        value = int(claims.get(name) or 0)
-    except (TypeError, ValueError):
+    raw = claims.get(name)
+    if isinstance(raw, bool):
         return None
-    return value if value > 0 else None
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # JWT claims are input, not proof of validity. Keep impossible timestamps
+    # out of datetime conversions in both account views and readiness reports.
+    return value if 0 < value < 253402300800 else None
 
 
 def access_token_timestamps(access_token: str) -> tuple[int | None, int | None]:

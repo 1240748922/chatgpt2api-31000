@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from threading import Lock
 from typing import Any, Mapping
 
@@ -17,6 +18,8 @@ _INTERNAL_PATH = "/internal/monitor/realtime"
 _OPERATIONS_TTL = 1.0
 _operations_lock = Lock()
 _operations_cache: tuple[tuple[int, int, str], float, dict[str, Any]] | None = None
+_load_lock = Lock()
+_load_cache = None
 
 
 def _int(value: object) -> int:
@@ -48,8 +51,15 @@ def local_internal_snapshot(provided: str) -> dict[str, Any]:
 
 def _local_image_load() -> dict[str, Any]:
     from services.log_service import image_threadpool_snapshot
+    from services.maintenance_pressure import local_pressure_snapshot
 
-    return {"threadpool": {"image": image_threadpool_snapshot()}}
+    try:
+        health = local_pressure_snapshot()
+    except Exception:
+        # A failed diagnostic must not break the existing load counter API.
+        # The performance policy treats schema 0 as incomplete, not idle.
+        health = {"schema": 0}
+    return {"threadpool": {"image": image_threadpool_snapshot()}, "maintenance_health": health}
 
 
 def local_internal_image_load(provided: str) -> dict[str, Any]:
@@ -121,6 +131,18 @@ def cluster_operations_snapshot() -> dict[str, Any]:
 
 
 def cluster_image_load_snapshot() -> dict[str, Any]:
+    """Coalesce maintenance polling; never called on image dispatch's hot path."""
+    global _load_cache
+    key = (*account_shard_settings(), os.getenv("CHATGPT2API_MONITOR_CLUSTER_SECRET", ""))
+    with _load_lock:
+        if _load_cache is not None and _load_cache[0] == key and time.monotonic() - _load_cache[1] < 2:
+            return deepcopy(_load_cache[2])
+        snapshot = _collect_image_load_snapshot()
+        _load_cache = (key, time.monotonic(), snapshot)
+        return deepcopy(snapshot)
+
+
+def _collect_image_load_snapshot() -> dict[str, Any]:
     """Read only admission counters; no accounts, logs or history are scanned."""
     count, own_index = account_shard_settings()
     snapshots = [_local_image_load()]
@@ -142,6 +164,7 @@ def cluster_image_load_snapshot() -> dict[str, Any]:
     return {
         "cluster": {"expected": count, "responding": len(snapshots)},
         "threadpool": {"image": _pool_sum(snapshots, "image")},
+        "maintenance_health": [snapshot.get("maintenance_health") for snapshot in snapshots],
     }
 
 

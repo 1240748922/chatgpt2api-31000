@@ -51,6 +51,10 @@ class ImportUI:
         self.extra_items = 0
         self.extra_events = 0
         self.dashboard = None
+        self.accounts = []
+        self.availability = None
+        self.availability_status = 200
+        self.availability_calls = 0
         self.jobs = [dict(id="synthetic-history", status="completed", total=2,
                          processed=2, saved=2, added=2, skipped=0, synced=1,
                          sync_failed=1, done=True, created_at=1, updated_at=2)]
@@ -91,7 +95,11 @@ class ImportUI:
         elif path == "/api/dashboard":
             result = self.dashboard
         elif path == "/api/accounts":
-            result = dict(accounts=[], total=0, all_total=0, page=1, page_size=20)
+            result = dict(items=self.accounts, total=len(self.accounts), all_total=len(self.accounts), page=1, page_size=20)
+        elif path == "/api/accounts/availability":
+            self.availability_calls += 1
+            route.fulfill(json=self.availability or {}, status=self.availability_status)
+            return
         elif path == "/api/account-groups":
             result = dict(groups=[dict(id="test-group", name="测试分组", enabled=True, account_count=0)], revision="test")
         elif path == "/api/account-import-jobs":

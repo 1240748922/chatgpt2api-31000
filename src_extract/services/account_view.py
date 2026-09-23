@@ -6,6 +6,7 @@ from typing import Any, Literal
 from services.account_capabilities import upload_blocked
 
 from services.account_credentials import project_upstream_credential_availability
+from services.account_readiness import credential_readiness
 from services.proxy_management_service import project_proxy_assignment
 from utils.diagnostics import sanitize_diagnostic_text
 
@@ -103,6 +104,12 @@ def _credential_lifecycle(account: dict[str, Any]) -> dict[str, Any]:
     access = availability.access
     refresh_status = availability.refresh_status
     access_label, access_tone = _ACCESS_TOKEN_PRESENTATION[access.status]
+    # Keep the legacy policy field for compatibility; do not present an
+    # undecodable expiry as proven validity in the account management UI.
+    if access.status == "valid" and access.expires_at is None:
+        access_label, access_tone = "AT 有效期未知", "warning"
+    if _text(account.get("last_remote_check_result")).lower() == "pending":
+        access_label, access_tone = "AT 待核验", "warning"
     refresh_label, refresh_tone = _REFRESH_TOKEN_PRESENTATION[refresh_status]
     availability_label, availability_tone = _CREDENTIAL_AVAILABILITY_PRESENTATION[availability.status]
     return {
@@ -242,6 +249,12 @@ def account_row(
     unlimited_quota: bool,
     group_name: str = "",
 ) -> dict[str, Any]:
+    from services.config import config
+    from services.runtime_configuration import env_int
+    readiness = credential_readiness(account, max(
+        env_int("CHATGPT2API_IMAGE_TOKEN_MIN_VALIDITY_SECONDS", 300, 60, 86400),
+        config.image_request_timeout_secs + 60,
+    ))
     access_token = _text(account.get("access_token"))
     account_id = _text(account.get("management_id"))
     backend_category = _backend_status_category(account)
@@ -299,6 +312,7 @@ def account_row(
         "enabled_action": enabled_action,
         "enabled_action_label": "停用账号" if enabled_action == "disable" else "恢复启用",
         "available": bool(available),
+        "image_readiness": readiness,
         **credential_lifecycle,
         "quota_remaining": quota_remaining,
         "quota_unknown": quota_unknown,

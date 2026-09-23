@@ -1264,6 +1264,13 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
         return {"deleted_id": key_id}
 
+    @router.get("/api/accounts/availability")
+    async def get_account_availability(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        from services.account_maintenance_policy import account_maintenance_policy
+        result = await run_in_threadpool(account_service.readiness_summary)
+        return {**result, "maintenance": account_maintenance_policy.status()}
+
     @router.get("/api/accounts")
     async def get_accounts(
             page: int = Query(default=1, ge=1),

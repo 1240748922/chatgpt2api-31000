@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, make_url
@@ -17,6 +18,19 @@ DatabaseBase = declarative_base()
 _engines: dict[str, Engine] = {}
 _engines_lock = threading.Lock()
 _schema_lock = threading.Lock()
+
+
+def database_pool_utilization() -> float | None:
+    """Read pool counters without checking out a connection or issuing SQL."""
+    with _engines_lock:
+        engines = tuple(_engines.values())
+    ratios = []
+    for engine in engines:
+        capacity = getattr(engine, "_maintenance_pool_capacity", 0)
+        checkedout = getattr(engine.pool, "checkedout", None)
+        if capacity > 0 and callable(checkedout):
+            ratios.append(max(0, checkedout()) / capacity)
+    return max(ratios) if ratios else None
 
 
 def resolve_database_url(data_dir: Path = DEFAULT_DATA_DIR) -> str:
@@ -129,6 +143,26 @@ def _build_database_engine(database_url: str) -> Engine:
         })
 
     engine = create_engine(database_url, **kwargs)
+    engine._maintenance_pool_capacity = (
+        int(kwargs.get("pool_size", 0)) + int(kwargs.get("max_overflow", 0))
+        if backend == "postgresql" else 0
+    )
+    from services.maintenance_pressure import pressure_samples
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _sample_query_start(_connection, _cursor, _statement, _parameters, context, _many):
+        context._maintenance_started = time.perf_counter()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def _sample_query_end(_connection, _cursor, _statement, _parameters, context, _many):
+        began = getattr(context, "_maintenance_started", None)
+        if began is not None:
+            pressure_samples.observe("database_ms", (time.perf_counter() - began) * 1000)
+            pressure_samples.observe("database_error", 0)
+
+    @event.listens_for(engine, "handle_error")
+    def _sample_query_error(_context):
+        pressure_samples.observe("database_error", 1)
     if backend == "sqlite":
         busy_timeout_ms = int(
             _positive_float("SQLITE_BUSY_TIMEOUT_SECONDS", 30.0) * 1000

@@ -50,6 +50,7 @@ from services.storage.base import (
     StorageRevisionConflictError,
 )
 from services.runtime_configuration import account_shard_settings, env_int, stable_shard_index
+from services.maintenance_pressure import measure_account_upstream
 from utils.diagnostics import sanitize_diagnostic_text
 from utils.helper import anonymize_token
 
@@ -234,6 +235,8 @@ class AccountService:
         self._image_failure_refresh_pending_scopes: dict[str, str] = {}
         self._image_failure_refresh_started_at: dict[str, float] = {}
         self._image_selection_local = local()
+        self._readiness_summary_lock = Lock()
+        self._readiness_summary_cache = None
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -1682,6 +1685,7 @@ class AccountService:
             < cls._IMAGE_FAILURE_REFRESH_DEDUP_SECONDS
         )
 
+    @measure_account_upstream
     def _request_access_token_refresh(
         self,
         refresh_token: str,
@@ -6169,6 +6173,40 @@ class AccountService:
                 item["password"] = password
             items.append(item)
         return items
+
+    def readiness_summary(self) -> dict:
+        """Inventory for strict-admission rollout; not a claim about free slots.
+
+        Copy references briefly under the dispatch lock, then classify outside.
+        One cached scan per five seconds, not one full-pool scan per image call.
+        """
+        from services.account_readiness import credential_readiness, summarize_projections
+        with self._readiness_summary_lock:
+            cached = self._readiness_summary_cache
+            if cached is not None and time.monotonic() - cached[0] < 5:
+                return deepcopy(cached[1])
+            self._refresh_accounts_snapshot_if_stale(wait_for_refresh=False, allow_full_reload=False)
+            validity = self._image_token_validity_window()
+            with self._lock:
+                items = list(self._accounts.values())
+                checked_at = self._account_snapshot_checked_at
+            now = time.time()
+            projections = [credential_readiness(item, validity, now=now) for item in items]
+            result = summarize_projections(projections, validity, now=now)
+            candidates = [item for item, projection in zip(items, projections)
+                          if projection["state"] == "ready" and self._is_image_account_available(item)]
+            result.update({
+                "generation_candidates": len(candidates),
+                "edit_candidates": sum(not upload_blocked(item, now) for item in candidates),
+                "quota_unknown": sum(bool(item.get("image_quota_unknown")) for item in items),
+                "upload_limited": sum(upload_blocked(item, now) for item in items),
+                "snapshot_age_seconds": max(0, int(time.monotonic() - checked_at)),
+                "note": "就绪预评估，不等于实时空闲槽位；当前仍沿用原调度策略，未知凭据严格拦截尚未启用。",
+            })
+            with self._oauth_refresh_flights_lock:
+                result["refreshing_local"] = len(self._oauth_refresh_flights)
+            self._readiness_summary_cache = (time.monotonic(), result)
+            return deepcopy(result)
 
     def get_stats(self) -> dict:
         self._refresh_accounts_snapshot_if_stale()

@@ -9,7 +9,8 @@ from threading import Event, Thread
 from fastapi import HTTPException, Request
 
 from services.account_service import account_service
-from services.maintenance_load import maintenance_is_allowed, configured_thresholds
+from services.maintenance_load import configured_thresholds
+from services.account_maintenance_policy import account_maintenance_decision
 from services.account_maintenance import sync_idle_batch, renew_idle_batch
 from services.account_replenishment_service import account_replenishment_service
 from services.auth_service import auth_service
@@ -85,26 +86,30 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
         expiring_pending: deque[str] = deque()
         while not stop_event.is_set():
             try:
-                allowed, load = maintenance_is_allowed()
+                decision = account_maintenance_decision()
+                allowed = decision["allowed"]
                 if allowed:
                     if time.monotonic() >= next_lifecycle and not (limited_pending or expiring_pending):
                         limited_pending.extend(account_service.list_limited_tokens())
                         expiring_pending.extend(account_service.list_expiring_access_tokens())
                         next_lifecycle = time.monotonic() + config.refresh_account_interval_minute * 60
-                    # Carry unfinished work into the next idle cycle, rather
+                    # Carry unfinished work into the next maintenance cycle, rather
                     # than repeatedly checking just the first accounts.
-                    allowed, _ = maintenance_is_allowed()
+                    decision = account_maintenance_decision()
+                    allowed = decision["allowed"]
                     if allowed and not stop_event.is_set():
-                        account_service.resume_pending_auth_verifications(limit=2)
-                    allowed, _ = maintenance_is_allowed()
+                        account_service.resume_pending_auth_verifications(limit=decision["batch_size"])
+                    decision = account_maintenance_decision()
+                    allowed = decision["allowed"]
                     if allowed and not stop_event.is_set() and expiring_pending:
-                        # More than two cheap renewals can complete per idle
-                        # cycle, but every small batch rechecks the load gate.
+                        # Every small batch rechecks performance; image count
+                        # alone no longer prevents credential maintenance.
                         expiring = list(islice(expiring_pending, 50))
                         checked = renew_idle_batch(account_service, expiring, stop_event)
                         for _ in range(checked):
                             expiring_pending.popleft()
-                    allowed, _ = maintenance_is_allowed()
+                    decision = account_maintenance_decision()
+                    allowed = decision["allowed"]
                     if allowed and not stop_event.is_set():
                         tokens = account_service.list_unknown_quota_tokens()
                         if tokens:

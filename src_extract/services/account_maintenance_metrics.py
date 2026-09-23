@@ -3,6 +3,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+from services.maintenance_pressure import pressure_samples
 
 
 TOKEN_METRIC_LABELS = {
@@ -22,9 +23,14 @@ _timings = ContextVar("image_token_timings", default=None)
 
 
 def _add(metric, started):
+    elapsed = max(0.0, (time.perf_counter() - started) * 1000)
+    if metric == "account_token_writer_lock_ms":
+        pressure_samples.observe("writer_wait_ms", elapsed)
+    elif metric == "account_token_commit_ms":
+        pressure_samples.observe("database_ms", elapsed)
     timings = _timings.get()
     if timings is not None:
-        timings[metric] = timings.get(metric, 0.0) + max(0.0, (time.perf_counter() - started) * 1000)
+        timings[metric] = timings.get(metric, 0.0) + elapsed
 
 
 @contextmanager

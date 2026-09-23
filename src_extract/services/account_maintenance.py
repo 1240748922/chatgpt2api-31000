@@ -4,8 +4,7 @@ from __future__ import annotations
 import time
 from threading import Event
 
-from services.maintenance_load import maintenance_is_allowed
-from services.runtime_configuration import env_int
+from services.account_maintenance_policy import account_maintenance_decision
 from utils.log import logger
 
 
@@ -19,17 +18,17 @@ def renew_idle_batch(service, tokens: list[str], stop_event: Event) -> int:
 
 
 def _run_idle_batches(operation, tokens: list[str], stop_event: Event, kind: str) -> int:
-    width = env_int("CHATGPT2API_MAINTENANCE_BATCH_CONCURRENCY", 2, 1, 8)
-    # At most one small batch remains in flight if traffic rises during a check.
+    # At most one small batch remains in flight if pressure rises during a check.
     started = time.monotonic()
     processed = 0
-    for offset in range(0, len(tokens), width):
+    while processed < len(tokens):
         if stop_event.is_set() or time.monotonic() - started >= 20:
             break
-        allowed, _ = maintenance_is_allowed()
-        if not allowed:
+        decision = account_maintenance_decision()
+        if not decision["allowed"]:
             break
-        batch = tokens[offset:offset + width]
+        width = decision["batch_size"]
+        batch = tokens[processed:processed + width]
         result = operation(batch) or {}
         logger.info({
             "event": f"account_maintenance_{kind}_batch",
@@ -37,6 +36,10 @@ def _run_idle_batches(operation, tokens: list[str], stop_event: Event, kind: str
             "synced": result.get("synced", 0),
             "refreshed": result.get("refreshed", 0),
             "failed": len(result.get("errors") or []),
+            "maintenance_mode": decision["mode"],
+            "maintenance_reasons": decision["reason_codes"],
         })
         processed += len(batch)
+        if decision["mode"] != "normal":
+            break  # One small batch per invocation under reduced/unknown load.
     return processed

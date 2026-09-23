@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from services.account_maintenance_metrics import TOKEN_METRIC_LABELS
 from services.image_input_prewarm import INPUT_METRIC_LABELS
+from services.maintenance_pressure import pressure_samples
 
 import math
 import time
@@ -251,6 +252,8 @@ class RealtimeMonitorService:
         event = str(event or "").strip()
         if not event:
             return
+        if event == "handler_started" and "handler_queue_ms" in data:
+            pressure_samples.observe("queue_ms", data["handler_queue_ms"])
         now = time.time()
         with self._lock:
             record = self._active.get(call_id)

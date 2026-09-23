@@ -2586,7 +2586,6 @@ def _generate_single_image(
                 access_token=token,
                 proxy_profile=fallback_profile,
                 reserve_image_egress=fallback_profile is None,
-                use_page_prewarm=True,
                 deadline_monotonic=request.deadline_monotonic or None,
             )
             if request.trace_image_perf:
@@ -2615,6 +2614,10 @@ def _generate_single_image(
             egress_acquired = (
                 int(getattr(backend.proxy_profile, "image_concurrency_limit", 0) or 0) > 0
             )
+            # Context TTL must be checked AFTER a possibly slow egress queue.
+            adopt_prewarm = getattr(backend, "adopt_page_prewarm", None)
+            if callable(adopt_prewarm):
+                adopt_prewarm()
             egress_wait_ms = int((time.perf_counter() - egress_started) * 1000)
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)

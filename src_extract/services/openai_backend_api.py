@@ -309,19 +309,23 @@ class OpenAIBackendAPI:
         self._page_prewarmed = False
         self._page_prewarm_metrics = {}
         if use_page_prewarm:
-            from services.page_prewarm_pool import page_prewarm_pool
-            warm, age = page_prewarm_pool.take(self.account, self.proxy_profile)
-            self._page_prewarm_metrics = {"page_prewarm_hit": int(warm is not None), "page_prewarm_age_ms": age}
-            if warm is not None:
-                self.session.close()
-                # Transfer only immutable page/fingerprint state and the owned
-                # session, never a callback, request deadline or conversation.
-                for name in ("session", "fp", "user_agent", "device_id", "session_id",
-                             "pow_script_sources", "pow_data_build", "client_version", "client_build_number"):
-                    setattr(self, name, getattr(warm, name))
-                warm.session = None
-                warm.close()
-                self._page_prewarmed = True
+            self.adopt_page_prewarm()
+
+    def adopt_page_prewarm(self):
+        """Call only after egress admission; recheck TTL after any queue wait."""
+        from services.page_prewarm_pool import page_prewarm_pool
+        warm, age = page_prewarm_pool.take(self.account, self.proxy_profile)
+        self._page_prewarm_metrics = {"page_prewarm_hit": int(warm is not None), "page_prewarm_age_ms": age}
+        if warm is not None:
+            self.session.close()
+            # Transfer only immutable page/fingerprint state and the owned
+            # session, never a callback, request deadline or conversation.
+            for name in ("session", "fp", "user_agent", "device_id", "session_id",
+                         "pow_script_sources", "pow_data_build", "client_version", "client_build_number"):
+                setattr(self, name, getattr(warm, name))
+            warm.session = None
+            warm.close()
+            self._page_prewarmed = True
 
     def close(self) -> None:
         if getattr(self, "_closed", False):

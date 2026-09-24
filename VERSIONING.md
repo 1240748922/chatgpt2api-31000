@@ -1,15 +1,55 @@
 # 稳定版本、升级和回退
 
-## 2026-09-25 3.2.38：健康积压连续维护
+## 2026-09-25 当前发布：3.2.38
 
 - 有剩余待办且性能正常时，整轮间隔由固定等待 30 秒改为默认 2 秒；一轮内仍连续执行小批并逐批检查压力，每批并发上限不变（默认 2）。没有任务、调度减速/暂停、没有进展或调用异常时仍采用原 retry 间隔。
 - 复用未知额度未完成队列，继续执行前仅按队列 token 重校验；全池筛选和鉴权核验仍受原扫描周期限制，不增加 2 秒一次的全池扫描。
 - 新增 `CHATGPT2API_MAINTENANCE_CONTINUE_SECONDS`，Compose 默认 2；不修改真实 `.env`。设为与原 retry 相同的 30 可恢复原等待。注册/备份/保留清理、生图/超分并发、导号、凭据锁及 RT 失败退避不变。
 - 确定性同输入对照：每批 2 个、每批 3 秒，第一轮在第 21 秒完成；下一轮从旧版第 51 秒提前到第 23 秒，无重复或跳过队列。不是生产整体吞吐保证。详见 [维护节奏、配置与复验](./docs/account-maintenance-cadence.md)。
-- 本地验证：537 项 Python 测试通过（含 20 项新节奏回归），6 项 PostgreSQL 回归因无本地数据库留给 CI 实跑；4 组 Node、Compose 和差异校验通过。未使用真实账号请求上游，未更新用户服务器。
-- 发布镜像与完整回归结果在验证成功后补齐；Compose 暂保持已发布的 3.2.37，避免引用不存在的镜像。
+- 验证：537 项本地 Python 测试通过（含 20 项新节奏回归），6 项 PostgreSQL 17 回归及真实 Nginx/Docker DNS 网关回归已在 CI 通过；4 组 Node、Compose 和差异校验通过。未使用真实账号请求上游，未更新用户服务器。
+- 应用提交：`2229b06a8ea70ae4bd3db757fc072f73bb8fe660`；镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-2229b06`，同时发布 `latest`。
+- [GitHub Actions](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36029972872) 全部成功，已核实 `Build and push` 成功，Compose 默认镜像已同步锁定。
 
-## 2026-09-24 当前发布：3.2.37
+**服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-2229b06`，或移除该项使用 Compose 默认值。新增继续间隔默认 2 秒，不必另改 `.env`。**
+
+低峰暂停新请求和导入，等待在途任务结束、备份数据库/配置后执行：
+
+```bash
+git pull --ff-only &&
+grep -F 'gateway-routing: dynamic-backends-v1' nginx.conf &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+`git pull` 有冲突或网关标记缺失时，上面 `&&` 链会停止，不要强制覆盖服务器配置后跳过核验。本流程有统一切换窗口，不承诺无中断，不重建 PostgreSQL、不删除卷。应用版本应为 **3.2.38**，镜像标签为 `sha-2229b06`。
+
+此前概览 `Not Found` 尚需现网核验；不能因应用更新就视为网关已经修好。检查新网关容器实际能读到的标记及接口：
+
+```bash
+docker compose --env-file .env exec -T gateway nginx -T 2>&1 | grep 'gateway-routing:'
+docker compose --env-file .env exec -T app0 curl --max-time 10 -sS -i http://gateway/api/dashboard
+```
+
+预期看到 `dynamic-backends-v1`；不带密钥的概览探测应为 **401 而非 404**，浏览器再用已有登录态核验。新标记未生效时不要反复重建全部应用，先按 [网关诊断](./docs/gateway-routing.md)核查挂载配置。
+
+逐实例核验镜像 revision：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+应全部为 `2229b06a8ea70ae4bd3db757fc072f73bb8fe660`。健康积压下观察累计维护处理次数是否连续增加；单个 RT 失效不能通过本更新恢复。回退镜像为 `sha-9760705`（3.2.37），同样排空后切换。部署锁定提交标记 `[skip ci]`，不生成新的应用镜像 SHA。
+
+---
+
+## 2026-09-24 上一版：3.2.37
 
 - 新增后台 AT 续期/额度同步的实际处理中数量、当前批次和累计成功/失败/跳过次数；与“每批最多”明确区分。进程重启归零，同一账号可能重复计数。
 - 可用性摘要改为平铺指标，详情拆为同步进度、凭据与额度、处理规则三个页签；统一字体/图标、固定关闭区域，适配手机和深色。

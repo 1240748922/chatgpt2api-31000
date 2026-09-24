@@ -1,6 +1,42 @@
 # 稳定版本、升级和回退
 
-## 2026-09-24 当前发布：3.2.32
+## 2026-09-24 当前发布：3.2.33
+
+- 应用提交：`6f5cb89bee1ff0be5365510bffe6e01684d8cbb2`。
+- 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-6f5cb89`，同时发布到 `latest`。
+- [GitHub Actions：PostgreSQL 回归及镜像发布](https://github.com/1240748922/chatgpt2api-31000/actions/runs/35959838872)已成功，已核实 `Build and push` 步骤成功。
+- 概览中心、账号管理的可用性卡片增加文生图/图生图“就绪额度”；只汇总满足准入条件账号的已知额度，未知额度、无限额套餐单列，图生图排除上传冷却。两种额度有重叠，不能相加。
+- 仅增加只读缓存统计与显示；账号派发、导号加速、后台维护、预热、生图/超分并发和代理配置不变，无新配置项或数据库迁移。详细口径见 [就绪额度说明](./docs/ready-account-quota.md)。
+- 验证：466 项本地 Python 测试通过（含实际静态模块 Chromium 回归），本地跳过的 4 项 PostgreSQL 测试已在 GitHub PostgreSQL 17 中通过；4 组 Node 检查、Compose 配置校验通过。未直接更新服务器，未用真实账号做生图压测。
+
+**如服务器 `.env` 固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-6f5cb89`，或移除该项跟随 Compose 默认值。`git pull` 不会修改 `.env`。**
+
+在低峰暂停新请求和导入、等待在途任务结束并备份数据库/配置后执行：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+此流程有统一切换窗口，不是无中断滚动升级；不删除卷、不重建 PostgreSQL。尤其从 3.2.31 或更早版本升级时，不要让未实现共享刷新保护的旧进程混跑。恢复后 `/version` 应为 **3.2.33**，浏览器 Ctrl+F5 刷新，在“账号可用性”的前两张卡片下方查看“就绪额度”。
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+所有实例输出应为 `6f5cb89bee1ff0be5365510bffe6e01684d8cbb2`。回退镜像为 `sha-074f2c8`（3.2.32），同样在排空后统一重建 app/importer。本次部署文件提交只锁定已经发布的应用镜像，使用 `[skip ci]`，没有另一个应用镜像标签。
+
+---
+
+## 2026-09-24 上一版：3.2.32
 
 - 应用提交：`074f2c8cefdd0dda3bdbdd1072b699ba5f95f120`。
 - 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-074f2c8`，也发布到 `latest`。

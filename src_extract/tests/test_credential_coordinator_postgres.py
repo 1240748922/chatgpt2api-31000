@@ -11,6 +11,7 @@ from sqlalchemy import text, make_url
 
 from services.credential_coordinator import CredentialCoordinator, CredentialBusy, CredentialGate
 from services.storage.database_storage import DatabaseStorageBackend
+from services.storage.base import StorageMutation, StorageRevisionConflictError
 
 
 @pytest.fixture
@@ -86,4 +87,39 @@ def test_postgres_exact_release_and_authoritative_generation(pair):
     a.storage.replace_accounts([{**account, "refresh_token": "new-rt"}])
     with pytest.raises(CredentialBusy, match="credential_changed"):
         b.acquire_image(account, minimum_validity=300, duration=400, limit=2)
+
+
+def test_postgres_result_batch_cas_is_atomic_on_one_conflicted_row(pair):
+    a, b, _ = pair
+    baseline = [{"access_token": f"batch-{i}", "quota": 8, "success": 0} for i in range(32)]
+    a.storage.replace_accounts(baseline)
+    b.storage.upsert_account({**baseline[-1], "quota": 4})
+    mutation = StorageMutation(upserts=tuple({**r, "quota": 7, "success": 1} for r in baseline))
+    with pytest.raises(StorageRevisionConflictError):
+        a.storage.mutate_accounts_checked(mutation, expected_items={r["access_token"]: r for r in baseline})
+    saved = {r["access_token"]: r for r in b.storage.load_accounts()}
+    assert saved["batch-31"]["quota"] == 4
+    assert saved["batch-0"]["quota"] == 8
+    assert all(r["success"] == 0 for r in saved.values())
+
+
+def test_postgres_disjoint_result_batches_do_not_conflict_on_collection_revision(pair):
+    a, b, _ = pair
+    baseline = [{"access_token": f"batch-{i}", "quota": 8, "success": 0} for i in range(64)]
+    receipt = a.storage.replace_accounts(baseline)
+    barrier = Barrier(2)
+
+    def commit(storage, rows):
+        barrier.wait()
+        return storage.mutate_accounts_checked(
+            StorageMutation(upserts=tuple({**r, "quota": 7, "success": 1} for r in rows),
+                            expected_revision=receipt.revision),
+            expected_items={r["access_token"]: r for r in rows})
+
+    with ThreadPoolExecutor(2) as pool:
+        left = pool.submit(commit, a.storage, baseline[:32])
+        right = pool.submit(commit, b.storage, baseline[32:])
+        assert left.result(timeout=10).updated == 32
+        assert right.result(timeout=10).updated == 32
+    assert all(r["quota"] == 7 and r["success"] == 1 for r in a.storage.load_accounts())
 

@@ -85,6 +85,31 @@ def test_pause_has_recovery_hold_and_then_resumes():
     assert policy.decide(load(), now=1010, monotonic=111)["allowed"]
 
 
+def test_reported_writer_contention_pauses_then_recovers_without_relaxing_thresholds():
+    samples = PressureSamples(window_seconds=60)
+    for _ in range(10):
+        samples.observe("writer_wait_ms", 3738, now=100)
+        samples.observe("database_ms", 143, now=100)
+        samples.observe("upstream_ms", 2932, now=100)
+    policy = AccountMaintenancePolicy()
+
+    def decide(at):
+        reports = [report(sampled_at=900 + at, samples=samples.snapshot(now=at))]
+        snapshot = {"cluster": {"expected": 1, "responding": 1},
+                    "maintenance_health": reports,
+                    "threadpool": {"image": {"active": 131}}}
+        return policy.decide(snapshot, now=900 + at, monotonic=at)
+
+    first = decide(100)
+    assert first["batch_size"] == 0 and first["reason_codes"] == ["writer_wait_ms"]
+    assert decide(150)["mode"] == "paused"
+    for _ in range(10):
+        samples.observe("writer_wait_ms", 20, now=161)
+        samples.observe("database_ms", 143, now=161)
+    assert decide(161)["mode"] == "normal"
+    assert decide(161)["batch_size"] == 2  # Healthy 131 active images are not a pause condition.
+
+
 def test_samples_are_bounded_expire_and_reject_invalid_values():
     samples = PressureSamples(window_seconds=60, capacity=4)
     for i in range(10): samples.observe("database_ms",i,now=100)

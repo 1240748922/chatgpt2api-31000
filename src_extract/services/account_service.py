@@ -159,6 +159,7 @@ class AccountService:
     # revision. A short jittered retry prevents simultaneous image completions
     # from exhausting the conflict budget and dropping quota/state updates.
     _STORAGE_MUTATION_MAX_ATTEMPTS = 12
+    _IMAGE_RESULT_PERSIST_BATCH_SIZE = 32
     _ACCOUNT_SNAPSHOT_TTL_SECONDS = 5.0
     _EMPTY_POOL_SNAPSHOT_TTL_SECONDS = 0.5
     _GIT_ACCOUNT_SNAPSHOT_TTL_SECONDS = 60.0
@@ -949,14 +950,19 @@ class AccountService:
             )
 
     @token_phase("account_token_conflict_ms")
-    def _load_credential_conflict(self, keys, expected_generation):
+    def _load_credential_conflict(self, keys, expected_generation, *, scoped_write=False, baseline_keys=()):
         subset_loader = getattr(self.storage, "load_accounts_subset_snapshot", None)
-        scoped = expected_generation is not None and callable(subset_loader)
+        scoped = (scoped_write or expected_generation is not None) and callable(subset_loader)
         if scoped:
             snapshot = subset_loader(tuple(keys))
-            # A missing source may have rotated to an unknown key on another
-            # replica. Retain full identity reconciliation for that rare case.
-            scoped = any(row.get("access_token") == expected_generation[0] for row in snapshot.items)
+            present = {row.get("access_token") for row in snapshot.items}
+            required = set(baseline_keys)
+            if expected_generation is not None:
+                required.add(expected_generation[0])
+            # Ordinary quota/result conflicts need only the affected rows.
+            # A missing old key may instead be a remote rotation (including
+            # during deletion); keep full identity reconciliation in that case.
+            scoped = required <= present
         if not scoped:
             snapshot = self.storage.load_accounts_snapshot()
         raw = {str(row["access_token"]): row for row in snapshot.items if row.get("access_token")}
@@ -1027,7 +1033,8 @@ class AccountService:
                     # Read/normalize/merge in the writer, never under the lock
                     # needed by account selection, metadata reads and completion.
                     snapshot, raw, remote, scoped = self._load_credential_conflict(
-                        keys, expected_credential_generation if callable(checked) else None)
+                        keys, expected_credential_generation if callable(checked) else None,
+                        scoped_write=callable(checked), baseline_keys=keys & persisted.keys())
                     if conflict_existing_tokens is not None:
                         conflict_existing_tokens.update(key for key in keys if key not in persisted and key in remote)
                     if expected_credential_generation is not None:
@@ -5391,19 +5398,28 @@ class AccountService:
                 pending = dict(self._image_result_persist_pending)
                 self._image_result_persist_pending.clear()
             failed = {}
-            for token in pending:
+            tokens = list(pending)
+            batch_size = self._IMAGE_RESULT_PERSIST_BATCH_SIZE
+            for offset in range(0, len(tokens), batch_size):
+                batch = tokens[offset:offset + batch_size]
                 try:
                     with self._account_write():
                         # Always commit the latest live row. A queued older row
                         # must not resurrect a deleted/rotated account or undo a
                         # newer quota/auth update by another replica.
-                        active = self._resolve_access_token_locked(token)
-                        if active not in self._accounts:
-                            continue
-                        self._save_accounts(account_tokens={active})
+                        active = {self._resolve_access_token_locked(token) for token in batch}
+                        active.intersection_update(self._accounts)
+                        if active:
+                            # One checked transaction per bounded burst, not
+                            # one revision-row lock/commit per finished image.
+                            self._save_accounts(account_tokens=active)
                 except Exception:
-                    failed[token] = pending[token]
+                    failed.update((token, pending[token]) for token in batch)
                     logger.exception("image account persistence failed")
+                # Give waiting credential writers a scheduling opportunity;
+                # never drain an unbounded burst while holding the writer lock.
+                if offset + batch_size < len(tokens):
+                    time.sleep(0)
             if failed:
                 with self._image_result_persist_lock:
                     for token, row in failed.items():

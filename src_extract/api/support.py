@@ -12,6 +12,7 @@ from services.account_service import account_service
 from services.maintenance_load import configured_thresholds
 from services.account_maintenance_policy import account_maintenance_decision
 from services.account_maintenance import sync_idle_batch, renew_idle_batch
+from services.account_maintenance_progress import account_maintenance_progress
 from services.account_replenishment_service import account_replenishment_service
 from services.auth_service import auth_service
 from services.config import config
@@ -81,10 +82,18 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
+        account_maintenance_progress.started()
+        try:
+            worker_body()
+        finally:
+            account_maintenance_progress.stopped()
+
+    def worker_body() -> None:
         next_lifecycle = 0.0
         limited_pending: deque[str] = deque()
         expiring_pending: deque[str] = deque()
         while not stop_event.is_set():
+            account_maintenance_progress.checking()
             try:
                 decision = account_maintenance_decision()
                 allowed = decision["allowed"]
@@ -122,7 +131,9 @@ def start_account_lifecycle_watcher(stop_event: Event) -> Thread:
             except Exception as exc:
                 print(f"[account-watcher] fail {exc}")
             # A traffic spike must not postpone another check for 30 minutes.
-            stop_event.wait(configured_thresholds()[2])
+            interval = configured_thresholds()[2]
+            account_maintenance_progress.waiting(interval)
+            stop_event.wait(interval)
 
     thread = Thread(target=worker, name="account-lifecycle-watcher", daemon=True)
     thread.start()

@@ -5,6 +5,7 @@ import time
 from threading import Event
 
 from services.account_maintenance_policy import account_maintenance_decision
+from services.account_maintenance_progress import account_maintenance_progress
 from utils.log import logger
 
 
@@ -29,7 +30,9 @@ def _run_idle_batches(operation, tokens: list[str], stop_event: Event, kind: str
             break
         width = decision["batch_size"]
         batch = tokens[processed:processed + width]
-        result = operation(batch) or {}
+        with account_maintenance_progress.batch(kind, len(batch)) as progress:
+            result = operation(batch) or {}
+            progress.reconcile(result)
         logger.info({
             "event": f"account_maintenance_{kind}_batch",
             "attempted": len(batch),

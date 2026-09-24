@@ -19,6 +19,7 @@ from uuid import uuid4
 from services.account_maintenance_metrics import collect_token_timings, token_phase, token_request_slot, token_write_lock
 from services.credential_coordinator import CredentialCoordinator, CredentialBusy, LeasedToken, resource
 from services.account_readiness import credential_readiness
+from services.account_maintenance_progress import current_maintenance_batch
 from services.account_capabilities import upload_blocked, record_upload_throttle
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -5927,7 +5928,9 @@ class AccountService:
         refreshed_ids: list[str] = []
         errors = list(initial_errors)
 
-        def exchange(
+        maintenance_batch = current_maintenance_batch()
+
+        def exchange_impl(
             token: str,
             account_id: str,
         ) -> tuple[str, dict | None, bool, dict[str, Any] | None]:
@@ -5990,6 +5993,14 @@ class AccountService:
                 or (after_refresh_at and after_refresh_at != before_refresh_at)
             )
             return refreshed_token, result_account, exchanged, None
+
+        def exchange(token, account_id):
+            if maintenance_batch is None:
+                return exchange_impl(token, account_id)
+            return maintenance_batch.call(
+                lambda: exchange_impl(token, account_id),
+                lambda result: "failed" if result[3] else "succeeded" if result[2] else "skipped",
+            )
 
         max_workers = account_processing_worker_count(len(targets))
         executor = ThreadPoolExecutor(max_workers=max_workers) if max_workers else None
@@ -6111,14 +6122,22 @@ class AccountService:
             self.init_refresh_progress(progress_id, len(access_tokens))
 
         executor = ThreadPoolExecutor(max_workers=max_workers)
+        maintenance_batch = current_maintenance_batch()
         try:
-            def sync_one(token: object) -> dict[str, Any] | None:
+            def sync_impl(token: object) -> dict[str, Any] | None:
                 return self.fetch_remote_info(
                     token,
                     "sync_accounts_and_quota",
                     remove_invalid,
                     preflight_refresh=False,
                     request_slot=account_quota_sync_slot,
+                )
+
+            def sync_one(token):
+                if maintenance_batch is None:
+                    return sync_impl(token)
+                return maintenance_batch.call(
+                    lambda: sync_impl(token), lambda result: "succeeded" if result is not None else "failed",
                 )
 
             for future, item in bounded_future_results(

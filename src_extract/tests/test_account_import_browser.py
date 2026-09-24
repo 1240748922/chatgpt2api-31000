@@ -55,6 +55,8 @@ class ImportUI:
         self.availability = None
         self.availability_status = 200
         self.availability_calls = 0
+        self.maintenance_calls = 0
+        self.maintenance_status = 200
         self.jobs = [dict(id="synthetic-history", status="completed", total=2,
                          processed=2, saved=2, added=2, skipped=0, synced=1,
                          sync_failed=1, done=True, created_at=1, updated_at=2)]
@@ -99,6 +101,12 @@ class ImportUI:
         elif path == "/api/accounts/availability":
             self.availability_calls += 1
             route.fulfill(json=self.availability or {}, status=self.availability_status)
+            return
+        elif path == "/api/accounts/maintenance-status":
+            self.maintenance_calls += 1
+            result = {key: value for key, value in (self.availability or {}).items()
+                      if key in {"maintenance", "maintenance_progress", "cleanup_policy"}}
+            route.fulfill(json=result, status=self.maintenance_status)
             return
         elif path == "/api/account-groups":
             result = dict(groups=[dict(id="test-group", name="测试分组", enabled=True, account_count=0)], revision="test")

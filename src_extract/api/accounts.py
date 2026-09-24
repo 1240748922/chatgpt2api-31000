@@ -1264,13 +1264,30 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
         return {"deleted_id": key_id}
 
+    def maintenance_view():
+        from services.account_maintenance_policy import account_maintenance_policy
+        from services.account_maintenance_progress import account_maintenance_progress
+        from services.runtime_configuration import account_shard_settings
+        _count, index = account_shard_settings()
+        return {
+            "maintenance": account_maintenance_policy.status(),
+            "maintenance_progress": account_maintenance_progress.snapshot(owner=index == 0, instance=f"app{index}"),
+            "cleanup_policy": {"auto_remove_invalid_accounts": config.auto_remove_invalid_accounts,
+                               "renewal_failure_auto_delete": False},
+        }
+
+    @router.get("/api/accounts/maintenance-status")
+    async def get_maintenance_status(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        # Polling an open detail panel must not rescan a large account pool.
+        return maintenance_view()
+
     @router.get("/api/accounts/availability")
     async def get_account_availability(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        from services.account_maintenance_policy import account_maintenance_policy
         result = await run_in_threadpool(account_service.readiness_summary)
         from services.page_prewarm_pool import page_prewarm_pool
-        return {**result, "maintenance": account_maintenance_policy.status(), "prewarm": page_prewarm_pool.status()}
+        return {**result, **maintenance_view(), "prewarm": page_prewarm_pool.status()}
 
     @router.get("/api/accounts")
     async def get_accounts(

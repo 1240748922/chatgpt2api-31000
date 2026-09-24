@@ -1,6 +1,6 @@
 import {d as defineComponent, b as h, r as ref, s as onMounted, x as onUnmounted, m as api, O as Icon}
-  from "./index-BhEm-7EJ.js?v=20260924-ready-prewarm-v14";
-import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260924-readiness-v2";
+  from "./index-BhEm-7EJ.js?v=20260924-ready-quota-v15";
+import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260924-readiness-v3";
 
 export default defineComponent({
   name:"AccountAvailability",
@@ -26,9 +26,16 @@ export default defineComponent({
       const view = availabilityDisplay(snapshot.value), maintenance = snapshot.value?.maintenance;
       const signals = maintenance?.signals || {}, prewarm = snapshot.value?.prewarm || {};
       const ms = x => typeof x === "number" && Number.isFinite(x) ? `${Math.round(x)}ms` : "--";
-      const tile = (key, label, value) => h("div", {key, class:"rounded-lg bg-muted/40 p-3", "data-availability-metric":key}, [
+      const tile = (key, label, value, quota) => h("div", {key, class:"rounded-lg bg-muted/40 p-3", "data-availability-metric":key, style:"min-width:0;overflow-wrap:anywhere"}, [
         h("div", {class:"text-xs text-muted-foreground"}, label),
         h("div", {class:"mt-1 text-xl font-semibold tabular-nums text-foreground"}, value),
+        quota ? h("div", {class:"mt-1 text-xs text-muted-foreground tabular-nums", "data-ready-quota":key,
+          title:`${view.quotaNote} 额度未知 ${quota.unknown} 个；无限额套餐 ${quota.unlimited} 个。`},
+          `就绪额度 ${quota.known}${quota.separate ? " *" : ""}`) : null,
+      ]);
+      const quotaDetail = (key, label, quota) => h("div", {"data-ready-quota-detail":key, class:"mt-2"}, [
+        h("p",{},`${label}：已知额度 ${quota.known}（${quota.accounts} 个账号）`),
+        h("p",{class:"mt-1 text-muted-foreground"},`未计入数字：额度未知 ${quota.unknown} 个 · 无限额套餐 ${quota.unlimited} 个`),
       ]);
       return h("section", {"aria-label":"账号可用性", class:"rounded-xl border border-border bg-card p-4", style:"min-width:0;margin:12px 0"}, [
         h("div", {class:"flex flex-wrap items-center justify-between gap-2"}, [
@@ -39,8 +46,8 @@ export default defineComponent({
             iconButton("刷新账号可用性","lucide:refresh-cw",refresh,busy.value),
           ]),
         ]),
-        h("div", {style:"display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:8px"}, [
-          tile("generation","文生图候选",view.generation), tile("edits","图生图候选",view.edits),
+        h("div", {style:"display:grid;grid-template-columns:repeat(auto-fit,minmax(min(130px,100%),1fr));gap:8px;margin-top:8px"}, [
+          tile("generation","文生图候选",view.generation,view.generationQuota), tile("edits","图生图候选",view.edits,view.editQuota),
           tile("recovery","可尝试恢复",view.renewable), tile("manual","待补凭据",view.manual),
         ]),
         error.value ? h("p", {role:"status", class:"mt-2 text-xs text-amber-600"}, error.value) : null,
@@ -52,6 +59,11 @@ export default defineComponent({
           h("div", {style:"display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:16px"}, view.states.map(item=>
             h("div", {key:item.key,"data-readiness-state":item.key,class:"text-sm flex justify-between gap-2"},[
               h("span",{class:"text-muted-foreground"},item.label),h("span",{class:"tabular-nums"},item.value)]))),
+          h("div", {class:"mt-4 border-t border-border pt-3 text-xs", "aria-label":"就绪额度详情"},[
+            h("h4",{class:"font-medium"},"就绪额度"),
+            quotaDetail("generation","文生图",view.generationQuota), quotaDetail("edits","图生图",view.editQuota),
+            h("p",{class:"mt-2 text-muted-foreground"},view.quotaNote),
+          ]),
           h("div", {class:"mt-4 border-t border-border pt-3 text-xs text-muted-foreground", "aria-label":"后台同步策略"},[
             h("p",{},`后台维护：${view.mode} · 每批 ${view.batch} 个 · ${view.policy}`),
             h("p",{class:"mt-2"},view.reason),

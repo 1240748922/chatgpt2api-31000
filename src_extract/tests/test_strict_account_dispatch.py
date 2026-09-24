@@ -232,6 +232,23 @@ def test_uncertain_refresh_is_visible_not_reported_as_available(service_factory)
     assert summary["needs_credentials"] == 1
 
 
+@pytest.mark.parametrize("state", ["refreshing", "uncertain"])
+def test_ready_quota_excludes_shared_refresh_gate_on_another_instance(service_factory, state):
+    blocked, ready = jwt(7200), jwt(7201)
+    first = service_factory([row(blocked, quota=999, refresh_token="private-rt"), row(ready, quota=7)])
+    second = service_factory(url=first.storage.database_url)
+    ticket = first._credential_coordinator.begin_refresh(first._accounts[blocked])
+    if state == "uncertain":
+        first._credential_coordinator.finish_refresh(ticket, "uncertain")
+    summary = second.readiness_summary()
+    assert summary["counts"][state] == 1
+    assert summary["generation_candidates"] == summary["edit_candidates"] == 1
+    assert summary["generation_quota"] == summary["edit_quota"] == dict(
+        known_remaining=7, known_accounts=1, unknown_accounts=0, unlimited_accounts=0)
+    if state == "refreshing":
+        first._credential_coordinator.finish_refresh(ticket, "idle")
+
+
 from test_account_ingest import ingest
 
 

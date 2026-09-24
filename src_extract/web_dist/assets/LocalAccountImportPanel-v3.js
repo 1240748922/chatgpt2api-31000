@@ -1,9 +1,9 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, b as createVNode, l as Button, O as Icon, a5 as Checkbox, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260924-ready-prewarm-v14";
-import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel, importHistoryLimit, importEventLimit} from "./accountImportRuntime-v3.js?v=20260924-ready-prewarm-v14";
-import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260924-ready-prewarm-v14";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260924-ready-quota-v15";
+import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel, importHistoryLimit, importEventLimit} from "./accountImportRuntime-v3.js?v=20260924-ready-quota-v15";
+import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260924-ready-quota-v15";
 
 // The bundle's `a` export is createBaseVNode, a compiler-only helper: it
 // does not normalize classes or a single VNode child. Use public createVNode

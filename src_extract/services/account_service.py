@@ -6283,6 +6283,23 @@ class AccountService:
             items.append(item)
         return items
 
+    @classmethod
+    def _summarize_candidate_quota(cls, candidates: list[dict]) -> dict:
+        """Known quota in a ready pool, not free slots or a remote balance check."""
+        result = {"known_remaining": 0, "known_accounts": 0, "unknown_accounts": 0, "unlimited_accounts": 0}
+        for item in candidates:
+            quota = max(0, int(item.get("quota") or 0))
+            if cls._is_unlimited_image_quota_account(item):
+                result["unlimited_accounts"] += 1
+            elif item.get("image_quota_unknown") or quota <= 0:
+                # A stale positive value is not known capacity; local zero is
+                # also unconfirmed until the upstream marks the account limited.
+                result["unknown_accounts"] += 1
+            else:
+                result["known_remaining"] += quota
+                result["known_accounts"] += 1
+        return result
+
     def readiness_summary(self) -> dict:
         """Inventory for strict-admission rollout; not a claim about free slots.
 
@@ -6310,9 +6327,13 @@ class AccountService:
             result = summarize_projections(projections, validity, now=now)
             candidates = [item for item, projection in zip(items, projections)
                           if projection["state"] == "ready" and self._is_image_account_available(item)]
+            edit_candidates = [item for item in candidates if not upload_blocked(item, now)]
             result.update({
                 "generation_candidates": len(candidates),
-                "edit_candidates": sum(not upload_blocked(item, now) for item in candidates),
+                "edit_candidates": len(edit_candidates),
+                "generation_quota": self._summarize_candidate_quota(candidates),
+                "edit_quota": self._summarize_candidate_quota(edit_candidates),
+                "quota_note": "就绪额度只合计通过凭据准入且未禁用、未限流账号的已知剩余额度；图生图另排除上传冷却。未知额度、无限额套餐单列，两种额度有重叠，不能相加。基于最近账号快照，不是上游实时余额、空闲并发或成功次数保证。",
                 "quota_unknown": sum(bool(item.get("image_quota_unknown")) for item in items),
                 "upload_limited": sum(upload_blocked(item, now) for item in items),
                 "snapshot_age_seconds": max(0, int(time.monotonic() - checked_at)),

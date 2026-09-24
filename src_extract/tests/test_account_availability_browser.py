@@ -11,6 +11,8 @@ def inventory():
     return dict(
         counts=dict(ready=8000, unknown=400, expiring=20, expired=30, quarantined=5, invalid=2, disabled=1),
         generation_candidates=7900, edit_candidates=7800, refresh_candidates=420, needs_credentials=37,
+        generation_quota=dict(known_remaining=24000, known_accounts=7817, unknown_accounts=80, unlimited_accounts=3),
+        edit_quota=dict(known_remaining=23000, known_accounts=7718, unknown_accounts=80, unlimited_accounts=2),
         quota_unknown=80, upload_limited=100, snapshot_age_seconds=0,
         sampled_at="2026-09-24T00:00:00+00:00", note="就绪预评估，不等于实时空闲槽位。",
         maintenance=dict(mode="normal", policy="performance", batch_size=2, active_images=300,
@@ -33,12 +35,16 @@ def test_readiness_renders_refreshes_and_does_not_break_import_or_navigation(ui,
     pw.expect(panel).to_be_visible()
     # Only four summary cards; diagnosis lives in a bounded native dialog.
     assert panel.locator("[data-availability-metric]").count() == 4
+    pw.expect(panel.locator('[data-ready-quota="generation"]')).to_have_text("就绪额度 24,000 *")
+    pw.expect(panel.locator('[data-ready-quota="edits"]')).to_have_text("就绪额度 23,000 *")
     ui.page.screenshot(path=str(ROOT / f".runtime/account-availability-compact-{width}.png"), full_page=True)
     panel.get_by_role("button", name="详情", exact=True).click()
     assert panel.locator("[data-readiness-state]").count() == 9
     pw.expect(panel.locator('[data-readiness-state="ready"]')).to_contain_text("8,000")
     pw.expect(panel).to_contain_text("活跃生图 300")
     pw.expect(panel).to_contain_text("正常同步")
+    pw.expect(panel.locator('[data-ready-quota-detail="generation"]')).to_contain_text("额度未知 80 个 · 无限额套餐 3 个")
+    pw.expect(panel.locator('[data-ready-quota-detail="edits"]')).to_contain_text("已知额度 23,000")
     size = panel.evaluate("el => ({width:el.clientWidth, scroll:el.scrollWidth})")
     assert size["scroll"] <= size["width"] + 1, size
     ui.page.screenshot(path=str(ROOT / f".runtime/account-availability-{width}.png"), full_page=True)
@@ -59,6 +65,7 @@ def test_readiness_renders_refreshes_and_does_not_break_import_or_navigation(ui,
         pw.expect(ui.page).to_have_url(ui.origin + "/#/")
         pw.expect(ui.page.get_by_text("当前并发", exact=True)).to_be_visible()
         pw.expect(panel).to_have_count(1)
+        pw.expect(panel.locator('[data-ready-quota="generation"]')).to_have_text("就绪额度 24,000 *")
         if width < 1024:
             ui.page.get_by_role("button", name="打开导航", exact=True).click()
         ui.page.locator('#app-sidebar-navigation a[href="#/accounts"]').click()
@@ -73,6 +80,7 @@ def test_availability_failure_keeps_last_sample_and_does_not_disable_import(ui):
     ui.close()
     panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
     pw.expect(panel).to_contain_text("7,900")
+    pw.expect(panel.locator('[data-ready-quota="generation"]')).to_have_text("就绪额度 24,000 *")
     ui.availability_status = 503
     panel.get_by_role("button", name="刷新账号可用性").click()
     pw.expect(panel.get_by_role("status")).to_contain_text("不影响导入")
@@ -86,6 +94,31 @@ def test_availability_failure_keeps_last_sample_and_does_not_disable_import(ui):
     start.click()
     pw.expect(ui.dialog.get_by_label("选择导入任务")).to_have_value("synthetic-job-1")
     ui.close()
+
+
+def test_ready_quota_old_api_unknown_then_zero_and_large_numbers_do_not_overflow(ui):
+    ui.page.set_viewport_size(dict(width=390, height=844))
+    ui.availability = inventory()
+    ui.availability.pop("generation_quota")
+    ui.availability.pop("edit_quota")
+    ui.open()
+    ui.close()
+    panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
+    pw.expect(panel.locator('[data-ready-quota="generation"]')).to_have_text("就绪额度 --")
+    ui.availability["generation_quota"] = dict(known_remaining=0, known_accounts=0, unknown_accounts=0, unlimited_accounts=0)
+    ui.availability["edit_quota"] = dict(known_remaining=123456789, known_accounts=10000, unknown_accounts=0, unlimited_accounts=2)
+    panel.get_by_role("button", name="刷新账号可用性").click()
+    pw.expect(panel.locator('[data-ready-quota="generation"]')).to_have_text("就绪额度 0")
+    pw.expect(panel.locator('[data-ready-quota="edits"]')).to_have_text("就绪额度 123,456,789 *")
+    for node in [panel, *panel.locator("[data-availability-metric]").all()]:
+        size = node.evaluate("el => ({width:el.clientWidth, scroll:el.scrollWidth})")
+        assert size["scroll"] <= size["width"] + 1, size
+    ui.page.screenshot(path=str(ROOT / ".runtime/account-availability-quota-390.png"), full_page=True)
+    panel.get_by_role("button", name="详情", exact=True).click()
+    pw.expect(panel.get_by_role("dialog")).to_be_visible()
+    ui.page.keyboard.press("Escape")
+    pw.expect(panel.get_by_role("dialog")).not_to_be_visible()
+    assert not ui.errors, ui.errors
 
 
 def test_account_row_explains_unknown_expiry(ui):

@@ -1,6 +1,7 @@
 import base64
 import json
 import time
+from copy import deepcopy
 
 import pytest
 from fastapi import FastAPI
@@ -69,8 +70,51 @@ def test_availability_api_requires_admin_and_does_not_expose_credentials(service
         result = client.get("/api/accounts/availability", headers={"Authorization":"Bearer test-only"})
     assert result.status_code == 200
     assert result.json()["counts"]["unknown"] == 1
+    assert result.json()["generation_quota"] == dict(known_remaining=0, known_accounts=0, unknown_accounts=0, unlimited_accounts=0)
+    assert result.json()["edit_quota"] == result.json()["generation_quota"]
     assert "synthetic-secret" not in result.text
     assert result.json()["maintenance"]["policy"] == "performance"
+
+
+def test_ready_quota_excludes_unready_limits_and_separates_unknown_unlimited(service_factory, monkeypatch):
+    now = int(time.time())
+    service = service_factory([
+        row(token(now+7200), quota=8),
+        row(token(now+7201), quota=12, file_upload_blocked_until=now+600),
+        row("opaque", quota=999), row(token(now-1), quota=999), row(token(now+10), quota=999),
+        row(token(now+7202), quota=999, status="异常"),
+        row(token(now+7203), quota=999, status="禁用"),
+        row(token(now+7204), quota=999, last_remote_check_result="pending", pending_auth_scope="image"),
+        row(token(now+7205), quota=999, last_remote_check_result="invalid"),
+        row(token(now+7206), quota=999, status="限流"),
+        row(token(now+7207), quota=999, image_quota_unknown=True),
+        row(token(now+7208), quota=999, image_quota_unknown=True, type="pro"),
+        row(token(now+7209), quota=0),
+        row(token(now+7210), quota=999, image_quota_unknown=True, type="prolite", file_upload_blocked_until=now+600),
+    ])
+    monkeypatch.setattr(service, "_refresh_accounts_snapshot_if_stale", lambda **kw: False)
+    before = deepcopy(service._accounts)
+    result = service.readiness_summary()
+    assert result["generation_candidates"] == 6
+    assert result["edit_candidates"] == 4
+    assert result["generation_quota"] == dict(known_remaining=20, known_accounts=2, unknown_accounts=2, unlimited_accounts=2)
+    assert result["edit_quota"] == dict(known_remaining=8, known_accounts=1, unknown_accounts=2, unlimited_accounts=1)
+    assert service._accounts == before  # Observation must never consume quota or change eligibility.
+    result["generation_quota"]["known_remaining"] = 999
+    assert service.readiness_summary()["generation_quota"]["known_remaining"] == 20
+
+
+def test_ready_quota_empty_pool_is_known_zero(service_factory):
+    result = service_factory([]).readiness_summary()
+    assert result["generation_quota"] == result["edit_quota"] == dict(
+        known_remaining=0, known_accounts=0, unknown_accounts=0, unlimited_accounts=0)
+
+
+def test_ready_quota_expired_upload_cooldown_does_not_remove_edit_quota(service_factory):
+    now = int(time.time())
+    result = service_factory([row(token(now+7200), quota=7, file_upload_blocked_until=now-1)]).readiness_summary()
+    assert result["generation_quota"] == result["edit_quota"] == dict(
+        known_remaining=7, known_accounts=1, unknown_accounts=0, unlimited_accounts=0)
 
 
 def test_inventory_classification_does_not_hold_foreground_dispatch_lock(service_factory, monkeypatch):

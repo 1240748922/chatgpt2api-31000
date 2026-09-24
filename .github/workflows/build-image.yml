@@ -13,6 +13,14 @@ env:
   IMAGE_NAME: ghcr.io/1240748922/chatgpt2api-31000
 
 jobs:
+  gateway-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify nginx routing across Docker DNS and IP reuse
+        run: python3 scripts/test_gateway_routing.py
+
   coordination-regression:
     runs-on: ubuntu-latest
     services:
@@ -39,7 +47,7 @@ jobs:
         run: python -m pytest src_extract/tests/test_credential_coordinator_postgres.py -q --tb=short
 
   build-and-publish:
-    needs: coordination-regression
+    needs: [coordination-regression, gateway-regression]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 

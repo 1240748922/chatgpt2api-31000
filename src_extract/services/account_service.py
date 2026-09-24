@@ -176,6 +176,7 @@ class AccountService:
         "invalid_grant",
         "invalid_refresh_token",
         "refresh_token_invalidated",
+        "refresh_token_reused",
     })
     _TERMINAL_REFRESH_MESSAGE_FRAGMENTS = ("session has ended",)
     # 刷新进度追踪
@@ -3702,6 +3703,11 @@ class AccountService:
                 if updated_refresh_token != current_refresh_token
                 else current.get("refresh_token_invalid_at") or None
             )
+        if not preserve_lifecycle and updated_refresh_token != current_refresh_token:
+            # Rejection/backoff belongs to the old RT, not its replacement.
+            # Duplicate imports keep the fence; backup restores keep history.
+            normalized["last_token_refresh_error"] = None
+            normalized["last_token_refresh_error_at"] = None
         return normalized
 
     @staticmethod

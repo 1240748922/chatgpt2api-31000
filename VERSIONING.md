@@ -1,13 +1,43 @@
 # 稳定版本、升级和回退
 
-## 2026-09-24 3.2.37：后台维护实况与界面整理
+## 2026-09-24 当前发布：3.2.37
 
 - 新增后台 AT 续期/额度同步的实际处理中数量、当前批次和累计成功/失败/跳过次数；与“每批最多”明确区分。进程重启归零，同一账号可能重复计数。
 - 可用性摘要改为平铺指标，详情拆为同步进度、凭据与额度、处理规则三个页签；统一字体/图标、固定关闭区域，适配手机和深色。
 - 打开详情时约 3 秒查询管理员只读内存接口，不新增全池扫描；原摘要频率、导号加速、生图/超分并发、性能调度阈值、凭据租约和自动清理规则不变。
-- 本地验证：517 项 Python 测试通过；无本地 PostgreSQL 的 6 项留给 CI 实跑。4 组 Node、Compose 和差异校验通过；额外复验 4 种屏宽/主题组合。未使用真实账号请求上游，未更新用户服务器。
+- 验证：517 项本地 Python 测试、4 组 Node、Compose 和差异校验通过；额外复验 4 种屏宽/主题组合。6 项 PostgreSQL 17 测试与真实 Nginx/Docker DNS 网关回归已在 CI 通过。未使用真实账号请求上游，未更新用户服务器。
 - 自动续期和删除行为、计数口径及复验步骤见 [维护进度说明](./docs/account-maintenance-progress.md)。本版不会让失效 RT 自动恢复，也不会新增自动删除规则。
-- 发布 SHA 与镜像锁定在构建验证成功后补齐；当前 Compose 镜像暂保持 3.2.36，避免引用未发布镜像。
+- 应用提交：`9760705f8b9c088c3dce98cca5ca89493fce8bf0`；镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-9760705`，同时发布 `latest`。
+- [GitHub Actions](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36023987473) 全部成功，已核实 `Build and push` 成功；Compose 默认镜像及 `.env.example` 示例同步锁定。
+
+**若服务器 `.env` 固定了 `CHATGPT2API_IMAGE_TAG`，改成 `sha-9760705`，或移除该项跟随 Compose 默认值；`git pull` 不会修改你的 `.env`。**
+
+低峰暂停新请求和导入，等待在途任务结束、备份数据库/配置后执行：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+这是有统一切换窗口的更新，不承诺无中断，不删除卷、不重建 PostgreSQL。`/version` 应为 **3.2.37**，`image_tag` 应为 `sha-9760705`。逐实例核验实际镜像 revision：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+所有实例应为 `9760705f8b9c088c3dce98cca5ca89493fce8bf0`。若尚未安装前一版网关永久配置，同步核对 [dynamic-backends-v1 标记](./docs/gateway-routing.md)。更新后打开可用性详情观察“正在处理”和累计次数；短任务可能在两次采样间完成，瞬时 0 不代表维护没运行。
+
+回退镜像为 `sha-3c1535b`（3.2.36），同样先排空再统一切换；无需数据回滚。部署锁定提交标记 `[skip ci]`，不会产生新的应用镜像 SHA。
+
+---
 
 ## 2026-09-24 网关配置补丁：dynamic-backends-v1
 
@@ -18,7 +48,7 @@
 - **这是宿主机挂载配置更新，不需要更换应用镜像；应用仍为 3.2.36 / `sha-3c1535b`。** 当前已恢复的服务器可先继续运行，永久配置安装见 [网关更新与复验](./docs/gateway-routing.md)。单文件挂载可能仍引用旧 inode，须用容器内 `nginx -T` 核对标记，不能认为 `git pull` + reload 一定读到了新文件；如需重建，仅在排空后重建 gateway，不重启生图容器。
 - 本机无 Linux Docker 引擎，已做 Python 语法和 Compose 校验；真实 Nginx/IP 复用与 PostgreSQL 测试在 GitHub CI 执行。DNS 刷新仍存在缓存窗口，不承诺后端重建零中断。
 
-## 2026-09-24 当前发布：3.2.36
+## 2026-09-24 上一版：3.2.36
 
 - 应用提交：`3c1535b06a57fcb54162954b8b510f680da1922f`。
 - 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-3c1535b`，同时发布到 `latest`。

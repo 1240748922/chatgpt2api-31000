@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
+      - name: Check read-only gateway verification script
+        run: bash -n scripts/verify_gateway.sh
       - name: Verify nginx routing across Docker DNS and IP reuse
         run: python3 scripts/test_gateway_routing.py
 

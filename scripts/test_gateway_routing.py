@@ -142,6 +142,7 @@ def main():
                 assert actual == status and data["role"] == role, (path, actual, data)
                 assert data["path"] == path and data["host"] == "gateway-fixture.invalid", data
             assert request(fixed, "/internal/monitor/load")[0] == 404
+            assert request(fixed, "/internal/monitor/account-maintenance")[0] == 404
             for path, role in (("/v1/images/generations", "app"), ("/api/account-import-jobs", "importer")):
                 status, data = request(fixed, path, method="POST", body=b'{"synthetic":true}')
                 assert status == 200 and data["role"] == role and data["method"] == "POST", data
@@ -185,6 +186,27 @@ def main():
                 status, data = request(fixed, path)
                 assert status == 200 and data["instance"] == "importer-v2", (path, status, data)
             print("PASS: importer IP reuse no longer leaves import routes pointing at the wrong role", flush=True)
+
+            # git checkout/pull replaces the host inode. A single-file bind
+            # mount still points at the old config; nginx -t/reload can succeed
+            # without installing the new dynamic routing configuration.
+            replacement = root / "next.conf"
+            replacement.write_text(config, encoding="utf-8")
+            replacement.replace(root / "legacy.conf")
+            assert (root / "legacy.conf").read_text(encoding="utf-8") == config
+            mounted = docker("exec", gateways[1], "cat", "/etc/nginx/conf.d/default.conf")
+            assert mounted == legacy.strip() and mounted != config.strip()
+            docker("exec", gateways[1], "nginx", "-t")
+            docker("exec", gateways[1], "nginx", "-s", "reload")
+            assert docker("exec", gateways[1], "cat", "/etc/nginx/conf.d/default.conf") == legacy.strip()
+            docker("rm", "-f", gateways[1])
+            gateways[1] = run("legacy", ["-p", "127.0.0.1::80", "-v",
+                f"{root / 'legacy.conf'}:/etc/nginx/conf.d/default.conf:ro"], NGINX_IMAGE)
+            port = int(docker("port", gateways[1], "80/tcp").rsplit(":", 1)[1])
+            assert docker("exec", gateways[1], "cat", "/etc/nginx/conf.d/default.conf") == config.strip()
+            eventually(lambda: request(port, "/api/dashboard")[1].get("instance") == "app-v2",
+                       "recreated gateway binds new inode and routes to app0")
+            print("PASS: replaced host inode stays stale across reload; gateway recreation binds the new config", flush=True)
     except BaseException:
         for gateway in gateways:
             print(docker("logs", "--tail", "30", gateway, check=False), flush=True)

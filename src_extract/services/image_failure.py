@@ -527,6 +527,19 @@ def _looks_like_image_quota_message(value: Any, *, allow_deferred: bool = True) 
 
 
 QUOTA_CODES = {"insufficient_quota", "quota_exhausted", "image_quota_exhausted"}
+# Observed upstream refusal templates sometimes lack a structured moderation
+# code. Only recognize complete notices in a terminal assistant text message;
+# quoted customer prompts and in-progress text are not evidence of refusal.
+_POLICY_NOTICE_TEXTS = frozenset(
+    f"非常抱歉，{subject}可能违反了{reason}。如果你认为此判断有误，请重试或修改提示语。"
+    for subject, reason in (
+        ("该提示", "我们的内容政策"),
+        ("该提示", "关于裸露、色情或情色内容的防护限制"),
+        ("生成的图片", "关于裸露、色情或情色内容的防护限制"),
+        ("该提示", "关于暴力内容的防护限制"),
+        ("该提示", "关于非法或违法活动的防护限制"),
+    )
+)
 AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}
 POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
 
@@ -1201,6 +1214,8 @@ def classify_message_facts(
     if normalized_role == "assistant" and normalized_content_type == "text" and (
         end_turn or is_terminal_message_status(normalized_status)
     ) and has_text:
+        if isinstance(raw_detail, str) and raw_detail.strip() in _POLICY_NOTICE_TEXTS:
+            return image_failure("content_policy_violation", raw_detail=raw_detail).with_public_detail(raw_detail)
         return image_failure(
             "upstream_text_reply",
             raw_detail=raw_detail,

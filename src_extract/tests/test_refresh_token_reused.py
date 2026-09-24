@@ -185,4 +185,41 @@ def test_historical_text_alone_does_not_invalidate_current_rt(service_factory):
         token, refresh_token="possibly-replaced-rt",
         last_token_refresh_error="oauth_refresh_http_401: refresh_token_reused: old rejection")])
     assert not service.get_account(token)["refresh_token_invalid_at"]
-    assert service.readiness_summary()["refresh_candidates"] == 1
+    summary = service.readiness_summary()
+    assert summary["refresh_candidates"] == 0 and summary["refresh_unverified"] == 1
+    assert summary["needs_credentials"] == 0
+    assert service.list_expiring_access_tokens() == [token]  # Still eligible for a fenced recheck.
+
+
+def test_normal_recovery_precedes_older_unverified_rejection(service_factory, monkeypatch):
+    older, recent = jwt(-86400), jwt(-300)
+    service = service_factory([
+        row(older, refresh_token="old-rt", last_token_refresh_error="oauth_refresh_http_401: refresh_token_reused: rejected"),
+        row(recent, refresh_token="good-rt"),
+    ])
+    assert service.list_expiring_access_tokens() == [recent, older]
+    summary = service.readiness_summary()
+    assert summary["refresh_candidates"] == 1 and summary["refresh_unverified"] == 1
+    calls = mock_oauth(monkeypatch, service)
+    service.renew_expiring_access_tokens([older])
+    assert calls == [1] and service.get_account(older)["refresh_token_invalid_at"]
+    assert older not in service.list_expiring_access_tokens()
+
+
+@pytest.mark.parametrize("error", ["timeout: refresh_token_reused", "oauth_refresh_http_503: refresh_token_reused",
+                                  "oauth_refresh_http_429: invalid_grant", "unknown OAuth response"])
+def test_historical_transient_errors_are_not_terminal_suspects(service_factory, error):
+    token = jwt(-300)
+    summary = service_factory([row(token, refresh_token="rt", last_token_refresh_error=error)]).readiness_summary()
+    assert summary["refresh_candidates"] == 1 and summary["refresh_unverified"] == 0
+
+
+def test_unverified_rt_does_not_remove_usable_at_or_enter_cleanup(service_factory):
+    token = jwt(7 * 86400)
+    service = service_factory([row(token, refresh_token="rt", last_token_refresh_error="oauth_refresh_http_401: refresh_token_reused")])
+    summary = service.readiness_summary()
+    assert summary["counts"]["ready"] == 1 and summary["refresh_unverified"] == 0
+    assert service.get_available_access_token() == token
+    service.release_image_slot(token)
+    assert service.preview_auto_remove_accounts(remove_invalid=False, remove_rate_limited=False,
+                                               remove_unusable_credentials=True)["credentials_unavailable"] == 0

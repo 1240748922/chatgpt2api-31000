@@ -10,7 +10,7 @@ from dashboard_fixtures import dashboard_payload
 def inventory():
     return dict(
         counts=dict(ready=8000, unknown=400, expiring=20, expired=30, quarantined=5, invalid=2, disabled=1, refreshing=1, uncertain=0),
-        generation_candidates=7900, edit_candidates=7800, refresh_candidates=420, needs_credentials=37,
+        generation_candidates=7900, edit_candidates=7800, refresh_candidates=420, refresh_unverified=12345, needs_credentials=37,
         generation_quota=dict(known_remaining=24000, known_accounts=7817, unknown_accounts=80, unlimited_accounts=3),
         edit_quota=dict(known_remaining=23000, known_accounts=7718, unknown_accounts=80, unlimited_accounts=2),
         quota_unknown=80, upload_limited=100, snapshot_age_seconds=0,
@@ -50,6 +50,7 @@ def test_readiness_renders_refreshes_and_does_not_break_import_or_navigation(ui,
     pw.expect(panel).to_contain_text("允许同步")
     ui.page.screenshot(path=str(ROOT / f".runtime/account-maintenance-progress-{width}.png"), full_page=True)
     panel.get_by_role("tab", name="凭据与额度", exact=True).click()
+    pw.expect(panel.get_by_role("region", name="凭据恢复分类")).to_contain_text("12,345")
     assert panel.locator("[data-readiness-state]").count() == 9
     pw.expect(panel.locator('[data-readiness-state="ready"]')).to_contain_text("8,000")
     pw.expect(panel.locator('[data-ready-quota-detail="generation"]')).to_contain_text("额度未知 80 个 · 无限额套餐 3 个")
@@ -217,7 +218,7 @@ def test_progress_unknown_nonowner_and_failure_remain_readonly(ui):
     ui.close()
     panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
     pw.expect(panel.locator('[data-maintenance-active]')).to_have_text("--")
-    pw.expect(panel.locator('[data-maintenance-status]').first).to_have_text("非维护实例")
+    pw.expect(panel.locator('[data-maintenance-status]').first).to_have_text("非维护实例 · 请检查网关")
     ui.maintenance_status = 503
     panel.get_by_role("button", name="详情", exact=True).click()
     pw.expect(panel.get_by_role("status")).to_contain_text("同步进度暂不可用")
@@ -225,3 +226,19 @@ def test_progress_unknown_nonowner_and_failure_remain_readonly(ui):
     pw.expect(panel.get_by_role("dialog")).not_to_be_visible()
     assert not ui.posts, "read-only detail panel must not mutate/import accounts"
     assert not [error for error in ui.errors if "503" not in error], ui.errors
+
+
+def test_unreachable_owner_is_not_displayed_as_stopped_or_zero(ui):
+    ui.availability = inventory()
+    ui.availability["maintenance_progress"].update(available=False, owner=True, instance="app0", state="unreachable",
+                                                  active=None, totals=None, batch=None)
+    ui.availability["maintenance"].update(mode="unavailable", batch_size=None, stale=True,
+                                         reasons=["无法读取维护实例 app0 的进度；不代表后台已停止"])
+    ui.open()
+    ui.close()
+    panel = ui.page.get_by_role("region", name="账号可用性", exact=True)
+    pw.expect(panel.locator('[data-maintenance-active]')).to_have_text("--")
+    pw.expect(panel.locator('[data-maintenance-status]').first).to_have_text("维护实例暂不可达")
+    panel.get_by_role("button", name="详情", exact=True).click()
+    pw.expect(panel).to_contain_text("尚未取得维护实例的批次信息")
+    assert not ui.posts

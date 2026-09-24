@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 
-from services.account_credentials import access_token_timestamps
+from services.account_credentials import access_token_timestamps, has_unverified_refresh_rejection
 
 
 READINESS_LABELS = {
@@ -54,6 +54,7 @@ def credential_readiness(account: dict, minimum_validity_seconds: float, *, now:
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat() if expires_at is not None else None,
         "remaining_seconds": int(remaining) if remaining is not None else None,
         "has_refresh_path": recoverable,
+        "refresh_unverified": has_unverified_refresh_rejection(account),
     }
 
 
@@ -66,15 +67,18 @@ def summarize_readiness(accounts: list[dict], minimum_validity_seconds: float, *
 def summarize_projections(projections, minimum_validity_seconds: float, *, now: float) -> dict:
     """Reuse the same decoded projection for inventory and candidate counts."""
     counts = Counter({state: 0 for state in READINESS_LABELS})
-    renewable = manual = 0
+    renewable = manual = unverified = 0
     for item in projections:
         counts[item["state"]] += 1
         if item["state"] in {"unknown", "expired", "expiring", "quarantined", "invalid", "uncertain"}:
-            renewable += int(item["has_refresh_path"])
+            pending = item["has_refresh_path"] and item.get("refresh_unverified", False)
+            unverified += int(pending)
+            renewable += int(item["has_refresh_path"] and not pending)
             manual += int(not item["has_refresh_path"])
     return {
         "total": sum(counts.values()), "counts": dict(counts), "labels": dict(READINESS_LABELS),
         "refresh_candidates": renewable, "needs_credentials": manual,
+        "refresh_unverified": unverified,
         "minimum_validity_seconds": int(minimum_validity_seconds),
         "sampled_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
         "scope": "credential_inventory", "policy": "readiness_preview",

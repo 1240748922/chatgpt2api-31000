@@ -26,6 +26,7 @@ from services.account_credentials import (
     access_token_expires_in_seconds,
     access_token_issued_at,
     decode_access_token_payload,
+    has_unverified_refresh_rejection,
     project_upstream_credential_availability,
 )
 from services.account_processing import (
@@ -2296,19 +2297,21 @@ class AccountService:
         with self._lock:
             accounts = list(self._accounts.values())
         # Normalize/expiry decoding and sorting need not block image dispatch.
-        return sorted(
-            (
-                token for account in accounts
-                if account.get("status") in {"正常", "限流"}
-                and account.get("last_remote_check_result") != "pending"
-                and str(account.get("refresh_token") or "").strip()
-                and not account.get("refresh_token_invalid_at")
-                and not self._recent_token_refresh_error(account)
-                and (token := str(account.get("access_token") or "").strip())
-                and (self._token_needs_refresh(token) or (AccountService._strict_admission() and self._token_expires_in(token) is None))
-            ),
-            key=lambda token: self._jwt_exp(token),
-        )
+        candidates = [
+            (has_unverified_refresh_rejection(account), self._jwt_exp(token), token)
+            for account in accounts
+            if account.get("status") in {"正常", "限流"}
+            and account.get("last_remote_check_result") != "pending"
+            and str(account.get("refresh_token") or "").strip()
+            and not account.get("refresh_token_invalid_at")
+            and not self._recent_token_refresh_error(account)
+            and (token := str(account.get("access_token") or "").strip())
+            and (self._token_needs_refresh(token) or (AccountService._strict_admission() and self._token_expires_in(token) is None))
+        ]
+        # A large legacy-rejection backlog must not be sorted ahead of ordinary
+        # recovery simply because its ATs expired earlier. Still recheck it:
+        # old error text alone cannot invalidate replacement credentials.
+        return [token for _, _, token in sorted(candidates, key=lambda item: item[:2])]
 
     def list_tokens(self) -> list[str]:
         self._refresh_accounts_snapshot_if_stale()
@@ -3485,6 +3488,8 @@ class AccountService:
         )
         now = datetime.now(timezone.utc)
         candidates: list[tuple[float, str]] = []
+        strict = AccountService._strict_admission()
+        validity = self._image_token_validity_window() if strict else 0
         with self._lock:
             if candidate_tokens is None:
                 snapshot = tuple(self._accounts.values())
@@ -3502,6 +3507,10 @@ class AccountService:
                 or item.get("last_remote_check_result") == "pending"
                 or self._remote_check_is_fresh(item, now, freshness)
                 or self._remote_check_attempt_is_recent(item, now, freshness)
+                # Background renewal owns unusable AT recovery. Do not spend
+                # the quota time slice refreshing the same expired RT again.
+                # Manual sync and import entrypoints retain their behavior.
+                or (strict and credential_readiness(item, validity, now=now.timestamp())["state"] != "ready")
             ):
                 continue
             checked_at = self._parse_time(

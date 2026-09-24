@@ -147,6 +147,11 @@ def test_lightweight_admin_api_never_scans_pool_or_exposes_config(progress, monk
     assert set(payload) == {"maintenance", "maintenance_progress", "cleanup_policy"}
     monkeypatch.setenv("CHATGPT2API_ACCOUNT_SHARD_INDEX", "3")
     monkeypatch.setenv("CHATGPT2API_ACCOUNT_SHARD_COUNT", "8")
+    from services import account_maintenance_status
+    monkeypatch.setenv("CHATGPT2API_MONITOR_CLUSTER_SECRET", "synthetic-cluster-only")
+    monkeypatch.setattr(account_maintenance_status, "_cache", None)
+    monkeypatch.setattr(account_maintenance_status, "_fetch_owner", lambda _: payload)
     response = client.get("/api/accounts/maintenance-status", headers={"Authorization": "Bearer test-only"})
-    assert response.json()["maintenance_progress"]["state"] == "not_owner"
+    assert response.json()["maintenance_progress"]["instance"] == "app0"
+    assert response.json()["maintenance_progress"]["available"]
     client.close()

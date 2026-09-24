@@ -41,7 +41,11 @@ assert.equal(current.progress.ratio,50);
 assert.equal(current.progress.status,'后台同步中');
 assert.equal(current.progress.completed,'20');
 assert.equal(display(null).progress.active,'--');
-assert.equal(display({...data,maintenance_progress:{available:false,owner:false}},101).progress.status,'非维护实例');
+assert.equal(display({...data,maintenance_progress:{available:false,owner:false}},101).progress.status,'非维护实例 · 请检查网关');
+assert.equal(display({maintenance_progress:{available:false,owner:true,state:'unreachable'}}).progress.status,'维护实例暂不可达');
+assert.equal(display({refresh_unverified:12345}).unverified,'12,345');
+assert.equal(display({refresh_unverified:12345}).hasUnverified,true);
+assert.equal(display(null).unverified,'--');
 for (const sampled_at of [undefined,NaN,Infinity,-1,0,54]) {
  assert.equal(display({...data,maintenance_progress:{...progress,sampled_at}},100).progress.active,'--');
 }

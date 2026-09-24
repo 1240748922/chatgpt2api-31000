@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from functools import lru_cache
 from dataclasses import dataclass
@@ -12,6 +13,23 @@ ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
 AccessTokenStatus = Literal["valid", "expiring", "invalid"]
 RefreshTokenStatus = Literal["valid", "missing", "invalid"]
 CredentialAvailabilityStatus = Literal["usable", "recoverable", "unavailable"]
+
+
+def has_unverified_refresh_rejection(account: dict) -> bool:
+    """Historical OAuth rejection is a warning, NOT proof about today's RT.
+
+    Old versions did not record a credential generation with these messages.
+    Keep these accounts eligible for a fenced recheck, but don't present them as
+    ordinary recovery candidates or let their old expiry outrank healthy RTs.
+    """
+    if not account.get("refresh_token") or account.get("refresh_token_invalid_at"):
+        return False
+    error = str(account.get("last_token_refresh_error") or "")
+    return bool(re.match(
+        r"^oauth_refresh_http_(?:400|401):\s*(?:refresh_token_reused|invalid_grant|"
+        r"invalid_refresh_token|refresh_token_invalidated)(?=\s|:|$)", error,
+        flags=re.IGNORECASE,
+    ))
 
 
 @dataclass(frozen=True)

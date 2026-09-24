@@ -400,6 +400,14 @@ def create_router(app_version: str) -> APIRouter:
         require_admin(authorization)
         return await run_in_threadpool(log_service.delete, body.ids)
 
+    @router.get("/internal/monitor/account-maintenance")
+    async def get_internal_maintenance(x_cluster_monitor_secret: str | None = Header(default=None)):
+        from services.account_maintenance_status import local_internal_maintenance_view
+        try:
+            return local_internal_maintenance_view(x_cluster_monitor_secret or "")
+        except (PermissionError, RuntimeError) as exc:
+            raise HTTPException(status_code=403, detail={"error": "forbidden"}) from exc
+
     @router.get("/internal/monitor/load")
     async def get_internal_image_load(x_cluster_monitor_secret: str | None = Header(default=None)):
         try:

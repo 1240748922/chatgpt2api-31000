@@ -1,6 +1,6 @@
 import {d as defineComponent, b as h, r as ref, s as onMounted, x as onUnmounted, m as api}
-  from "./index-BhEm-7EJ.js?v=20260925-maintenance-v16";
-import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260925-maintenance-v1";
+  from "./index-BhEm-7EJ.js?v=20260925-owner-v17";
+import {availabilityDisplay} from "./accountAvailabilityRuntime-v1.js?v=20260925-owner-v2";
 
 let sequence = 0;
 const paths = {
@@ -95,7 +95,7 @@ export default defineComponent({
         h("div",{class:"av-metrics"},[
           metric("generation","文生图候选",view.generation,"image",view.generationQuota),
           metric("edits","图生图候选",view.edits,"edit",view.editQuota),
-          metric("recovery","可尝试恢复",view.renewable,"refresh",null,"等待验证或续期"),
+          metric("recovery","可尝试恢复",view.renewable,"refresh",null,view.hasUnverified?`另有 ${view.unverified} 个历史失败待复核`:"等待验证或续期"),
           metric("manual","待补凭据",view.manual,"key",null,"需补充有效 AT / RT"),
         ]),
         h("div",{class:"av-summary", "aria-label":"后台同步概况"},[
@@ -124,7 +124,7 @@ export default defineComponent({
                 h("div",{class:"av-stats"},[stat("active","正在处理",p.active,"av-primary-stat"),stat("succeeded","累计成功",p.succeeded),stat("failed","累计失败",p.failed),stat("skipped","累计跳过",p.skipped)]),
                 h("p",{class:"av-caption"},"仅统计后台 AT 续期与额度同步；包含处理过程中的等待，不含手动同步、导入及鉴权核验任务。"),
                 h("div",{class:"av-batch"},[
-                  h("div",{class:"av-label-value"},[h("span",{},p.hasBatch?`当前批次 · ${p.phase}`:"当前没有执行中的批次"),h("strong",{},p.hasBatch?`${p.batchCompleted} / ${p.batchTotal}`:`下次检查 ${p.nextCheck}`)]),
+                  h("div",{class:"av-label-value"},[h("span",{},p.hasBatch?`当前批次 · ${p.phase}`:p.known?"当前没有执行中的批次":"尚未取得维护实例的批次信息"),h("strong",{},p.hasBatch?`${p.batchCompleted} / ${p.batchTotal}`:`下次检查 ${p.nextCheck}`)]),
                   p.hasBatch?h("div",{class:"av-progress-track",role:"progressbar","aria-label":"当前批次进度","aria-valuenow":Math.round(p.ratio),"aria-valuemin":0,"aria-valuemax":100},[h("div",{style:{width:`${p.ratio}%`}})]):null,
                   p.hasBatch?h("p",{class:"av-caption"},`本批等待执行 ${p.queued} 个 · 调度上限每批 ${view.batch} 个`):null,
                   h("p",{class:"av-caption"},`最近一批：${p.last}${p.lastTime!=="--"?` · ${p.lastTime}`:""}`),
@@ -143,6 +143,11 @@ export default defineComponent({
               h("section",{class:"av-section"},[h("h4",{},"凭据分布"),h("div",{class:"av-state-grid"},view.states.map(item=>h("div",{
                 key:item.key,class:`av-state av-state-${item.key}`,"data-readiness-state":item.key,
               },[h("span",{},item.label),h("strong",{},item.value)])))]),
+              h("section",{class:"av-section","aria-label":"凭据恢复分类"},[
+                h("h4",{},"凭据恢复"),
+                h("div",{class:"av-signals"},[labelValue("常规恢复候选",view.renewable),labelValue("历史失败待复核",view.unverified),labelValue("待补凭据",view.manual)]),
+                h("p",{class:"av-caption"},"历史 RT 失败不代表当前凭据已确认失效：单独统计、排在常规续期候选之后复核，不据此自动删除账号。"),
+              ]),
               h("div",{class:"av-quota-grid","aria-label":"就绪额度详情"},[quotaDetail("generation","文生图",view.generationQuota),quotaDetail("edits","图生图",view.editQuota)]),
               h("p",{class:"av-note"},view.quotaNote),
             ]),

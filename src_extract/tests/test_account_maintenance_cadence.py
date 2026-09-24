@@ -8,6 +8,7 @@ from api import support
 from services import account_maintenance as maintenance
 from services.account_maintenance_progress import AccountMaintenanceProgress
 from test_account_auth_quarantine import service_factory, row, now
+from test_account_auth_quarantine import jwt
 
 
 class Clock:
@@ -217,3 +218,19 @@ def test_revalidation_is_bounded_and_preserves_freshness_busy_and_rotation_guard
     ])
     assert result == ["eligible", "new-at"]
     assert refreshes == [{"wait_for_refresh": False, "allow_full_reload": False}]
+
+
+def test_strict_background_quota_only_uses_ready_at_renewal_keeps_recovery(service_factory, monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_STRICT_IMAGE_CREDENTIALS", "1")
+    ready, expired, terminal, expiring = jwt(7*86400), jwt(-300), jwt(-301), jwt(10)
+    service = service_factory([
+        row(ready, image_quota_unknown=True, last_remote_checked_at=None), row(expired, refresh_token="rt", image_quota_unknown=True),
+        row(terminal, refresh_token="bad-rt", refresh_token_invalid_at=now(), image_quota_unknown=True),
+        row(expiring, refresh_token="expiring-rt", image_quota_unknown=True),
+        row("opaque", refresh_token="opaque-rt", image_quota_unknown=True),
+    ])
+    assert service.list_unknown_quota_tokens() == [ready]
+    assert service.list_unknown_quota_tokens(candidate_tokens=[expired, terminal, expiring, "opaque", ready]) == [ready]
+    assert expired in service.list_expiring_access_tokens()
+    assert "opaque" in service.list_expiring_access_tokens()
+    assert terminal not in service.list_expiring_access_tokens()

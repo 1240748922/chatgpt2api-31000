@@ -26,7 +26,8 @@ export function availabilityDisplay(value, now=Date.now()/1000) {
   const ratio = Number.isSafeInteger(total) && total > 0 && Number.isSafeInteger(completed) && completed >= 0
     ? Math.max(0, Math.min(100, completed / total * 100)) : 0;
   let status = "等待维护采样", tone = "neutral";
-  if (p.owner === false) status = "非维护实例";
+  if (p.state === "unreachable") { status = "维护实例暂不可达"; tone = "amber"; }
+  else if (p.owner === false) status = "非维护实例 · 请检查网关";
   else if (progressStale) status = "同步采样已过期";
   else if (active > 0) { status = "后台同步中"; tone = "blue"; }
   else if (known && p.state === "stopped") status = "维护已停止";
@@ -41,6 +42,7 @@ export function availabilityDisplay(value, now=Date.now()/1000) {
       : "仅合计就绪账号的已知额度；未知额度和无限额套餐单列。文生图与图生图额度有重叠，不能相加；不是实时空闲并发或成功次数保证。",
     quotaUnknown:count(value?.quota_unknown), uploadLimited:count(value?.upload_limited),
     renewable:count(value?.refresh_candidates), manual:count(value?.needs_credentials),
+    unverified:count(value?.refresh_unverified), hasUnverified:Number.isSafeInteger(value?.refresh_unverified) && value.refresh_unverified > 0,
     mode:maintenance.stale ? "采样已过期" : modes[maintenance.mode] || "等待采样",
     reason:Array.isArray(maintenance.reasons) ? maintenance.reasons.filter(x => typeof x === "string").join("；") : "",
     batch:count(maintenance.batch_size), active:count(maintenance.active_images),

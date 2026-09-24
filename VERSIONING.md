@@ -1,6 +1,45 @@
 # 稳定版本、升级和回退
 
-## 2026-09-24 当前发布：3.2.35
+## 2026-09-24 当前发布：3.2.36
+
+- 应用提交：`3c1535b06a57fcb54162954b8b510f680da1922f`。
+- 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-3c1535b`，同时发布到 `latest`。
+- [GitHub Actions：PostgreSQL 回归及镜像发布](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36016654221)已成功，已核实 `Build and push` 步骤成功。
+- 补齐 OAuth `refresh_token_reused` 的终止性分类，按凭据代际标记 RT 无效，避免再次进入后台续期候选。AT 仍有效的账号继续保留可用，不清额度；不同 RT 覆盖更新时清除旧错误与退避，重复同 RT 不清失效标记。详见 [原因、边界与离线复验](./docs/refresh-token-reused.md)。
+- 验证：503 项本地 Python 测试（新增 19 项）、6 项 GitHub PostgreSQL 17 回归、4 组 Node 检查和 Compose 配置校验通过。本机没有 PostgreSQL 的 6 项跳过已在 CI 实跑。未直接更新服务器、未使用真实账号做上游请求。
+- 不改生图/超分并发、导号加速、预热、代理或维护阈值，无数据库迁移。**补丁不能恢复已使用的旧 RT**；需取得最新 AT/RT 或重新登录。历史旧错误缺少凭据代际依据，不启动全池判废迁移；下一次允许的续期明确拒绝后才标记，共享不确定请求仍不重放。
+
+**如果服务器 `.env` 固定了 `CHATGPT2API_IMAGE_TAG`，改成 `sha-3c1535b`，或移除该项使用 Compose 默认值；`git pull` 不会修改 `.env`。**
+
+低峰暂停新请求和导入，等在途任务结束并备份数据库/配置后执行：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+此流程有统一切换窗口，不是无中断升级，不删除卷、不重建 PostgreSQL。
+恢复后 `/version` 应为 **3.2.36**。逐实例核验：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+所有实例应输出 `3c1535b06a57fcb54162954b8b510f680da1922f`。观察续期错误、“可尝试恢复/需补凭据”及各分片就绪数；5 条 RT 复用样本不能证明所有待恢复账号都失效，历史额度也不等同于就绪额度。不要清共享租约或盲目重导整个池。
+
+回退镜像为 `sha-53947c9`（3.2.35），同样排空后统一切换。部署锁定提交使用 `[skip ci]`，没有另外的应用镜像标签。
+
+---
+
+## 2026-09-24 上一版：3.2.35
 
 - 应用提交：`53947c94cf12ceaa4b6338b49df6e28841ddf6ba`。
 - 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-53947c9`，同时发布到 `latest`。

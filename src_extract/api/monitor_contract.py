@@ -179,6 +179,17 @@ class MonitorImageView(StrictMonitorModel):
 
 
 class MonitorEventView(StrictMonitorModel):
+    account_wait_reason: str | None = None
+    account_shard_index: int | None = None
+    account_shard_count: int | None = None
+    selection_loop_count: int | None = None
+    selection_wait_ms: int | None = None
+    matched_count: int | None = None
+    ready_count: int | None = None
+    busy_count: int | None = None
+    limited_count: int | None = None
+    upload_limited_count: int | None = None
+    available_slot_count: int | None = None
     time: str
     call_id: str
     event: str

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from services.account_maintenance_metrics import TOKEN_METRIC_LABELS
+from services.account_selection_diagnostics import SELECTION_FIELDS, SELECTION_COUNT_FIELDS
 from services.image_input_prewarm import INPUT_METRIC_LABELS
 
 from collections.abc import Mapping
@@ -210,6 +211,7 @@ IMAGE_FIELDS = {
 }
 
 EVENT_FIELDS = {
+    *SELECTION_FIELDS,
     "account_candidate_attempts",
     "time",
     "call_id",
@@ -263,6 +265,7 @@ EVENT_FIELDS = {
 }
 
 INTEGER_FIELDS = {
+    *SELECTION_COUNT_FIELDS,
     "account_candidate_attempts",
     "elapsed_ms",
     "stage_elapsed_ms",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from services.account_maintenance_metrics import TOKEN_METRIC_LABELS
+from services.account_selection_diagnostics import SELECTION_FIELDS
 from services.image_input_prewarm import INPUT_METRIC_LABELS
 from services.maintenance_pressure import pressure_samples
 
@@ -709,6 +710,7 @@ class RealtimeMonitorService:
         compact = {
             key: value for key, value in event.items()
             if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS,
+                       *SELECTION_FIELDS,
                        "public_error", "account_failure", "switched_account", "page_prewarm_hit"}
             or (str(key).endswith("_ms") and _int_ms(value) > 0)
         }
@@ -944,6 +946,7 @@ class RealtimeMonitorService:
                     or key in CANONICAL_FAILURE_FIELDS
                     or key in {"public_error", "account_failure", "switched_account", "page_prewarm_hit"}
                     or key in RAW_DIAGNOSTIC_FIELDS
+                    or key in SELECTION_FIELDS
                     or (str(key).endswith("_ms") and _int_ms(value) > 0)
                 }
                 for event in events
@@ -1003,6 +1006,7 @@ class RealtimeMonitorService:
                 "account_candidate_total_ms",
                 "account_token_maintenance_ms",
                 "account_candidate_attempts",
+                *SELECTION_FIELDS,
                 "egress_wait_ms",
                 "upload_ms",
                 "bootstrap_ms",

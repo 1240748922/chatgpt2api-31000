@@ -147,6 +147,9 @@ class AccountService:
         0,
         30,
     )
+    # A busy ready pool can recover as in-flight images finish. Do not treat
+    # this as an empty pool on the first request before any upstream attempt.
+    _IMAGE_BUSY_WAIT_SECONDS = env_int("CHATGPT2API_IMAGE_BUSY_WAIT_SECONDS", 30, 0, 120)
     _ACCESS_TOKEN_FINGERPRINT_LIMIT = 8
     _REFRESH_PROGRESS_COMPLETED_TTL_SECONDS = 10 * 60
     _REFRESH_PROGRESS_ACTIVE_TTL_SECONDS = 60 * 60
@@ -2410,6 +2413,7 @@ class AccountService:
             deadline_monotonic: float | None = None,
             requires_file_upload: bool = False,
             minimum_validity_seconds: float | None = None,
+            busy_wait_deadline: float | None = None,
     ) -> str:
         selection_started = time.monotonic()
         selection_loops = 0
@@ -2420,10 +2424,23 @@ class AccountService:
         state.diagnostics = {}
         self._set_image_selection_diagnostics(
             account_wait_reason="starting",
+            account_shard_index=self._image_shard_index,
+            account_shard_count=self._image_shard_count,
+            matched_count=0, ready_count=0, limited_count=0,
+            busy_count=0, upload_limited_count=0, available_slot_count=0,
             selection_loop_count=0,
             selection_wait_ms=0,
         )
         pool_wait_deadline = time.monotonic() + self._IMAGE_POOL_WAIT_SECONDS
+        # Calls without a request deadline retain their old short probe. A
+        # caller-wide absolute boundary prevents repeated lease conflicts from
+        # restarting the busy wait indefinitely.
+        if deadline_monotonic is not None:
+            if busy_wait_deadline is None:
+                busy_wait_deadline = selection_started + max(self._IMAGE_POOL_WAIT_SECONDS, self._IMAGE_BUSY_WAIT_SECONDS)
+            busy_wait_deadline = min(deadline_monotonic, busy_wait_deadline)
+        else:
+            busy_wait_deadline = pool_wait_deadline
         while True:
             selection_loops += 1
             with self._image_slot_condition:
@@ -2509,7 +2526,7 @@ class AccountService:
                     )
                     return access_token
                 else:
-                    pool_wait_remaining = pool_wait_deadline - time.monotonic()
+                    pool_wait_remaining = busy_wait_deadline - time.monotonic()
                     if pool_wait_remaining <= 0:
                         self._set_image_selection_diagnostics(
                             account_wait_reason="all_ready_accounts_busy",
@@ -2786,6 +2803,10 @@ class AccountService:
         }
         candidate_attempts = 0
         minimum_validity_seconds = self._image_token_validity_window(deadline_monotonic)
+        busy_wait_deadline = time.monotonic() + max(
+            getattr(self, "_IMAGE_POOL_WAIT_SECONDS", AccountService._IMAGE_POOL_WAIT_SECONDS),
+            getattr(self, "_IMAGE_BUSY_WAIT_SECONDS", AccountService._IMAGE_BUSY_WAIT_SECONDS),
+        )
 
         def timed(metric, operation, *args, **kwargs):
             started = time.monotonic()
@@ -2816,6 +2837,7 @@ class AccountService:
                     deadline_monotonic=deadline_monotonic,
                     requires_file_upload=requires_file_upload,
                     minimum_validity_seconds=minimum_validity_seconds,
+                    busy_wait_deadline=busy_wait_deadline,
                 )
                 try:
                     if AccountService._strict_admission():

@@ -50,6 +50,8 @@ x-app: &app
     CHATGPT2API_MAINTENANCE_IMPORTER_URL: http://importer:80
     CHATGPT2API_IMAGE_QUEUE_LIMIT: 40
     CHATGPT2API_IMAGE_RETRY_AFTER_SECS: 2
+    # Only extend a busy ready pool; empty/expired pools keep the short probe.
+    CHATGPT2API_IMAGE_BUSY_WAIT_SECONDS: ${CHATGPT2API_IMAGE_BUSY_WAIT_SECONDS:-30}
     # Super-resolution is independent from image generation slots. Keep eight
     # CPU jobs per replica so normal image traffic does not queue behind four
     # post-processing jobs; tune down through .env if CPU saturation appears.

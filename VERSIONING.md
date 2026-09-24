@@ -1,5 +1,14 @@
 # 稳定版本、升级和回退
 
+## 2026-09-24 网关配置补丁：dynamic-backends-v1
+
+- 配置提交：`1288478c155314689534011ef0be7eda16e7f914`；容器回归环境兼容修正：`ade81b5c7b30901772ce41b41688937699f6b678`。
+- 修复管理/图任务/图片后备及 importer 的静态后端解析。两组固定角色 upstream 使用 Docker DNS 动态解析；生图池、路径、并发和 POST 重试策略不变。
+- [真实 Nginx/Docker DNS 回归](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36020215556)的 `gateway-regression` 与 PostgreSQL 回归已通过：对照组复现健康 `/version` + 概览 404，新配置在 app0/importer 旧 IP 被其他角色占用后自动恢复，导入路径/请求内容及平滑重载中的合成 SSE 保持正确。
+- 现网已回传：直连 app0 401、网关 404，Nginx 平滑重载后网关恢复为预期的未认证 401；浏览器应使用已有登录态重载概览。
+- **这是宿主机挂载配置更新，不需要更换应用镜像；应用仍为 3.2.36 / `sha-3c1535b`。** 当前已恢复的服务器可先继续运行，永久配置安装见 [网关更新与复验](./docs/gateway-routing.md)。单文件挂载可能仍引用旧 inode，须用容器内 `nginx -T` 核对标记，不能认为 `git pull` + reload 一定读到了新文件；如需重建，仅在排空后重建 gateway，不重启生图容器。
+- 本机无 Linux Docker 引擎，已做 Python 语法和 Compose 校验；真实 Nginx/IP 复用与 PostgreSQL 测试在 GitHub CI 执行。DNS 刷新仍存在缓存窗口，不承诺后端重建零中断。
+
 ## 2026-09-24 当前发布：3.2.36
 
 - 应用提交：`3c1535b06a57fcb54162954b8b510f680da1922f`。

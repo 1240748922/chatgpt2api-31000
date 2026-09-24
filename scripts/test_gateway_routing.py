@@ -25,7 +25,7 @@ def docker(*args, check=True):
     result = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=120)
     if check and result.returncode:
         raise RuntimeError(f"docker {' '.join(args)}: {result.stderr}")
-    return result.stdout.strip()
+    return (result.stdout if check else result.stdout + result.stderr).strip()
 
 
 def request(port, path, *, method="GET", body=None):
@@ -102,7 +102,7 @@ def main():
         existing = docker("network", "ls", "-q").splitlines()
         import ipaddress
         occupied = [ipaddress.ip_network(c["Subnet"]) for n in json.loads(docker("network", "inspect", *existing))
-                    for c in n.get("IPAM", {}).get("Config", []) if c.get("Subnet")]
+                    for c in ((n.get("IPAM") or {}).get("Config") or []) if c.get("Subnet")]
         subnet = next(ipaddress.ip_network(f"172.29.{i}.0/24") for i in range(256)
                       if not any(ipaddress.ip_network(f"172.29.{i}.0/24").overlaps(other)
                                  for other in occupied if other.version == 4))

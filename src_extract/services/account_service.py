@@ -3461,15 +3461,22 @@ class AccountService:
         limit: int | None = None,
         *,
         freshness_seconds: int | float | None = None,
+        candidate_tokens: list[str] | None = None,
     ) -> list[str]:
         """Return a bounded, oldest-first batch of accounts needing quota checks.
 
         This intentionally never returns the whole unknown pool. The lifecycle
         watcher uses it to make gradual progress through large imports while the
         recent-attempt guard prevents a failed check from being retried every
-        cycle.
+        cycle. An existing candidate window can be revalidated without scanning
+        the whole pool or synchronously requesting a full snapshot reload.
         """
-        self._refresh_accounts_snapshot_if_stale()
+        if candidate_tokens is None:
+            self._refresh_accounts_snapshot_if_stale()
+        else:
+            # Continuations revalidate only an existing bounded queue window;
+            # never synchronously reload the full pool on the short cadence.
+            self._refresh_accounts_snapshot_if_stale(wait_for_refresh=False, allow_full_reload=False)
         freshness = self._pool_health_freshness_seconds(freshness_seconds)
         batch_size = (
             self._UNKNOWN_QUOTA_SYNC_BATCH_SIZE
@@ -3479,7 +3486,11 @@ class AccountService:
         now = datetime.now(timezone.utc)
         candidates: list[tuple[float, str]] = []
         with self._lock:
-            snapshot = tuple(self._accounts.values())
+            if candidate_tokens is None:
+                snapshot = tuple(self._accounts.values())
+            else:
+                resolved = dict.fromkeys(self._resolve_access_token_locked(token) for token in candidate_tokens)
+                snapshot = tuple(self._accounts[token] for token in resolved if token in self._accounts)
             busy = set(self._image_inflight)
         for item in snapshot:
             token = str(item.get("access_token") or "").strip()

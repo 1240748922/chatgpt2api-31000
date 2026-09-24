@@ -1,6 +1,45 @@
 # 稳定版本、升级和回退
 
-## 2026-09-24 当前发布：3.2.33
+## 2026-09-24 当前发布：3.2.35
+
+- 应用提交：`53947c94cf12ceaa4b6338b49df6e28841ddf6ba`。
+- 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-53947c9`，同时发布到 `latest`。
+- [GitHub Actions：PostgreSQL 回归及镜像发布](https://github.com/1240748922/chatgpt2api-31000/actions/runs/35988415876)已成功，已核实 `Build and push` 步骤成功。
+- 生图结果由逐账号提交改为最多 32 个账号的小批提交；普通账号状态写入冲突只重读相关账号，不再在持写锁期间反复加载整个池。远端删除/轮换仍走原身份协调，额度/计数合并与共享租约保护保留。详见 [写锁修复与复验](./docs/account-writer-contention.md)。
+- 包含 3.2.34：首次取号“就绪但全忙”默认有界等待最多 30 秒，释放槽位立即唤醒，受请求截止约束；真实空池/过期/额度耗尽不放行。取号日志保留繁忙、候选和分片诊断。3.2.34 应用提交 `cccfd32a1f8a1df5da85b7de34dd3d46089cd98a` 已构建发布，本次直接更新到包含它的 3.2.35。
+- 验证：484 项本地 Python 测试、6 项 GitHub PostgreSQL 17 回归、4 组 Node 检查和 Compose 配置校验通过。本机无 PostgreSQL 的 6 项跳过已在 CI 实跑。未直接更新服务器，未使用真实账号生图压测。
+- 不修改导号、预热、代理、生图/超分并发、真实 `.env` 或数据库结构；不放宽后台性能暂停阈值。更新后仍需观察写锁 P95 和后台维护是否恢复，无法续期的过期 AT 不会自动变成可用账号。
+
+**若服务器 `.env` 固定了 `CHATGPT2API_IMAGE_TAG`，先改成 `sha-53947c9`，或移除该项使用 Compose 默认值。`git pull` 不会修改 `.env`。**
+
+在低峰暂停新请求和导入，等在途任务结束并备份数据库/配置后执行：
+
+```bash
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+此流程有统一切换窗口，不是无中断升级，不删除卷、不重建 PostgreSQL。恢复后 `/version` 应为 **3.2.35**。逐实例核验：
+
+```bash
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+所有实例应输出 `53947c94cf12ceaa4b6338b49df6e28841ddf6ba`。观察“账号可用性 → 详情”：写锁 P95 是否下降、维护每批是否从 0 恢复、就绪池是否补充；旧指标窗口和恢复观察不会瞬间清零。若仍暂停，保留新的原因、采样时间和一次取号失败 JSON，不要清空共享租约或重新导入全池。
+
+回退镜像为 `sha-6f5cb89`（3.2.33），同样排空后统一切换。部署锁定提交使用 `[skip ci]`，没有另外的应用镜像标签。
+
+---
+
+## 2026-09-24 上一版：3.2.33
 
 - 应用提交：`6f5cb89bee1ff0be5365510bffe6e01684d8cbb2`。
 - 应用镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-6f5cb89`，同时发布到 `latest`。

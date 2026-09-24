@@ -6,8 +6,31 @@
 - 历史 RT 终止错误单列“待复核”，正常续期候选优先；严格模式下后台未知额度队列只使用已就绪 AT，避免重复尝试尚未恢复的凭据。不根据历史错误直接删号、批量标死 RT，不改导入/手动同步行为。
 - 已观察到的完整上游内容拒绝模板明确分类，保留原始原因和 HTTP 400，不通过换号绕过拒绝。
 - 增加 `sh scripts/verify_gateway.sh` 只读验收，检查配置哈希、动态路由及 app0 身份；CI 增加单文件挂载旧 inode 对照。实际服务器未修改，由用户安排更新。
-- 详细边界、复验与网关单独修复见 [维护实例与恢复分类](./docs/maintenance-owner-recovery.md)。发布镜像/CI 信息将在构建验证完成后锁定。
-- 本地验证：553 项发布回归、10 项新增内容拒绝分类测试通过，4 组 Node、Compose、Python 语法与差异校验通过；额外复验真实前端手机/桌面及深色布局。6 项 PostgreSQL 和真实 Docker/Nginx 回归交由 CI 执行。未使用真实账号触发生图或 RT 刷新，未更新用户服务器。
+- 详细边界、复验与网关单独修复见 [维护实例与恢复分类](./docs/maintenance-owner-recovery.md)。应用提交：`a39e32f16a86c02a2301b7969d274f904633bb5e`；镜像：`ghcr.io/1240748922/chatgpt2api-31000:sha-a39e32f`，同时发布 `latest`。
+- 本地验证：553 项发布回归、10 项新增内容拒绝分类测试通过，4 组 Node、Compose、Python 语法与差异校验通过；额外复验真实前端手机/桌面及深色布局。6 项 PostgreSQL 和真实 Docker/Nginx 回归已在 CI 通过。未使用真实账号触发生图或 RT 刷新，未更新用户服务器。
+- [GitHub Actions](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36035066123) 全部成功，已核实 `Build and push` 成功，Compose 默认镜像及 `.env.example` 已锁定。
+
+**服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-a39e32f`，或移除该项使用 Compose 默认值。** 保留现有其他参数，不要覆盖实际 `.env`。本版不要求改维护并发、超分或导号参数。
+
+低峰暂停新请求和导入，等待在途任务结束、备份数据库/配置后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+有统一切换窗口，不承诺无中断；不重建 PostgreSQL、不删除卷。本次一定包含 gateway 重建，**仅 reload 不能修复已经确认的旧 inode 挂载**。验收脚本只读，失败时先检查原因，不要反复重建全部服务。
+
+`/version` 应显示 **3.2.39 / sha-a39e32f**；若显式固定了 `CHATGPT2API_BUILD_VERSION`，也需同步版本标签。镜像 revision 应为 `a39e32f16a86c02a2301b7969d274f904633bb5e`，详情来源应为 app0，而不是“非维护实例 app7”；同步失败、历史待复核和待补凭据并不等于停止执行。先确认新原始进度，再观察累计次数。
+
+回退镜像为 `sha-2229b06`（3.2.38），同样排空后切换，无数据库迁移；保留动态网关配置。部署锁定提交标记 `[skip ci]`，不生成新的应用镜像 SHA。
 
 ---
 

@@ -6,7 +6,26 @@
 - 额度同步采用后台已有的持久化进度 `checked`，包括已完成处理的成功、失败和 RT 兑换失败跳过项；跳过会单独注明，不误算同步成功。每批提交后随原轮询更新，不从有条数上限的日志反推进度。
 - 最小化窗口在入库结束后切换到同步进度；等待同步、中断、已完成、未启用同步均有对应显示。保留成功/失败明细，并调整小屏幕间距保证日志区域可滚动。
 - 仅前端显示及版本更新，后台导入、同步速度/并发、数据库、凭据、生图和用户配置不变；前端模块统一更新缓存版本，避免载入旧组件或重复 Vue 实例。服务器由用户更新。
-- 74 项针对性回归及 4 组 Node 检查通过，覆盖真实 Chromium 导入/清理/可用性界面、导入断点/幂等、同步任务、版本接口；复验最小化继续刷新、RT 跳过、中断、未启用同步和 3 种屏幕尺寸。CI 与镜像标签完成后补充。
+- 74 项针对性回归及 4 组 Node 检查通过，覆盖真实 Chromium 导入/清理/可用性界面、导入断点/幂等、同步任务、版本接口；复验最小化继续刷新、RT 跳过、中断、未启用同步和 3 种屏幕尺寸。Compose、差异校验通过；CI 的 PostgreSQL 17 协调及 Docker/Nginx 回归也均通过。
+- [GitHub Actions 36095967732](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36095967732) 全部成功，已核实镜像发布。应用提交 `bfb687026ee5337aa907d6a886dec7d608f2658f`；镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-bfb6870`（同时更新 latest），Compose 默认标签已锁定；回退版本为 3.2.42 / `sha-c49a76d`。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-bfb6870`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.43 / sha-bfb6870`。更新后刷新浏览器，打开导入任务日志检查两条进度；已入库而仍同步中的任务应继续显示同步已处理数量和剩余数量。无需重新导入账号。现有更新流程有访问切换窗口，不删除卷、不重建 PostgreSQL。
 
 ---
 

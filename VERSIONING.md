@@ -6,8 +6,26 @@
 - 修复并发结果写入把长冷却覆盖成短冷却；重复清理、已在途成功不清除冷却。文生图及额度保留，上传/额度重试仍不消耗普通错误次数，原截止时间、内容拒绝、导号、续期和超分配置不变。
 - 未返回 Retry-After、15 分钟冷却后仍受限的账号改为渐进冷却，默认最多 2 小时；明确 Retry-After 仍遵从上游。新增可选 `CHATGPT2API_UPLOAD_COOLDOWN_MAX_SECONDS`，设为基础冷却可恢复固定等待，不改实际 `.env`。
 - 原有取号/释放事务内完成，无新增全池扫描或上传预检，无数据库表结构迁移。详见 [共享上传冷却](./docs/shared-upload-cooldown.md)。服务器由用户更新。
-- 本地 581 项回归通过，包含导号/可用性界面、生图重试/后处理、账号写入及后台维护；Compose 和差异校验通过。新增 PostgreSQL 事务交错验证随镜像 CI 执行。
-- 构建验证与镜像锁定信息在发布成功后补全；回退版本为 3.2.40 / `sha-e0bb015`。
+- 本地 581 项回归通过，包含导号/可用性界面、生图重试/后处理、账号写入及后台维护；Compose 和差异校验通过。9 项真实 PostgreSQL 17 协调测试及 Docker/Nginx 回归均在 CI 通过。
+- [GitHub Actions 36093482160](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36093482160) 全部成功，已核实 `Build and push` 成功。镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-f8acd01`（同时更新 latest），Compose 已锁定；回退版本为 3.2.40 / `sha-e0bb015`。
+
+**更新：** `.env` 若显式固定 `CHATGPT2API_IMAGE_TAG`，改为 `sha-f8acd01`；若还固定了 `CHATGPT2API_BUILD_VERSION`，同步该值。未固定时直接使用 Compose 默认值，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等在途任务结束，备份数据库与配置后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.41 / sha-f8acd01`。应用 revision 为 `f8acd017d10e5b6b4896fdbc5dc87dc4d523d4b6`；全部应用完成更新后共享冷却保护才完整生效。保留原有网关重建步骤以处理此前已确认的旧挂载；不重建 PostgreSQL、不删除卷。仍有访问切换窗口。
 
 ---
 

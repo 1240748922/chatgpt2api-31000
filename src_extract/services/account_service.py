@@ -2308,10 +2308,22 @@ class AccountService:
             and (token := str(account.get("access_token") or "").strip())
             and (self._token_needs_refresh(token) or (AccountService._strict_admission() and self._token_expires_in(token) is None))
         ]
-        # A large legacy-rejection backlog must not be sorted ahead of ordinary
-        # recovery simply because its ATs expired earlier. Still recheck it:
-        # old error text alone cannot invalidate replacement credentials.
-        return [token for _, _, token in sorted(candidates, key=lambda item: item[:2])]
+        # Ordinary recovery includes still-usable ATs in the 24h renewal window.
+        # Putting ALL of them first starves expired historical accounts under
+        # reduced (one-per-cycle) maintenance. Reserve one position after each
+        # three ordinary candidates, while retaining expiry order within each
+        # group. The watcher retains this order across slices, so a width of one
+        # cannot reset the share on every turn. No extra scan or OAuth request.
+        ordinary, historical = deque(), deque()
+        for unverified, _expiry, token in sorted(candidates, key=lambda item: item[:2]):
+            (historical if unverified else ordinary).append(token)
+        ordered = []
+        while ordinary or historical:
+            for _ in range(min(3, len(ordinary))):
+                ordered.append(ordinary.popleft())
+            if historical:
+                ordered.append(historical.popleft())
+        return ordered
 
     def list_tokens(self) -> list[str]:
         self._refresh_accounts_snapshot_if_stale()

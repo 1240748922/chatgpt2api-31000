@@ -5,7 +5,11 @@ from typing import Any, Literal
 
 from services.account_capabilities import upload_blocked
 
-from services.account_credentials import project_upstream_credential_availability
+from services.account_credentials import (
+    CredentialAvailabilityStatus,
+    UpstreamCredentialAvailability,
+    project_upstream_credential_availability,
+)
 from services.account_readiness import credential_readiness
 from services.proxy_management_service import project_proxy_assignment
 from utils.diagnostics import sanitize_diagnostic_text
@@ -92,15 +96,20 @@ def _timestamp_seconds(value: object) -> int | None:
     return int(parsed.timestamp())
 
 
-def _credential_lifecycle(account: dict[str, Any]) -> dict[str, Any]:
-    access_token = _text(account.get("access_token"))
-    remotely_invalid = _text(account.get("last_remote_check_result")).lower() == "invalid"
-    availability = project_upstream_credential_availability(
-        access_token,
+def _credential_availability(
+    account: dict[str, Any], *, now_seconds: int | None = None,
+) -> UpstreamCredentialAvailability:
+    return project_upstream_credential_availability(
+        _text(account.get("access_token")),
         _text(account.get("refresh_token")),
-        access_confirmed_invalid=remotely_invalid,
+        access_confirmed_invalid=_text(account.get("last_remote_check_result")).lower() == "invalid",
         refresh_confirmed_invalid=bool(account.get("refresh_token_invalid_at")),
+        now_seconds=now_seconds,
     )
+
+
+def _credential_lifecycle(account: dict[str, Any]) -> dict[str, Any]:
+    availability = _credential_availability(account)
     access = availability.access
     refresh_status = availability.refresh_status
     access_label, access_tone = _ACCESS_TOKEN_PRESENTATION[access.status]
@@ -165,11 +174,11 @@ def _backend_status_category(account: dict[str, Any]) -> AccountStatusCategory:
 
 def _effective_status_category(
     backend_category: AccountStatusCategory,
-    credential_lifecycle: dict[str, Any],
+    credential_availability: CredentialAvailabilityStatus,
 ) -> AccountStatusCategory:
     if backend_category in {"disabled", "abnormal"}:
         return backend_category
-    if credential_lifecycle["credential_availability"] == "unavailable":
+    if credential_availability == "unavailable":
         return "abnormal"
     return backend_category
 
@@ -179,7 +188,7 @@ def _status(
     credential_lifecycle: dict[str, Any],
 ) -> tuple[AccountStatusCategory, str, PresentationTone, str, str, str]:
     backend_category = _backend_status_category(account)
-    category = _effective_status_category(backend_category, credential_lifecycle)
+    category = _effective_status_category(backend_category, credential_lifecycle["credential_availability"])
     remote_result = _text(account.get("last_remote_check_result")).lower()
     raw_error = _diagnostic(
         (
@@ -219,11 +228,17 @@ def _status(
     )
 
 
-def account_status_category(account: dict[str, Any]) -> AccountStatusCategory:
+def account_status_category(
+    account: dict[str, Any], *, now_seconds: int | None = None,
+) -> AccountStatusCategory:
     """Project the effective management category without mutating stored status."""
+    backend_category = _backend_status_category(account)
+    if backend_category in {"disabled", "abnormal"}:
+        return backend_category
+    # Counts and filters need no display labels or sanitized diagnostic details.
     return _effective_status_category(
-        _backend_status_category(account),
-        _credential_lifecycle(account),
+        backend_category,
+        _credential_availability(account, now_seconds=now_seconds).status,
     )
 
 

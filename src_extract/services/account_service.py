@@ -6461,17 +6461,25 @@ class AccountService:
             return deepcopy(result)
 
     def get_stats(self) -> dict:
+        from services.account_view import account_status_category
+
         self._refresh_accounts_snapshot_if_stale()
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
         now_epoch = time.time()
+        now_seconds = int(now_epoch)
+        categories = dict(normal=0, limited=0, abnormal=0, disabled=0)
+        normal_items = []
+        # Match management filters, including unusable AT/RT credentials whose
+        # persisted status is still normal. Classify outside the account lock;
+        # never persist this projection or use it to change dispatch/cleanup.
+        for account in items:
+            category = account_status_category(account, now_seconds=now_seconds)
+            categories[category] += 1
+            if category == "normal":
+                normal_items.append(account)
         upload_limited = sum(1 for a in items if upload_blocked(a, now_epoch))
-        abnormal = sum(1 for a in items if a.get("status") == "异常")
-        disabled = sum(1 for a in items if a.get("status") == "禁用")
-        normal_items = [a for a in items if a.get("status") == "正常"]
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in normal_items)
         unlimited = sum(1 for a in normal_items if self._is_unlimited_image_quota_account(a))
         unknown_quota = sum(
@@ -6492,11 +6500,11 @@ class AccountService:
         return {
             "total": total,
             "cumulative_total": self._cumulative_total,
-            "active": active,
-            "limited": limited,
+            "active": categories["normal"],
+            "limited": categories["limited"],
             "upload_limited": upload_limited,
-            "abnormal": abnormal,
-            "disabled": disabled,
+            "abnormal": categories["abnormal"],
+            "disabled": categories["disabled"],
             "total_quota": total_quota,
             "unlimited_quota_count": unlimited,
             "unknown_quota_count": unknown_quota,

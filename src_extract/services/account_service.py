@@ -20,7 +20,9 @@ from services.account_maintenance_metrics import collect_token_timings, token_ph
 from services.credential_coordinator import CredentialCoordinator, CredentialBusy, LeasedToken, resource
 from services.account_readiness import credential_readiness
 from services.account_maintenance_progress import current_maintenance_batch
-from services.account_capabilities import upload_blocked, record_upload_throttle
+from services.account_capabilities import (
+    upload_blocked, upload_blocked_until, upload_cooldown_seconds, record_upload_throttle, merge_upload_cooldown,
+)
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     access_token_expires_in_seconds,
@@ -796,6 +798,9 @@ class AccountService:
                 merged[field] = deepcopy(local[field])
             else:
                 merged.pop(field, None)
+        # A later short response must not undo a longer wait or its backoff
+        # history when both result writers started from an unblocked snapshot.
+        merge_upload_cooldown(merged, remote)
         return merged
 
     @staticmethod
@@ -2776,10 +2781,14 @@ class AccountService:
         return bool(env_int("CHATGPT2API_STRICT_IMAGE_CREDENTIALS", 1, 0, 1))
 
     @staticmethod
-    def _release_shared_image_slot(access_token):
+    def _release_shared_image_slot(access_token, *, failure=None):
         if isinstance(access_token, LeasedToken):
             try:
-                access_token.release()
+                throttled = failure is not None and failure.code == "file_upload_throttled"
+                return access_token.release(
+                    upload_cooldown_seconds=upload_cooldown_seconds(failure.retry_after) if throttled else 0,
+                    upload_retry_after_missing=throttled and failure.retry_after is None,
+                )
             except Exception:
                 # Fail closed. A failed cleanup must not trigger regeneration or
                 # hide the image result; this exact lease expires conservatively.
@@ -2905,9 +2914,18 @@ class AccountService:
                         with self._image_slot_condition:
                             current = self._accounts.get(access_token)
                             if current:
-                                duration = 30 if exc.reason in {"refresh_outcome_uncertain", "credential_refresh_pending"} else 1
-                                self._credential_blocked[access_token] = (
-                                    time.monotonic() + duration, self._credential_generation(access_token, current))
+                                if exc.reason == "file_upload_throttled":
+                                    # Cache the shared capability exclusion, not
+                                    # a credential ban: text generation stays usable.
+                                    current = dict(current)
+                                    current["file_upload_blocked_until"] = max(
+                                        upload_blocked_until(current), time.time() + upload_cooldown_seconds(exc.retry_after),
+                                    )
+                                    self._accounts[access_token] = current
+                                else:
+                                    duration = 30 if exc.reason in {"refresh_outcome_uncertain", "credential_refresh_pending"} else 1
+                                    self._credential_blocked[access_token] = (
+                                        time.monotonic() + duration, self._credential_generation(access_token, current))
                         if exc.reason == "credential_changed":
                             self._schedule_accounts_snapshot_refresh(max_age_seconds=0)
                     if isinstance(exc, StorageRevisionConflictError):
@@ -5310,7 +5328,7 @@ class AccountService:
         expected_last_token_refresh_at: str | None = None,
         defer_persistence: bool = False,
     ) -> dict | None:
-        self._release_shared_image_slot(access_token)
+        shared_upload_state = self._release_shared_image_slot(access_token, failure=failure if not success else None)
         if not access_token:
             return None
         now = datetime.now(timezone.utc)
@@ -5347,6 +5365,8 @@ class AccountService:
                 if failure is not None and failure.code == "file_upload_throttled":
                     record_upload_throttle(next_item, failure.retry_after, now.timestamp())
                     next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                if shared_upload_state:
+                    merge_upload_cooldown(next_item, shared_upload_state)
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1

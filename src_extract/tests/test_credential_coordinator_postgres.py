@@ -3,7 +3,8 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-from threading import Barrier
+from threading import Barrier, Event
+from contextlib import contextmanager
 import time
 
 import pytest
@@ -122,4 +123,69 @@ def test_postgres_disjoint_result_batches_do_not_conflict_on_collection_revision
         assert left.result(timeout=10).updated == 32
         assert right.result(timeout=10).updated == 32
     assert all(r["quota"] == 7 and r["success"] == 1 for r in a.storage.load_accounts())
+
+
+def test_postgres_cooldown_and_release_are_one_atomic_handoff(pair, monkeypatch):
+    a, b, account = pair
+    lease = a.acquire_image(account, minimum_validity=300, duration=400, limit=1, requires_upload=True)
+    edited, finish = Event(), Event()
+    original = a.edit
+
+    @contextmanager
+    def paused_commit(key):
+        with original(key) as state:
+            yield state
+            edited.set()
+            assert finish.wait(5)
+
+    monkeypatch.setattr(a, "edit", paused_commit)
+    with ThreadPoolExecutor(1) as executor:
+        result = executor.submit(lease.release, upload_cooldown_seconds=120)
+        try:
+            assert edited.wait(2)
+            # Even with a second free slot, no request enters the write gap.
+            with pytest.raises(CredentialBusy):
+                b.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+        finally:
+            finish.set()
+        result.result(timeout=5)
+    with pytest.raises(CredentialBusy, match="file_upload_throttled") as failure:
+        b.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+    assert 0 < failure.value.retry_after <= 120
+    assert "file_upload_blocked_until" not in a.storage.load_accounts()[0]
+    text_image = b.acquire_image(account, minimum_validity=300, duration=400, limit=2)
+    text_image.release()
+
+
+def test_postgres_late_shorter_cooldown_and_cleanup_keep_longer_deadline(pair):
+    a, b, account = pair
+    one = a.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+    two = b.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+    one.release(upload_cooldown_seconds=3600)
+    with b.edit(one.key) as (_, data, _):
+        until = data["file_upload_blocked_until"]
+    two.release(upload_cooldown_seconds=60)
+    one.release()
+    with b.edit(one.key) as (_, data, _):
+        assert data["file_upload_blocked_until"] == until
+        assert data["leases"] == {}
+    restarted = CredentialCoordinator(a.storage)
+    with pytest.raises(CredentialBusy, match="file_upload_throttled"):
+        restarted.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+
+
+def test_postgres_adaptive_cooldown_survives_coordinator_restart(pair, monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_SECONDS", "900")
+    a, b, account = pair
+    first = a.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+    state = first.release(upload_cooldown_seconds=900, upload_retry_after_missing=True)
+    assert state["file_upload_throttle_streak"] == 1
+    with b.edit(first.key) as (_, data, now):
+        data["file_upload_blocked_until"] = now - 1
+    restarted = CredentialCoordinator(a.storage)
+    next_lease = restarted.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=True)
+    state = next_lease.release(upload_cooldown_seconds=900, upload_retry_after_missing=True)
+    assert state["file_upload_throttle_streak"] == 2
+    with b.edit(first.key) as (_, data, now):
+        assert 1790 < data["file_upload_blocked_until"] - now <= 1800
 

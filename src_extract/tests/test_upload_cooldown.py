@@ -163,3 +163,45 @@ def test_upload_limit_response_preserves_retry_after():
     assert response.status_code == 429
     assert response.headers["retry-after"] == "120"
     assert b"file_upload_throttled" in response.body
+
+
+def test_missing_retry_after_backs_off_only_on_repeated_cooldown_expiry(monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_SECONDS", "900")
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_MAX_SECONDS", "7200")
+    account = {}
+    now = 1000
+    durations = []
+    for _ in range(6):
+        record_upload_throttle(account, None, now)
+        durations.append(account["file_upload_blocked_until"] - now)
+        now = account["file_upload_blocked_until"] + 1
+    assert durations == [900, 1800, 3600, 7200, 7200, 7200]
+
+
+def test_simultaneous_throttles_do_not_multiply_backoff(monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_SECONDS", "900")
+    account = {}
+    for _ in range(100):
+        record_upload_throttle(account, None, 1000)
+    assert account["file_upload_throttle_streak"] == 1
+    assert account["file_upload_blocked_until"] == 1900
+
+
+def test_recovered_interval_resets_backoff_and_explicit_retry_after_wins(monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_SECONDS", "900")
+    account = {"file_upload_blocked_until": 1000, "file_upload_throttle_streak": 4}
+    record_upload_throttle(account, 60, 1001)
+    assert account["file_upload_blocked_until"] == 1061
+    assert account["file_upload_throttle_streak"] == 0
+    account.update(file_upload_blocked_until=2000, file_upload_throttle_streak=4)
+    record_upload_throttle(account, None, 3000)
+    assert account["file_upload_blocked_until"] == 3900
+    assert account["file_upload_throttle_streak"] == 1
+
+
+def test_backoff_max_can_restore_fixed_cooldown_without_shortening_base(monkeypatch):
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_SECONDS", "900")
+    monkeypatch.setenv("CHATGPT2API_UPLOAD_COOLDOWN_MAX_SECONDS", "600")
+    account = {"file_upload_blocked_until": 1000, "file_upload_throttle_streak": 4}
+    record_upload_throttle(account, None, 1001)
+    assert account["file_upload_blocked_until"] == 1901

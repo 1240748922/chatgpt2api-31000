@@ -7,6 +7,7 @@ Image leases cover the request deadline plus a recovery grace period.
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import time
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from sqlalchemy import Column, String, Text, text
 from sqlalchemy.orm import sessionmaker
 
 from services.application_database import DatabaseBase
+from services.account_capabilities import UPLOAD_COOLDOWN_FIELDS, upload_blocked_until, record_upload_throttle
 
 
 class CredentialGate(DatabaseBase):
@@ -23,8 +25,9 @@ class CredentialGate(DatabaseBase):
 
 
 class CredentialBusy(RuntimeError):
-    def __init__(self, reason="credential_in_use"):
+    def __init__(self, reason="credential_in_use", *, retry_after=None):
         self.reason = reason
+        self.retry_after = retry_after
         super().__init__(reason)
 
 
@@ -51,9 +54,24 @@ class LeasedToken(str):
     def __deepcopy__(self, memo):
         return self
 
-    def release(self):
+    def release(self, *, upload_cooldown_seconds=0, upload_retry_after_missing=False):
         # The DB deletion is idempotent, including retries after a lost commit.
-        self.coordinator.release(self.key, self.owner)
+        # Retain a failed publication on this exact ticket if cleanup is retried.
+        self.upload_cooldown_seconds = max(getattr(self, "upload_cooldown_seconds", 0), upload_cooldown_seconds)
+        self.upload_retry_after_missing = getattr(self, "upload_retry_after_missing", False) or upload_retry_after_missing
+        for attempt in range(3):
+            try:
+                return self.coordinator.release(
+                    self.key, self.owner, upload_cooldown_seconds=self.upload_cooldown_seconds,
+                    upload_retry_after_missing=self.upload_retry_after_missing,
+                )
+            except CredentialBusy:
+                # A simultaneous finish briefly owns this credential gate.
+                # Retry only this nonblocking lock miss, at most 30ms of sleep;
+                # database/network failures retain the original lease expiry.
+                if attempt == 2:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
 
 
 class CredentialCoordinator:
@@ -98,15 +116,18 @@ class CredentialCoordinator:
 
     def acquire_image(self, account, *, minimum_validity, duration, limit, requires_upload=False):
         from services.account_readiness import credential_readiness
-        from services.account_capabilities import upload_blocked
         if not isinstance(account, dict) or not account.get("access_token"):
             raise CredentialBusy("credential_changed")
         key, owner = resource(account), uuid4().hex
         with self.edit(key) as (session, data, now):
             current = self.current(session, account)
+            # The account result writer is asynchronous. Consult the same gate
+            # that releases the previous lease before admitting another upload.
+            until = max(upload_blocked_until(current), upload_blocked_until(data))
+            if requires_upload and until > now:
+                raise CredentialBusy("file_upload_throttled", retry_after=math.ceil(until - now))
             if (credential_readiness(current, minimum_validity, now=now)["state"] != "ready"
-                    or current.get("status") == "限流"
-                    or (requires_upload and upload_blocked(current, now))):
+                    or current.get("status") == "限流"):
                 raise CredentialBusy("credential_not_ready")
             state = data.get("refresh_state")
             if state in {"sent", "uncertain"} or (
@@ -118,9 +139,16 @@ class CredentialCoordinator:
             data["leases"][owner] = now + duration
         return LeasedToken(account["access_token"], self, key, owner)
 
-    def release(self, key, owner):
-        with self.edit(key) as (_, data, _now):
+    def release(self, key, owner, *, upload_cooldown_seconds=0, upload_retry_after_missing=False):
+        with self.edit(key) as (_, data, now):
+            # Publish and free capacity atomically. An overlapping success or
+            # duplicate cleanup must never erase/extend this cooldown. Only the
+            # live lease owner can report a new upload failure.
+            if owner in data["leases"] and upload_cooldown_seconds > 0:
+                record_upload_throttle(data, None if upload_retry_after_missing else upload_cooldown_seconds, now)
             data["leases"].pop(owner, None)
+            cooldown = {field: data[field] for field in UPLOAD_COOLDOWN_FIELDS if field in data}
+        return cooldown
 
     def begin_refresh(self, account, *, imported=False):
         key, owner = resource(account), uuid4().hex

@@ -1,9 +1,9 @@
 // This repository ships built Vue assets. Keep the new panel readable and
 // use the existing application's Vue runtime, HTTP client, modal and theme.
 import {d as defineComponent, b as createVNode, l as Button, O as Icon, a5 as Checkbox, r as ref, G as computed, s as onMounted,
-  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260925-owner-v17";
-import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel, importHistoryLimit, importEventLimit} from "./accountImportRuntime-v3.js?v=20260925-owner-v17";
-import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260925-owner-v17";
+  x as onUnmounted, m as api} from "./index-BhEm-7EJ.js?v=20260925-import-v18";
+import {createImportController, readImportInputs, formatImportInput, formatEvent, elapsed, jobLabel, importProgress, importProgressLabel, importHistoryLimit, importEventLimit} from "./accountImportRuntime-v3.js?v=20260925-import-v18";
+import {I as ImportModePanel} from "./ImportModePanel-D37CU3pc.js?v=20260925-import-v18";
 
 // The bundle's `a` export is createBaseVNode, a compiler-only helper: it
 // does not normalize classes or a single VNode child. Use public createVNode
@@ -30,7 +30,7 @@ export default defineComponent({
         state.value = value;
         if (value.selected !== selectedJob) { selectedJob = value.selected; itemPage.value = 1; }
         emit("busy-change", reading.value || value.busy);
-        emit("progress-change", value.job ? `${jobLabel(value.job)} · ${value.job.processed ?? value.job.saved}/${value.job.total}` : "尚未提交任务");
+        emit("progress-change", value.job ? importProgressLabel(value.job) : "尚未提交任务");
       },
       onAccountsChanged: () => emit("accounts-changed"),
     });
@@ -88,6 +88,14 @@ export default defineComponent({
       size: "xs", variant: primary ? "primary" : "outline", onClick, disabled,
     }, {default: () => [icon ? createVNode(Icon, {icon, class: "h-3.5 w-3.5", "aria-hidden": "true"}) : null, label]});
     const metric = (label, value) => h("div", {class: "min-w-0"}, [h("div", {class: "text-muted-foreground text-xs"}, label), h("div", {class: "mt-1 font-medium tabular-nums text-sm"}, value)]);
+    const phaseProgress = phase => h("div", {class: "account-import-phase", role: "group", "aria-label": `${phase.label}处理进度`}, [
+      h("div", {class: "account-import-phase-heading"}, [h("span", {}, phase.label), h("span", {class: "tabular-nums"}, `${phase.done} / ${phase.total}`)]),
+      h("progress", {max: phase.total || 1, value: phase.done, "aria-label": phase.label === "账号导入" ? "导入进度" : "额度同步进度"}),
+      h("div", {class: "account-import-phase-caption"}, [
+        h("span", {}, `${phase.waiting ? phase.waiting + " · " : ""}剩余 ${phase.remaining}`),
+        phase.skipped ? h("span", {}, `跳过 ${phase.skipped}（RT 兑换失败）`) : null,
+      ]),
+    ]);
     const stageLabel = stage => ({save: "入库", refresh: "RT 兑换", quota: "额度同步"}[stage] || stage || "处理");
     const statusClass = status => ({success: "text-emerald-600", failed: "text-red-600", skipped: "text-muted-foreground", info: "text-amber-600"}[status] || "text-muted-foreground");
     const tabs = (items, selected, label, prefix) => h("div", {class: "account-import-tabs", role: "tablist", "aria-label": label}, items.map(([id, title], index) =>
@@ -104,6 +112,7 @@ export default defineComponent({
       }, title)));
     return () => {
       const current = state.value, job = current.job;
+      const progress = job ? importProgress(job) : null;
       const allItems = current.items || [];
       const query = itemSearch.value.trim().toLowerCase();
       const visibleItems = allItems.filter(item =>
@@ -150,8 +159,8 @@ export default defineComponent({
           h("p", {id: "account-import-history-note", class: "account-import-history-note"}, `仅展示最近 ${importHistoryLimit} 个任务；每个任务展示最近 ${importEventLimit} 条日志事件（可含多条账号明细）。后台历史不受此显示上限影响。`),
           current.connection ? h("p", {role: "alert", class: "text-xs text-amber-600"}, current.connection) : null,
           job ? h("div", {class: "space-y-2", style: {flexShrink: 0}}, [
-            h("p", {class: "text-xs leading-5", role: "status"}, `${jobLabel(job)} · 总耗时 ${elapsed(((job.done ? job.updated_at : Date.now()/1000)-job.created_at)*1000)} · 已处理 ${job.processed ?? job.saved}/${job.total}`),
-            h("progress", {max: job.total || 1, value: job.processed ?? job.saved, class: "w-full h-2", "aria-label": "导入进度"}),
+            h("p", {class: "text-xs leading-5", role: "status"}, `${jobLabel(job)} · 总耗时 ${elapsed(((job.done ? job.updated_at : Date.now()/1000)-job.created_at)*1000)}`),
+            h("div", {class: "account-import-phases"}, [phaseProgress(progress.save), progress.quota ? phaseProgress(progress.quota) : null]),
             h("div", {class: "account-import-summary"}, [metric("已入库 / 总数", `${job.saved} / ${job.total}`), metric("新增 / 跳过", `${job.added} / ${job.skipped}`), metric("RT 处理 / 失败", `${job.refresh_done || 0} / ${job.refresh_failed || 0}`), metric("额度成功 / 失败", `${job.synced} / ${job.sync_failed}`)]),
             job.status === "failed" ? button("从断点重试中断任务", controller.retry) : null,
           ]) : null,

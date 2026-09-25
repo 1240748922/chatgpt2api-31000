@@ -17,6 +17,15 @@
 .account-import-notice { flex-shrink: 0; max-height: 3rem; overflow-y: auto; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .account-import-summary { flex-shrink: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .account-import-summary > div { border: 1px solid hsl(var(--border)); border-radius: 10px; padding: 8px; }
+.account-import-phases { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.account-import-phase { min-width: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.account-import-phase-heading, .account-import-phase-caption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 8px; }
+.account-import-phase-heading { font-weight: 500; }
+.account-import-phase-caption { color: hsl(var(--muted-foreground)); font-size: 11px; }
+.account-import-phase progress { width: 100%; height: 6px; appearance: none; border: 0; border-radius: 999px; overflow: hidden; background: hsl(var(--muted)); accent-color: hsl(var(--primary)); }
+.account-import-phase progress::-webkit-progress-bar { background: hsl(var(--muted)); border-radius: 999px; }
+.account-import-phase progress::-webkit-progress-value { background: hsl(var(--primary)); border-radius: 999px; }
+.account-import-phase progress::-moz-progress-bar { background: hsl(var(--primary)); border-radius: 999px; }
 .account-import-log-toolbar, .account-import-record-toolbar, .account-import-pagination { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .account-import-job-select { min-width: 0; flex: 1; }
 .account-import-history-note { flex-shrink: 0; margin: 0; font-size: 11px; line-height: 1.5; color: hsl(var(--muted-foreground)); }
@@ -38,12 +47,12 @@
    tooltip, without stealing the few rows left for the scrollable records. */
 @media (max-height: 800px), (max-width: 720px) {
   .account-import-history-note { display: none; }
+  .account-import-panel, .account-import-log-view, .account-import-records, .account-import-form { gap: 8px; }
+  .account-import-summary > div { padding: 4px 8px; }
 }
 @media (max-width: 720px) {
-  .account-import-window--local .account-import-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 9rem) minmax(0, 1fr); }
+  .account-import-window--local .account-import-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 7rem) minmax(0, 1fr); }
   .account-import-window--local .account-import-sidebar { border-right: 0; border-bottom: 1px solid hsl(var(--border)); }
   .account-import-window--local .account-import-content { padding: 10px; }
-  .account-import-panel, .account-import-log-view, .account-import-records, .account-import-form { gap: 8px; }
   .account-import-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
-  .account-import-summary > div { padding: 4px 8px; }
 }

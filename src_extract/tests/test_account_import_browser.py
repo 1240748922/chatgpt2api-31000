@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -59,7 +60,8 @@ class ImportUI:
         self.maintenance_status = 200
         self.jobs = [dict(id="synthetic-history", status="completed", total=2,
                          processed=2, saved=2, added=2, skipped=0, synced=1,
-                         sync_failed=1, done=True, created_at=1, updated_at=2)]
+                         sync_failed=1, checked=2, sync_after_import=True,
+                         done=True, created_at=1, updated_at=2)]
         self.baseline = os.environ.get("IMPORT_UI_BASELINE", "")
         self.assets = {}
         page.on("pageerror", lambda error: self.errors.append(str(error)))
@@ -115,7 +117,8 @@ class ImportUI:
                 payload = request.post_data_json
                 self.posts.append(payload)
                 job = dict(self.jobs[0], id=f"synthetic-job-{len(self.posts)}", total=len(payload["accounts"]),
-                           status="saving", done=False, saved=0, processed=0)
+                           status="saving", done=False, saved=0, processed=0,
+                           checked=0, synced=0, sync_failed=0, sync_after_import=payload["sync_after_import"])
                 self.jobs.insert(0, job)
                 if self.hold_posts:
                     self.pending.append((route, job))
@@ -332,7 +335,7 @@ def test_minimize_job_still_polls_and_menu_restores_same_panel(ui):
     ui.dialog.get_by_role('button', name='最小化导入窗口').click()
     ui.jobs[0].update(status='syncing', processed=1, saved=1)
     dock = ui.page.get_by_role('dialog', name='已最小化的导入任务', exact=True)
-    pw.expect(dock).to_contain_text('后台同步额度中 · 1/1')
+    pw.expect(dock).to_contain_text('后台同步额度中 · 0/1 · 剩余 1')
     ui.reopen()
     pw.expect(dock).to_have_count(0)
     pw.expect(ui.dialog.get_by_role('tab', name='任务日志', exact=True)).to_have_attribute('aria-selected', 'true')
@@ -405,6 +408,65 @@ def test_nonlocal_import_form_keeps_original_controls(ui):
     ui.close()
 
 
+def test_quota_progress_continues_after_import_is_complete_and_while_minimized(ui):
+    ui.jobs[0].update(status="syncing", done=False, total=2000, processed=2000, saved=2000,
+                      added=1971, skipped=29, synced=294, sync_failed=1576, checked=1870,
+                      created_at=time.time()-383, updated_at=time.time())
+    ui.open("session_json")
+    ui.show_logs()
+    save = ui.dialog.get_by_role("group", name="账号导入处理进度")
+    quota = ui.dialog.get_by_role("group", name="额度同步处理进度")
+    pw.expect(save).to_contain_text("2000 / 2000")
+    pw.expect(quota).to_contain_text("1870 / 2000")
+    pw.expect(quota).to_contain_text("剩余 130")
+    pw.expect(quota.get_by_role("progressbar")).to_have_attribute("value", "1870")
+    # Only two quota log items are loaded: counts must come from the job row.
+    ui.dialog.get_by_role("tab", name="原始日志", exact=True).click()
+    pw.expect(quota).to_contain_text("剩余 130")
+    ui.page.screenshot(path=str(ROOT / ".runtime/import-quota-progress.png"))
+    ui.dialog.get_by_role("button", name="最小化导入窗口").click()
+    dock = ui.page.get_by_role("dialog", name="已最小化的导入任务", exact=True)
+    pw.expect(dock).to_contain_text("1870/2000 · 剩余 130")
+    ui.jobs[0].update(checked=1910, sync_failed=1616)
+    pw.expect(dock).to_contain_text("1910/2000 · 剩余 90")
+    ui.jobs[0].update(status="completed", done=True, checked=2000, sync_failed=1706)
+    pw.expect(dock).to_contain_text("2000/2000 · 剩余 0")
+    ui.page.get_by_role("button", name="恢复导入窗口").click()
+    pw.expect(quota).to_contain_text("2000 / 2000")
+    pw.expect(quota).to_contain_text("剩余 0")
+    ui.close()
+
+
+@pytest.mark.parametrize("state", ["rt_skipped", "interrupted", "not_enabled", "waiting"])
+def test_quota_progress_handles_skips_interruption_and_disabled_sync(ui, state):
+    if state == "rt_skipped":
+        ui.jobs[0].update(total=3, processed=3, saved=2, refresh_failed=1, checked=3)
+    elif state == "interrupted":
+        ui.jobs[0].update(status="failed", total=3, processed=3, saved=3, checked=1,
+                          synced=1, sync_failed=0, error_code="import_sync_error")
+    elif state == "not_enabled":
+        ui.jobs[0].update(sync_after_import=False, checked=0, synced=0, sync_failed=0)
+    else:
+        ui.jobs[0].update(status="sync_pending", done=False, checked=0, synced=0, sync_failed=0)
+    ui.open()
+    ui.show_logs()
+    quota = ui.dialog.get_by_role("group", name="额度同步处理进度")
+    if state == "rt_skipped":
+        pw.expect(quota).to_contain_text("3 / 3")
+        pw.expect(quota).to_contain_text("剩余 0")
+        pw.expect(quota).to_contain_text("跳过 1（RT 兑换失败）")
+    elif state == "interrupted":
+        pw.expect(quota).to_contain_text("1 / 3")
+        pw.expect(quota).to_contain_text("剩余 2")
+        pw.expect(ui.dialog.get_by_role("button", name="从断点重试中断任务")).to_be_visible()
+    elif state == "not_enabled":
+        pw.expect(quota).to_have_count(0)
+    else:
+        pw.expect(quota).to_contain_text("0 / 2")
+        pw.expect(quota).to_contain_text("等待同步 · 剩余 2")
+    ui.close()
+
+
 @pytest.mark.parametrize('size', [(1366, 768), (800, 600), (390, 844)])
 def test_import_window_fits_viewport_with_large_history(ui, size):
     ui.page.set_viewport_size(dict(width=size[0], height=size[1]))
@@ -418,6 +480,7 @@ def test_import_window_fits_viewport_with_large_history(ui, size):
     scroll = ui.dialog.get_by_label('账号明细滚动区域')
     assert scroll.bounding_box()['height'] > 60
     assert scroll.evaluate('el => el.scrollHeight > el.clientHeight')
+    ui.page.screenshot(path=str(ROOT / f'.runtime/import-quota-layout-{size[0]}x{size[1]}.png'))
     ui.close()
 
 

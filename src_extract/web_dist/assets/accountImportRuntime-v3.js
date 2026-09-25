@@ -10,6 +10,29 @@ export function jobLabel(job) {
   return (importStates[job.status] || job.status) + (job.done && (job.refresh_failed || job.sync_failed) ? "（有失败项）" : "");
 }
 
+export function importProgress(job) {
+  const count = value => Number.isFinite(Number(value)) ? Math.max(0, Math.floor(Number(value))) : 0;
+  const total = count(job.total);
+  const saved = Math.min(total, count(job.processed ?? job.saved));
+  const results = count(job.synced) + count(job.sync_failed);
+  // checked is the durable quota checkpoint, including input rows skipped after
+  // an RT exchange failure. Do not derive progress from the bounded event log.
+  const checked = Math.min(total, count(job.checked ?? results));
+  const syncEnabled = job.sync_after_import ?? (["sync_pending", "syncing"].includes(job.status) || checked > 0 || job.error_code === "import_sync_error");
+  const phase = (label, done) => ({label, done, total, remaining: total-done});
+  return {
+    save: phase("账号导入", saved),
+    quota: syncEnabled ? {...phase("额度同步", checked), skipped: Math.max(0, checked-results),
+      waiting: saved < total ? "等待入库" : job.status === "sync_pending" ? "等待同步" : ""} : null,
+  };
+}
+
+export function importProgressLabel(job) {
+  const progress = importProgress(job);
+  const current = progress.quota && progress.save.remaining === 0 ? progress.quota : progress.save;
+  return `${jobLabel(job)} · ${current.done}/${current.total} · 剩余 ${current.remaining}`;
+}
+
 export function parseInput(text, mode = "auto", jsonFile = false) {
   const value = text.trim();
   if (!value) return [];

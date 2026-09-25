@@ -5,7 +5,26 @@
 - 修复概览“异常账号”漏算：与账号管理共用分类，将 AT 已失效且无可用 RT 的账号计入异常，即使数据库原状态仍为正常或限流。正常/限流/异常/禁用互斥，总数保持一致。
 - 正常账号额度汇总同步排除上述异常账号；可恢复、历史失败待复核、仅上传冷却或普通超时不会因此被计为异常。“正常账号”仍不等于严格准入下的就绪账号，已就绪额度保留原口径。
 - 分类在本地账号快照上、账号锁外执行，复用 JWT 时间缓存，不生成逐账号诊断详情，不新增数据库写入或上游请求。生图重试、导号、续期、清理、超分及实际 `.env` 均未修改，无数据库迁移。详见 [概览账号分类统计](./docs/dashboard-account-counts.md)。
-- 本地 600 项发布回归通过，包含 19 项新增统计回归，以及导号/可用性界面、生图重试/后处理、账号写入和后台维护。CI 与镜像标签在构建完成后补充；服务器仍由用户更新。
+- 本地 600 项发布回归通过，包含 19 项新增统计回归，以及导号/可用性界面、生图重试/后处理、账号写入和后台维护。9 项真实 PostgreSQL 17 协调测试及 Docker/Nginx 回归均在 CI 通过，Compose 和差异校验通过。
+- [GitHub Actions 36094911147](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36094911147) 全部成功，已核实 `Build and push` 成功。应用提交 `c49a76d87ab102d82340ed1e9ee59aa7ea9c4396`；镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-c49a76d`（同时更新 latest），Compose 已锁定。回退版本为 3.2.41 / `sha-f8acd01`。服务器仍由用户更新。
+
+**更新：** `.env` 若显式固定 `CHATGPT2API_IMAGE_TAG`，改为 `sha-c49a76d`；若还固定了 `CHATGPT2API_BUILD_VERSION`，同步该值。未固定时使用 Compose 默认值，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.42 / sha-c49a76d`。更新有访问切换窗口，不重建 PostgreSQL、不删除卷。概览和管理筛选独立采样，导入/清理/续期过程中数字可能短暂有差异，账号池稳定后应一致。
 
 ---
 

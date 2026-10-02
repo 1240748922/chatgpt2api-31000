@@ -3180,6 +3180,32 @@ class AccountService:
                 result.append(account)
             return result
 
+    def _existing_account_ids(self, account_ids: list[str] | tuple[str, ...]) -> set[str]:
+        """Return only requested management IDs without copying the account pool.
+
+        Refresh completion only needs to distinguish accounts that disappeared
+        while the batch was running.  Calling ``list_accounts`` here copied
+        every credential record and attached runtime counters on every small
+        maintenance batch, which made the cost grow with the whole pool.
+        """
+        requested = {
+            str(account_id or "").strip().lower()
+            for account_id in account_ids
+            if str(account_id or "").strip()
+        }
+        if not requested:
+            return set()
+        self._refresh_accounts_snapshot_if_stale()
+        existing: set[str] = set()
+        with self._lock:
+            for account in self._accounts.values():
+                management_id = str(account.get("management_id") or "").strip().lower()
+                if management_id in requested:
+                    existing.add(management_id)
+                    if len(existing) == len(requested):
+                        break
+        return existing
+
     def account_group_counts(self) -> dict[str, int]:
         """Count account groups without copying full credential records.
 
@@ -6100,19 +6126,19 @@ class AccountService:
             if executor:
                 executor.shutdown(wait=True, cancel_futures=True)
 
-        existing_ids = {
-            str(account.get("management_id") or "").strip()
-            for account in self.list_accounts()
-            if str(account.get("management_id") or "").strip()
-        }
         target_ids = [account_id for _token, account_id in targets]
+        existing_ids = self._existing_account_ids(target_ids)
         result = {
             "refreshed": refreshed,
             "skipped": skipped,
             "updated_ids": [
-                account_id for account_id in refreshed_ids if account_id in existing_ids
+                account_id for account_id in refreshed_ids
+                if str(account_id or "").strip().lower() in existing_ids
             ],
-            "removed_ids": [account_id for account_id in target_ids if account_id not in existing_ids],
+            "removed_ids": [
+                account_id for account_id in target_ids
+                if str(account_id or "").strip().lower() not in existing_ids
+            ],
             "errors": errors,
         }
         if progress_id and finalize_progress:

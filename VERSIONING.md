@@ -1,12 +1,40 @@
 # 稳定版本、升级和回退
 
-## 2026-10-02 发布准备：3.2.44
+## 2026-10-02 当前发布：3.2.44
 
 - 减少后台自动续期和管理员强制刷新每批结束的全池复制：只读取管理 ID 并返回本批目标，找到全部目标即停止扫描。保留快照刷新、账号锁、RT 轮换和批中删除的结果语义。
 - 合成万号池、每批 2 个池尾账号的本机对照：收尾 P50 由 16.236ms 降至 1.309ms，临时分配峰值由约 15.8MiB 降至约 0.8KiB。仅衡量内存查询，不含数据库/网络，不代表生图整体延迟同比下降。
 - 最近最终 502/504 主要集中在文生图无输出后的轮询。尚无证据证明 8000–10000 账号存在故障阈值；本版不是上游超时的完整修复，保留活跃任务等待、重试、导号、超分和配置默认值，无数据库迁移。
-- 本地完整 Python 回归 623 项通过，9 项真实 PostgreSQL 用例待发布 CI；Compose、语法与差异校验通过。新增 8 项回归覆盖普通/强制刷新、RT 轮换、批中删除以及 5000/10000/20000 账号目标查询。
-- 离线复验、范围及上线观察项见 [续期批次开销说明](./docs/account-refresh-batch-cost.md)。服务器由用户更新；镜像发布确认后再锁定 Compose 默认标签，回退镜像为 3.2.43 / `sha-bfb6870`。
+- 本地完整 Python 回归 623 项通过，9 项真实 PostgreSQL 用例、Docker/Nginx 路由和镜像发布 CI 全部成功；新增 8 项回归覆盖普通/强制刷新、RT 轮换、批中删除以及 5000/10000/20000 账号目标查询。
+- [GitHub Actions 36961875521](https://github.com/1240748922/chatgpt2api-31000/actions/runs/36961875521) 已成功。应用提交 `953b81a01e21851c9e9dc7342532d1120b2aee82`；镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-953b81a`（同时更新 `latest`），Compose 默认标签已锁定；回退版本为 3.2.43 / `sha-bfb6870`。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-953b81a`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.44 / sha-953b81a`。继续观察账号可用性中的维护处理数量和请求日志中的取号/锁/轮询分项；无需重新导入账号。更新有访问切换窗口，不重建 PostgreSQL、不删除卷。应用代码提交与部署锁定提交不同，以镜像 OCI revision `953b81a01e21851c9e9dc7342532d1120b2aee82` 为准。
+
+发布状态由上述 CI 的 `Build and push` 成功确认；本机 GHCR 清单读取因包权限受限，未完成独立清单校验。服务器使用已有 GHCR 登录拉取后，可逐实例核对 revision：
+
+```sh
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+离线复验、范围及观察项见 [续期批次开销说明](./docs/account-refresh-batch-cost.md)。部署锁定提交使用 `[skip ci]`，避免生成另一应用镜像 SHA。服务器由用户更新。
 
 ---
 

@@ -29,6 +29,7 @@ _IMAGE_FAILURE_LABELS = {
     "image_stream_timeout": "上游图片流超时",
     "image_stream_interrupted": "上游图片流中断",
     "image_tool_error": "图片工具异常",
+    "upstream_image_generation_error": "上游图片生成失败",
     "image_quota_exhausted": "图片额度已用尽",
     "file_upload_throttled": "参考图上传受限",
     "auth_invalid": "账号登录态失效",

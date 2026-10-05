@@ -1982,7 +1982,7 @@ class OpenAIBackendAPI:
                 except (TypeError, json.JSONDecodeError):
                     parsed_payload = payload
                 failure = classify_upstream_message(parsed_payload)
-                if failure is not None and failure.code != "upstream_text_reply":
+                if failure is not None and failure.code not in {"upstream_text_reply", "upstream_image_generation_error"}:
                     self._raise_editable_failure(failure, "editable_stream_failure")
                 conversation_id = conversation_id or self._find_editable_value(payload, "conversation_id")
         finally:
@@ -2029,7 +2029,7 @@ class OpenAIBackendAPI:
                 if failure is not None and failure.code == "auth_invalid":
                     self._schedule_auth_recovery("editable_artifact_after_success")
                 return targeted
-            if failure is not None and failure.code != "upstream_text_reply":
+            if failure is not None and failure.code not in {"upstream_text_reply", "upstream_image_generation_error"}:
                 self._raise_editable_failure(failure, "editable_poll_failure")
             remaining = poll_deadline - time.monotonic()
             if remaining > 0:
@@ -3209,10 +3209,15 @@ class OpenAIBackendAPI:
                         sediment_ids.append(sediment_id)
 
             probe.update(file_count=len(file_ids), sediment_count=len(sediment_ids))
+            conversation_failure = classify_conversation_failure(conversation)
             if (
                 not file_ids and not sediment_ids and _remaining() > 0
-                and classify_conversation_failure(conversation) is None
+                and (conversation_failure is None
+                     or conversation_failure.code == "upstream_image_generation_error")
             ):
+                # A prose-only technical failure is less specific than a
+                # task's structured refusal or output; preserve that evidence
+                # before allowing a cross-account retry.
                 task_query_started = time.perf_counter()
                 try:
                     tasks = self._query_backend_tasks(
@@ -3305,7 +3310,6 @@ class OpenAIBackendAPI:
                         (time.perf_counter() - task_query_started) * 1000,
                     )
             if not file_ids and not sediment_ids:
-                conversation_failure = classify_conversation_failure(conversation)
                 failure = merge_message_failure(pending_task_failure, conversation_failure)
                 # Even a generic explicit task failure is terminal. Waiting
                 # for a more specific error cannot make that task succeed.

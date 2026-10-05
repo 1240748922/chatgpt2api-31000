@@ -104,6 +104,16 @@ def test_normal_errors_still_stop_at_configured_limit(retry_flow):
     assert retry_flow.service._image_inflight == {}
 
 
+def test_upstream_image_generation_error_uses_normal_cross_account_budget(retry_flow):
+    outputs = retry_flow.run(["upstream_image_generation_error", None])
+    assert outputs[0].kind == "result"
+    assert len(outputs[0].image_attempts) == 2
+    assert outputs[0].image_attempts[0]["failure_code"] == "upstream_image_generation_error"
+    assert outputs[0].image_attempts[0]["switched_account"] is True
+    assert retry_flow.selected == retry_flow.closed == ["0", "1"]
+    assert retry_flow.service._image_inflight == {}
+
+
 def test_capacity_scan_stops_at_request_deadline(retry_flow):
     with pytest.raises(ImageGenerationError) as caught:
         retry_flow.run(["file_upload_throttled"] * 20, budget=3)

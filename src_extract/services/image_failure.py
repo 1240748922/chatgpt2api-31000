@@ -117,6 +117,12 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
         "account", "image_generation", False, 502, "server_error",
         verify_account=True,
     ),
+    "upstream_image_generation_error": FailurePolicy(
+        # The upstream returned a terminal assistant error instead of an
+        # image. It is retryable across accounts, but is not proof that the
+        # selected account is invalid, so do not schedule account verification.
+        "transient", "image_generation", True, 502, "server_error",
+    ),
     "image_quota_exhausted": FailurePolicy(
         "account", "image_generation", False, 429, "insufficient_quota",
         verify_account=True,
@@ -276,6 +282,7 @@ _TOOL_ERROR_PUBLIC_CODES = frozenset({
     "image_tool_error",
     "image_stream_interrupted",
     "image_stream_timeout",
+    "upstream_image_generation_error",
 })
 
 def _is_structured_text_payload(text: str) -> bool:
@@ -348,7 +355,7 @@ def public_image_error_message(
 ) -> str:
     if failure.code == "image_poll_timeout":
         return IMAGE_TIMEOUT_PUBLIC_MESSAGE
-    if failure.code in {"image_stream_interrupted", "image_stream_timeout"}:
+    if failure.code in {"image_stream_interrupted", "image_stream_timeout", "upstream_image_generation_error"}:
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
     # Do not expose the upstream plan/quota wording or reset duration. Keep
     # this response stable for API clients and avoid leaking account details.
@@ -540,6 +547,15 @@ _POLICY_NOTICE_TEXTS = frozenset(
         ("该提示", "关于非法或违法活动的防护限制"),
     )
 )
+
+# These are terminal upstream explanations observed in image turns. They are
+# deliberately narrow: a generic assistant text, a missing-reference reply,
+# a policy notice, or a customer prompt must remain request-level text and must
+# not trigger account rotation.
+_IMAGE_GENERATION_ERROR_TEXTS = frozenset({
+    "由于我这边发生了错误，我未能生成图片。",
+    "抱歉，我无法生成这张图片，因为图像生成过程中发生了错误。",
+})
 AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}
 POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
 
@@ -556,7 +572,7 @@ def _failure_priority(code: str) -> int:
         return 5
     if normalized in TEXT_REVIEW_FAILURE_CODES and normalized != "upstream_text_reply":
         return 4
-    if normalized == "image_tool_error":
+    if normalized in {"image_tool_error", "upstream_image_generation_error"}:
         return 3
     if normalized == "upstream_text_reply":
         return 2
@@ -1216,6 +1232,11 @@ def classify_message_facts(
     ) and has_text:
         if isinstance(raw_detail, str) and raw_detail.strip() in _POLICY_NOTICE_TEXTS:
             return image_failure("content_policy_violation", raw_detail=raw_detail).with_public_detail(raw_detail)
+        if isinstance(raw_detail, str) and raw_detail.strip() in _IMAGE_GENERATION_ERROR_TEXTS:
+            return image_failure(
+                "upstream_image_generation_error",
+                raw_detail=raw_detail,
+            )
         return image_failure(
             "upstream_text_reply",
             raw_detail=raw_detail,

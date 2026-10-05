@@ -1062,7 +1062,7 @@ def update_conversation_state(
     )
     if (
         candidate_failure is not None
-        and candidate_failure.code == "upstream_text_reply"
+        and candidate_failure.code in {"upstream_text_reply", "upstream_image_generation_error"}
         and not classify_terminal_text_as_image_failure
     ):
         candidate_failure = None
@@ -1289,11 +1289,28 @@ def _is_account_auth_failure(exc: Exception) -> bool:
     return True
 
 
+def _collect_task_image_outputs(
+    backend: OpenAIBackendAPI,
+    task: dict[str, Any],
+    output_ids: tuple[list[str], list[str]] | None,
+) -> None:
+    if output_ids is None:
+        return
+    message = task.get("image_gen_message")
+    if not isinstance(message, dict):
+        return
+    for record in backend._extract_image_tool_records({"mapping": {"task-result": {"message": message}}}):
+        add_unique(output_ids[0], record["file_ids"])
+        add_unique(output_ids[1], record["sediment_ids"])
+
+
 def _get_detailed_failure_from_tasks(
     backend: OpenAIBackendAPI,
     conversation_id: str,
     timeout_secs: float = 10.0,
     wait_secs: float = 2.0,
+    *,
+    output_ids: tuple[list[str], list[str]] | None = None,
 ) -> tuple[ImageFailure | None, str]:
     """Return the most specific structured task failure and its diagnostic text."""
     import time as _time
@@ -1306,6 +1323,7 @@ def _get_detailed_failure_from_tasks(
 
         selected_failure: ImageFailure | None = None
         for task in tasks:
+            _collect_task_image_outputs(backend, task, output_ids)
             candidate = classify_task_failure(task)
             if candidate is None:
                 continue
@@ -1379,6 +1397,8 @@ def _image_stream_timeout_task_diagnostics(
         backend: OpenAIBackendAPI,
         conversation_id: str,
         timeout_secs: float = 3.0,
+        *,
+        output_ids: tuple[list[str], list[str]] | None = None,
 ) -> tuple[ImageFailure | None, str, list[dict[str, Any]], str]:
     """Collect a small task summary after an upstream SSE timeout."""
     try:
@@ -1394,6 +1414,7 @@ def _image_stream_timeout_task_diagnostics(
     for task in tasks[:5]:
         if not isinstance(task, dict):
             continue
+        _collect_task_image_outputs(backend, task, output_ids)
         error_msg, metadata = backend.image_task_diagnostics(task)
         failure = classify_task_failure(task)
         if failure is not None:
@@ -1530,12 +1551,17 @@ def _recover_after_image_stream_timeout(
             conversation_probe_error = diagnostic_excerpt(repr(exc), 1000)
 
         if (
-            not (file_ids or sediment_ids) and conversation_failure is None
-            and stream_failure is None and time.monotonic() < recovery_deadline
+            not (file_ids or sediment_ids)
+            and all(failure is None or failure.code == "upstream_image_generation_error"
+                    for failure in (conversation_failure, stream_failure))
+            and time.monotonic() < recovery_deadline
         ):
             task_failure, task_error, task_summaries, task_probe_error = _image_stream_timeout_task_diagnostics(
                 backend, conversation_id,
                 timeout_secs=max(0.001, min(3.0, recovery_deadline - time.monotonic())),
+                output_ids=(file_ids, sediment_ids) if any(
+                    failure is not None for failure in (conversation_failure, stream_failure)
+                ) else None,
             )
 
     terminal_failure: ImageFailure | None = None
@@ -1857,7 +1883,7 @@ def stream_image_outputs(
     )
     is_text_reply = bool(
         stream_failure is not None
-        and stream_failure.code == "upstream_text_reply"
+        and stream_failure.code in {"upstream_text_reply", "upstream_image_generation_error"}
     )
     conversation_stream_ms = int((time.perf_counter() - conversation_stream_started) * 1000)
     http_timing = _backend_http_timing_data(backend)
@@ -1945,6 +1971,8 @@ def stream_image_outputs(
             conversation_id,
             timeout_secs=5.0,
             wait_secs=0.0,
+            output_ids=(file_ids, sediment_ids)
+            if stream_failure.code == "upstream_image_generation_error" else None,
         )
         previous_code = stream_failure.code
         merged_failure = merge_message_failure(stream_failure, task_failure)

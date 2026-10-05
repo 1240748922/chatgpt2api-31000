@@ -1,13 +1,39 @@
 # 稳定版本、升级和回退
 
-## 2026-10-05 发布验证中：3.2.45
+## 2026-10-05 当前发布：3.2.45
 
 - 修复两条明确的上游生成失败文字被当作普通文字回复、直接以本地 400 结束的问题。新增 `upstream_image_generation_error`，按现有普通错误预算重试；保留原文，日志显示“上游图片生成失败”。
 - 优先交付已取得的图片，并检查任务详情的更明确错误；审核/输入拒绝不因此继续换号。普通聊天、导号、账号准入、后台同步、超分与并发配置保持原行为，无数据库迁移。
 - 单凭这类文字不标异常、不发起鉴权核验、不推定额度消耗。重试有次数和时限，上游内部失败不能保证通过重试恢复。
 - 最终仍失败时本地 HTTP 从 400 改为 502；比较版本应结合错误码和最终成功率，不能仅比较 502 数量。历史日志不回写。
-- 本地全量 Python 回归 658 项通过；最后收紧文件生成与公开文案边界后，105 项相关回归通过（含新增 2 项边界用例）。9 项真实 PostgreSQL 用例留待 CI，Compose 配置与差异检查通过。
-- 离线完整链路及回归说明见 [上游生成失败文字处理](./docs/upstream-generation-error.md)。镜像在测试及 GitHub Actions 成功后锁定，服务器由用户更新。
+- 本地全量 Python 回归 658 项通过；最后收紧文件生成与公开文案边界后，105 项相关回归通过（含新增 2 项边界用例）。9 项真实 PostgreSQL 用例和 Docker/Nginx 路由回归在 CI 通过，Compose 配置与差异检查通过。
+- [GitHub Actions 37299470523](https://github.com/1240748922/chatgpt2api-31000/actions/runs/37299470523) 的 `Build and push` 成功。应用提交 `6fd5fa60952ec72c1065101a5b10a882ccea2ba1`；镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-6fd5fa6`（同时更新 `latest`），Compose 默认标签已锁定；回退版本为 3.2.44 / `sha-953b81a`。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-6fd5fa6`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.45 / sha-6fd5fa6`。更新有访问切换窗口，不重建 PostgreSQL、不删除卷；无需重新导入账号。应用代码提交与部署锁定提交不同，以镜像 OCI revision `6fd5fa60952ec72c1065101a5b10a882ccea2ba1` 为准：
+
+```sh
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+镜像发布以 CI 的 `Build and push` 成功为据，本机未独立验证 GHCR 清单。离线复验、范围及上线观察项见 [上游生成失败文字处理](./docs/upstream-generation-error.md)。部署锁定提交使用 `[skip ci]`，避免生成另一应用镜像 SHA。服务器由用户更新。
 
 ---
 

@@ -1,12 +1,40 @@
 # 稳定版本、升级和回退
 
-## 2026-10-07 待发布：3.2.47
+## 2026-10-07 当前发布：3.2.47
 
 - 修复严格就绪账号在固定分片间不均导致的本地 503：本分片无可用候选时，可通过共享凭据租约借用其他分片的就绪账号。保持本分片优先、全局账号并发限制、AT 有效期预算、上传冷却和 RT 刷新隔离。
 - 线上样本 182 条中有 87 条 `no_available_account`，集中在没有严格就绪账号的分片 3/6；其他分片仍成功。全局约 1930 个严格就绪账号，并不能保证每个固定分片都有容量。
 - 修正分片就绪统计遗漏有效期检查的问题；请求日志增加跨分片查找标记、选中分片及本分片候选数。无数据库迁移，不改导号、后台同步、超分和用户配置。
-- 本地完整 Python 回归 696 项通过，10 项真实 PostgreSQL 回归待 CI 执行；Compose 与差异检查通过。新增 22 项分片取号回归及 1 项真实 PostgreSQL 八实例租约争抢回归。
-- 应用镜像尚待构建验证，部署默认标签暂保留 3.2.46。服务器由用户更新。详细证据、复验方法与限制见 [就绪账号分片兜底](./docs/image-shard-fallback.md)。
+- 本地完整 Python 回归 696 项通过，10 项真实 PostgreSQL 回归和 Docker/Nginx 路由回归在 CI 通过；Compose 与差异检查通过。新增 22 项分片取号回归及 1 项真实 PostgreSQL 八实例租约争抢回归。
+- 应用提交 `161fb98b6f9579857be97f8cdd7e27cad3dd9271`；[GitHub Actions 37631551863](https://github.com/1240748922/chatgpt2api-31000/actions/runs/37631551863) 已发布镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-161fb98`（同时更新 `latest`）。已匿名读取 GHCR 的 linux/amd64 清单与配置并核对 OCI revision，Compose 默认标签已锁定。
+
+详细证据、复验方法与限制见 [就绪账号分片兜底](./docs/image-shard-fallback.md)。回退版本为 3.2.46 / `sha-1e8ab02`。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-161fb98`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.47 / sha-161fb98`。更新有访问切换窗口，不重建 PostgreSQL、不删除卷；无需重新导入账号。应用代码提交与部署锁定提交不同，以镜像 OCI revision `161fb98b6f9579857be97f8cdd7e27cad3dd9271` 为准：
+
+```sh
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+部署锁定提交使用 `[skip ci]`，避免生成另一应用镜像 SHA。服务器由用户更新。上线后比较原分片 3/6 的 `no_available_account` 比例与跨分片取号日志；本版不增加真实额度、不恢复失效凭据，也不保证消除上游持续限流和生成失败。
 
 ---
 

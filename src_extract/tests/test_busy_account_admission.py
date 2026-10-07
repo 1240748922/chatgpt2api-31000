@@ -84,7 +84,8 @@ def test_saved_busy_diagnostics_keep_zero_counts_and_shard_identity():
     data = dict(account_wait_reason="all_ready_accounts_busy", account_shard_index=0, account_shard_count=8,
                 matched_count=13, ready_count=2, busy_count=2, limited_count=0,
                 upload_limited_count=0, available_slot_count=0, selection_loop_count=3,
-                selection_wait_ms=2828)
+                selection_wait_ms=2828, account_shard_fallback=1, account_selected_shard_index=6,
+                local_matched_count=8, local_ready_count=0, local_busy_count=0)
     event = monitor._event("synthetic-busy", "image_local_rejected", {}, data)
     attempts = {}
     monitor._accumulate_attempt_event(attempts, {**event, "index":1, "attempt":1})

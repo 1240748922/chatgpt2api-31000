@@ -52,6 +52,27 @@ def test_postgres_refresh_vs_image_only_one_can_win(pair):
     assert sum(result is not None for result in results) == 1
 
 
+def test_postgres_eight_shard_borrowers_share_account_limit(pair):
+    a, _, account = pair
+    coordinators = [CredentialCoordinator(DatabaseStorageBackend(a.storage.database_url)) for _ in range(8)]
+    barrier = Barrier(8)
+    def borrow(coordinator):
+        barrier.wait(timeout=5)
+        try:
+            return coordinator.acquire_image(account, minimum_validity=300, duration=400, limit=1)
+        except CredentialBusy:
+            return None
+    with ThreadPoolExecutor(8) as executor:
+        futures = [executor.submit(borrow, coordinator) for coordinator in coordinators]
+        leases = [future.result(timeout=10) for future in futures]
+    acquired = [lease for lease in leases if lease is not None]
+    assert len(acquired) == 1
+    acquired[0].release()
+    # Any shard can use the released slot; a failed contender left no lease.
+    next_lease = coordinators[-1].acquire_image(account, minimum_validity=300, duration=400, limit=1)
+    next_lease.release()
+
+
 def test_postgres_send_fence_survives_new_coordinator(pair):
     a, b, account = pair
     ticket = a.begin_refresh(account)

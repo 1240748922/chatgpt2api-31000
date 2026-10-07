@@ -2354,16 +2354,21 @@ class AccountService:
             wait_for_refresh=False,
             allow_full_reload=False,
         )
+        strict = AccountService._strict_admission()
+        validity = self._image_token_validity_window(None)
+        now = time.time()
         with self._lock:
-            assigned = sum(
-                self._image_account_belongs_to_instance(item)
-                for item in self._accounts.values()
-            )
-            ready = sum(
-                self._image_account_belongs_to_instance(item)
-                and self._is_image_account_available(item)
-                for item in self._accounts.values()
-            )
+            assigned = ready = 0
+            for token, item in self._accounts.items():
+                if not self._image_account_belongs_to_instance(item):
+                    continue
+                assigned += 1
+                if self._is_image_account_available(item) and (not strict or (
+                    credential_readiness(item, validity, now=now)["state"] == "ready"
+                    and not self._image_refresh_is_inflight(token, item)
+                    and not self._credential_temporarily_blocked(token, item)
+                )):
+                    ready += 1
             inflight = sum(
                 max(0, int(value or 0))
                 for value in self._image_inflight.values()
@@ -2503,6 +2508,36 @@ class AccountService:
                 )
                 diagnostics = self.get_image_selection_diagnostics()
                 self._set_image_selection_diagnostics(
+                    account_shard_fallback=0,
+                    local_matched_count=matched_count,
+                    local_ready_count=ready_count,
+                    local_busy_count=diagnostics.get("busy_count", 0),
+                )
+                if (not access_token and self._image_shard_count > 1
+                        and AccountService._strict_admission()
+                        and self._credential_coordinator is not None):
+                    # A shard can exhaust its valid ATs while another still has
+                    # capacity. Borrow only through strict dispatch, whose caller
+                    # acquires the shared credential lease outside this lock.
+                    # Background prewarming and non-coordinated modes stay local.
+                    access_token, other_ready, other_matched, other_limited = (
+                        self._find_available_image_token_locked(
+                            resolved_excluded_tokens, plan_type, source_type, plan_types,
+                            requires_file_upload=requires_file_upload,
+                            minimum_validity_seconds=minimum_validity_seconds,
+                            other_shards=True,
+                        )
+                    )
+                    other_diagnostics = self.get_image_selection_diagnostics()
+                    ready_count += other_ready
+                    matched_count += other_matched
+                    limited_count += other_limited
+                    diagnostics = {
+                        key: int(diagnostics.get(key, 0)) + int(other_diagnostics.get(key, 0))
+                        for key in ("busy_count", "upload_limited_count", "available_slot_count")
+                    }
+                    self._set_image_selection_diagnostics(account_shard_fallback=1)
+                self._set_image_selection_diagnostics(
                     selection_loop_count=selection_loops,
                     selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
                     matched_count=matched_count,
@@ -2551,6 +2586,11 @@ class AccountService:
                     ) + 1
                     self._set_image_selection_diagnostics(
                         account_wait_reason="selected",
+                        account_selected_shard_index=stable_shard_index(
+                            self._accounts[access_token].get("management_id")
+                            or self._management_id_for_token(access_token),
+                            self._image_shard_count,
+                        ),
                         selection_wait_ms=max(0, int((time.monotonic() - selection_started) * 1000)),
                     )
                     return access_token
@@ -2609,6 +2649,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None,
             requires_file_upload: bool = False,
             minimum_validity_seconds: float | None = None,
+            other_shards: bool = False,
     ) -> tuple[str | None, int, int, int]:
         """Round-robin with quota priority; stop at the first best candidate.
 
@@ -2616,12 +2657,19 @@ class AccountService:
         the dispatch lock. A short key snapshot is cheap; only validate as many
         rows as needed. Exhaustion still scans all rows for accurate outcomes.
         """
+        setter = getattr(self, "_set_image_selection_diagnostics", None)
+        if callable(setter):
+            # A second scan or prewarm hit must not inherit the first scan's
+            # counts. The dispatcher merges disjoint shard scans explicitly.
+            setter(matched_count=0, ready_count=0, busy_count=0, limited_count=0,
+                   upload_limited_count=0, available_slot_count=0)
         if AccountService._strict_admission():
             from services.page_prewarm_pool import page_prewarm_pool
             validity = minimum_validity_seconds or self._IMAGE_TOKEN_MIN_VALIDITY_SECONDS
             for token in page_prewarm_pool.candidates():
                 item = self._accounts.get(token)
-                if (item and token not in excluded_tokens and self._image_account_belongs_to_instance(item)
+                if (item and token not in excluded_tokens
+                    and self._image_account_belongs_to_instance(item) != other_shards
                     and self._is_image_account_available(item)
                     and self._account_matches_plan_type(item, plan_type)
                     and self._account_matches_any_plan_type(item, plan_types)
@@ -2631,6 +2679,8 @@ class AccountService:
                     and not self._image_refresh_is_inflight(token, item)
                     and not self._credential_temporarily_blocked(token, item)
                     and int(self._image_inflight.get(token, 0)) < max(1, int(config.image_account_concurrency or 1))):
+                    if callable(setter):
+                        setter(matched_count=1, ready_count=1, available_slot_count=1)
                     return token, 1, 1, 0
         keys = tuple(self._accounts)
         count = len(keys)
@@ -2656,7 +2706,7 @@ class AccountService:
             ordinal = (cursor + offset) % count
             token = keys[ordinal]
             item = self._accounts[token]
-            if token in excluded_tokens or not self._image_account_belongs_to_instance(item):
+            if token in excluded_tokens or self._image_account_belongs_to_instance(item) == other_shards:
                 continue
             if not (self._account_matches_plan_type(item, plan_type)
                     and self._account_matches_any_plan_type(item, plan_types)

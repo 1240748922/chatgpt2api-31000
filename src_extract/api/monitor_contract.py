@@ -182,6 +182,11 @@ class MonitorEventView(StrictMonitorModel):
     account_wait_reason: str | None = None
     account_shard_index: int | None = None
     account_shard_count: int | None = None
+    account_shard_fallback: int | None = None
+    account_selected_shard_index: int | None = None
+    local_matched_count: int | None = None
+    local_ready_count: int | None = None
+    local_busy_count: int | None = None
     selection_loop_count: int | None = None
     selection_wait_ms: int | None = None
     matched_count: int | None = None

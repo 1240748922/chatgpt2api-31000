@@ -2999,14 +2999,13 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 5s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
+        - Sleeps image_poll_initial_wait_secs first (+jitter), capped at 1s
+          when the stream had no image IDs so task errors can be found early.
         - Subsequent polls are image_poll_interval_secs apart (default 5s).
-        - Failures marked retryable by the canonical image-failure policy back
-          off exponentially (capped at 16s, +jitter), honoring Retry-After.
-        - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
+        - Retryable transport failures and generic read-side 429s back off
+          exponentially (capped at 16s, +jitter), honoring Retry-After.
+        - All sleeps stay within timeout_secs; exhaustion retains the last
+          unrecovered failure, or raises ImagePollTimeoutError if reads worked.
         """
         self._reset_image_result_timing()
         started_at = time.monotonic()
@@ -3052,8 +3051,9 @@ class OpenAIBackendAPI:
                 self._sleep_for_image_poll(sleep_for)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
-            # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
-            base = retry_after if retry_after is not None else min(2 ** min(attempt, 4), 16)
+            # Honor a positive Retry-After and use a one-second floor for zero
+            # so an upstream error cannot turn the poll into a tight loop.
+            base = max(1, retry_after) if retry_after is not None else min(2 ** min(attempt, 4), 16)
             backoff = base + random.uniform(0, 0.5)
             remaining = _remaining()
             if remaining <= 0:
@@ -3152,12 +3152,36 @@ class OpenAIBackendAPI:
                 empty_turn_key = ""
                 empty_turn_checks = 0
                 failure = classify_image_exception(exc)
-                probe.update(conversation_query="failed", failure_code=failure.code)
+                probe.update(
+                    conversation_query="failed",
+                    failure_code=failure.code,
+                    status_code=failure.status_code,
+                    retry_after_secs=failure.retry_after,
+                )
                 setattr(exc, "failure", failure)
-                if failure.retryable:
+                # A generic 429 from the read-only conversation endpoint is a
+                # poll throttle, not proof that the selected account or image
+                # quota is exhausted. Continue the same conversation after the
+                # server's Retry-After delay so we do not submit a duplicate
+                # generation on another account. Account-local 429s (quota or
+                # upload) are classified separately and keep their existing
+                # retry/switch policy.
+                poll_rate_limited = (
+                    failure.code == "upstream_rate_limited"
+                    and failure.status_code == 429
+                )
+                if failure.retryable or poll_rate_limited:
                     conversation_transport_failure = failure
                     conversation_transport_error = exc
-                    if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
+                    retry_started = time.monotonic()
+                    should_continue = _retry_sleep(
+                        "upstream_poll_rate_limit" if poll_rate_limited else "upstream_status",
+                        exc.status_code,
+                        None,
+                        exc.retry_after,
+                    )
+                    probe["retry_wait_ms"] = int((time.monotonic() - retry_started) * 1000)
+                    if should_continue:
                         continue
                     break
                 final_failure = merge_message_failure(pending_task_failure, task_probe_failure)

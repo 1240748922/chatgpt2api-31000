@@ -1,6 +1,44 @@
 # 稳定版本、升级和回退
 
-## 2026-10-05 当前发布：3.2.45
+## 2026-10-07 当前发布：3.2.46
+
+- 修复已提交生图后的会话查询遇到通用 429 就立即失败：按上游 `Retry-After` 等待并继续读取原会话，避免丢弃任务或重复发起生成。已核实的 1 小时窗口中，128 条通用 429 全部来自这个结果查询接口，等待头为 2–55 秒。
+- 无等待头时使用有上限的退避；零值至少等待 1 秒。保留原轮询和请求截止时间，持续限流仍返回真实 429；查询恢复后旧错误不污染最终分类。轮询诊断增加状态码、要求等待时间和实际等待耗时。
+- 保留账号额度、导号、后台续期、超分、并发和用户 `.env` 配置，无数据库迁移。18 条最终 502 中有 12 条结果超时、5 条上游工具错误、1 条无图片结果；本版不宣称消除上游生成失败或持续限流。
+- 本地完整 Python 回归 674 项通过，9 项真实 PostgreSQL 用例和 Docker/Nginx 路由回归在 CI 通过；新增 14 项测试覆盖退避、截止时间、分类边界，以及 SSE→查询限流→原会话恢复→PNG 保存/返回、槽位释放。Compose 与差异检查通过。
+- 应用提交 `1e8ab027a1ac801f40b56411e22a8f5921528e65`；[GitHub Actions 37592742448](https://github.com/1240748922/chatgpt2api-31000/actions/runs/37592742448) 已发布镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-1e8ab02`（同时更新 `latest`）。已匿名读取 GHCR 的 linux/amd64 清单与配置并核对 OCI revision，Compose 默认标签已锁定。
+
+详细证据、离线复验与上线观察项见 [结果查询限流恢复](./docs/image-poll-rate-limit.md)。回退版本为 3.2.45 / `sha-6fd5fa6`。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-1e8ab02`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.46 / sha-1e8ab02`。更新有访问切换窗口，不重建 PostgreSQL、不删除卷；无需重新导入账号。应用代码提交与部署锁定提交不同，以镜像 OCI revision `1e8ab027a1ac801f40b56411e22a8f5921528e65` 为准：
+
+```sh
+for s in app0 app1 app2 app3 app4 app5 app6 app7 importer; do
+  docker inspect "$(docker compose --env-file .env ps -q "$s")" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+done
+```
+
+部署锁定提交使用 `[skip ci]`，避免生成另一应用镜像 SHA。服务器由用户更新。先核对运行版本，再比较查询 429 的恢复情况和最终成功率；不保证上游持续限流或生成超时全部消失。
+
+---
+
+## 2026-10-05 上一版：3.2.45
 
 - 修复两条明确的上游生成失败文字被当作普通文字回复、直接以本地 400 结束的问题。新增 `upstream_image_generation_error`，按现有普通错误预算重试；保留原文，日志显示“上游图片生成失败”。
 - 优先交付已取得的图片，并检查任务详情的更明确错误；审核/输入拒绝不因此继续换号。普通聊天、导号、账号准入、后台同步、超分与并发配置保持原行为，无数据库迁移。

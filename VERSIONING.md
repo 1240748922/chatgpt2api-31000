@@ -4,8 +4,28 @@
 
 - 修复注册机左侧表单被网格撑高、外层裁切导致底部设置无法滚动到达的问题。桌面布局按实际可用高度分配空间，左侧设置和右侧日志独立滚动；窄窗口或低窗口使用整页滚动。
 - 只改前端布局和注册机脚本缓存标识，不改注册、导号、生图、额度同步、预热及用户配置，无数据库迁移。尚未完成的额度冷却测试不包含在本次提交中。
-- 真实 Chromium 新增 9 项回归通过，覆盖底部保存按钮、日志独立滚动与 9 种视口尺寸；相关既有 53 项回归通过。旧版本 `a9fa2bc` 在同一滚动测试中可复现失败；JavaScript 语法、运行时和差异检查通过。
-- 镜像发布等待本次 GitHub Actions 构建完成。确认成功后再更新服务器；服务器由用户更新，回退版本为 3.2.47 / `sha-161fb98`。
+- 本次发布范围的本地完整 Python 回归 705 项通过，10 项 PostgreSQL 测试因本机未配置测试库跳过、在 CI 通过。包含真实 Chromium 新增 9 项回归，覆盖底部保存按钮、日志独立滚动与 9 种视口尺寸；相关既有 53 项回归也通过。旧版本 `a9fa2bc` 在同一滚动测试中可复现失败；JavaScript 语法、运行时和差异检查通过。测试明确排除未提交的额度冷却草稿，不将其未实现行为算作本版功能。
+- 应用提交 `421f54c7093b59e97ad8b9e59dba72886d009e64`；[GitHub Actions 37949421987](https://github.com/1240748922/chatgpt2api-31000/actions/runs/37949421987) 的镜像发布、真实 PostgreSQL 协调和 Docker/Nginx 路由回归均成功。镜像 `ghcr.io/1240748922/chatgpt2api-31000:sha-421f54c`（同时更新 `latest`），已匿名核对 linux/amd64 清单与 OCI revision，Compose 默认标签已锁定。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-421f54c`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `3.2.48 / sha-421f54c`。更新后按 Ctrl+F5 刷新，进入注册机，在左侧设置区向下滚动到“保存注册机运行参数”；右侧日志应能独立滚动。窄窗口或窗口高度不超过 600px 时整页滚动，日志在设置下方。
+
+更新有访问切换窗口，不重建 PostgreSQL、不删除卷；无需重新导入账号。镜像 OCI revision 为 `421f54c7093b59e97ad8b9e59dba72886d009e64`，部署锁定提交使用 `[skip ci]`，避免生成另一应用镜像 SHA。服务器仍由用户更新。回退版本为 3.2.47 / `sha-161fb98`。
 
 ---
 

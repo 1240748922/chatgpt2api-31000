@@ -546,7 +546,28 @@
 
 (function () {
   const layoutStyle = document.createElement("style");
-  layoutStyle.textContent = `.register-page{height:calc(100vh - 72px);box-sizing:border-box;overflow:hidden}.register-layout{height:calc(100% - 112px);min-height:0}.register-stack{min-height:0;overflow-y:auto;padding-right:4px}.register-log-card{height:100%;min-height:0;overflow:hidden}.register-log{min-height:0;max-height:none;overflow:auto}@media (max-width:1000px){.register-page{height:auto;overflow:visible}.register-layout{height:auto}.register-stack{overflow:visible}.register-log-card{height:420px;min-height:420px}}`;
+  // The grid row must shrink to the available space, not the form's full height.
+  // Flex sizing also accounts for shell padding and a wrapped page heading.
+  layoutStyle.textContent = `
+    .register-page{box-sizing:border-box}
+    .register-log{min-height:0;max-height:none;overflow:auto}
+    @media (min-width:1001px) and (min-height:601px){
+      body.register-route-active main{display:flex;flex-direction:column;height:100vh;height:100dvh;min-height:0}
+      body.register-route-active main>header{flex:0 0 auto}
+      body.register-route-active main>:has(>.register-page){flex:1 1 0;min-height:0;overflow:hidden}
+      .register-page{height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+      .register-hero{flex:0 0 auto}
+      .register-layout{flex:1 1 0;min-height:0;grid-template-rows:minmax(0,1fr);align-items:stretch}
+      .register-stack{min-height:0;overflow-y:auto;padding-right:4px;align-content:start}
+      .register-log-card{position:static;height:auto;min-height:0;max-height:none;overflow:hidden}
+    }
+    @media (max-width:1000px),(max-height:600px){
+      .register-page{height:auto;overflow:visible}
+      .register-layout{height:auto;grid-template-columns:1fr;grid-template-rows:auto}
+      .register-stack{height:auto;overflow:visible}
+      .register-log-card{height:420px;min-height:420px;max-height:420px}
+    }
+  `;
   document.head.appendChild(layoutStyle);
 
   const ADMIN_KEY = "chatgpt2api.adminKey";

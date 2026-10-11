@@ -139,3 +139,21 @@ def test_narrow_screen_scrolls_to_bottom_and_back(registration_ui, viewport):
     ui.page.wait_for_timeout(300)
     assert_inside_viewport(ui.page.get_by_role("button", name="刷新状态", exact=True))
     assert not ui.writes and not ui.errors, (ui.writes, ui.errors)
+
+
+def test_import_log_distinguishes_default_egress_from_historical_bindings(registration_ui):
+    ui = registration_ui
+    ui.status["running"] = False
+    ui.status["log_history"] = [
+        dict(batch_id="old-bound"),
+        dict(batch_id="new-unbound", stdout_tail="synthetic log line 299"),
+    ]
+    ui.status["log_history"][0]["import"] = dict(imported=1, skipped=0, proxy_assigned=True)
+    ui.status["log_history"][1]["import"] = dict(imported=2, skipped=0,
+                                                proxy_assigned=False, proxy_policy="inherit")
+    ui.open_registration()
+    log = ui.page.locator('[data-register-log]')
+    pw.expect(log).to_contain_text("账号出口：默认规则（不绑定注册代理）")
+    pw.expect(log).to_contain_text("账号代理绑定：已设置")
+    pw.expect(log).not_to_contain_text("代理继承：")
+    assert not ui.writes and not ui.errors, (ui.writes, ui.errors)

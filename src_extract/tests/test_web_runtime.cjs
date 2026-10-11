@@ -65,6 +65,21 @@ async function testLogPolling() {
   };
   vm.createContext(context);
   vm.runInContext(source.slice(start, end), context);
+  const inherited = {imported: 2, skipped: 1, proxy_assigned: false, proxy_policy: 'inherit'};
+  const newLog = context.formatLiveLog({log_history: [{import: inherited}]});
+  assert(newLog.includes('导入：2，跳过：1'));
+  assert(newLog.includes('账号出口：默认规则（不绑定注册代理）'));
+  assert(!newLog.includes('代理继承：'));
+  const history = context.formatLiveLog({log_history: [{import: {proxy_assigned: true}}]});
+  assert(history.includes('账号代理绑定：已设置'), 'old entries retain their historical assignment');
+  assert(!history.includes('不绑定注册代理'), 'never relabel a previous bound account as unbound');
+  const initialStart = source.indexOf('  function formatLogTimestamp(value)');
+  const initialEnd = source.indexOf('  function createPage(', initialStart);
+  const initial = {};
+  vm.createContext(initial);
+  vm.runInContext(source.slice(initialStart, initialEnd), initial);
+  assert.equal(initial.formatLogEntry({import: inherited}), newLog,
+    'initial render and polling use the same import policy');
   await context.poll();
   assert.equal(calls, 1, 'do not overlap status requests');
   reply({ok: true, json: async () => ({running: true, last_result: {reason: 'starting', stdout_tail: 'launch accepted'}})});

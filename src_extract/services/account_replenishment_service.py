@@ -736,7 +736,6 @@ class AccountReplenishmentService:
         session_paths: list[Path],
         *,
         batch_id: str = "",
-        account_proxy: str = "",
     ) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         imported_paths: list[str] = []
@@ -749,9 +748,13 @@ class AccountReplenishmentService:
             access_token = _text(payload.get("access_token"))
             if not access_token:
                 continue
-            if account_proxy and not _text(payload.get("proxy")):
-                payload = {**payload, "proxy": account_proxy}
-            items.append(payload)
+            # Registration egress is transient. Older session files may carry
+            # a proxy (or a proxy-group reference); never bind it to the new
+            # account. Omitting these fields also preserves existing manual
+            # assignments when a session for the same AT is re-imported.
+            items.append({key: value for key, value in payload.items() if key not in {
+                "proxy", "proxy_group_id", "proxy_mode", "registration_proxy", "account_proxy",
+            }})
             imported_paths.append(str(path))
         if not items:
             return {
@@ -759,6 +762,7 @@ class AccountReplenishmentService:
                 "skipped": 0,
                 "paths": imported_paths,
                 "proxy_assigned": False,
+                "proxy_policy": "inherit",
                 "_access_tokens": [],
             }
         result = account_service.add_account_items(items, return_items=False)
@@ -766,7 +770,8 @@ class AccountReplenishmentService:
             "imported": int(result.get("added") or 0),
             "skipped": int(result.get("skipped") or 0),
             "paths": imported_paths,
-            "proxy_assigned": bool(account_proxy),
+            "proxy_assigned": False,
+            "proxy_policy": "inherit",
             "_access_tokens": [
                 _text(item.get("access_token") or item.get("accessToken"))
                 for item in items
@@ -1080,27 +1085,14 @@ class AccountReplenishmentService:
         session_paths = self._extract_saved_session_paths(stdout)
         if not session_paths:
             session_paths = self._recent_session_paths(output_dir, started_at)
-        account_proxy = ""
-        try:
-            provider_values = self.provider_config()
-            account_proxy = _text(provider_values.get("registration_proxy"))
-            if not account_proxy:
-                pool_values = [
-                    _text(item)
-                    for item in _text(provider_values.get("registration_proxy_pool")).splitlines()
-                    if _text(item)
-                ]
-                account_proxy = pool_values[0] if len(pool_values) == 1 else ""
-        except (FileNotFoundError, ValueError):
-            # Import still works when provider config is unavailable; the UI reports
-            # the missing proxy assignment through proxy_assigned=False.
-            account_proxy = ""
-        import_result: dict[str, Any] = {"imported": 0, "skipped": 0, "paths": []}
+        import_result: dict[str, Any] = {
+            "imported": 0, "skipped": 0, "paths": [],
+            "proxy_assigned": False, "proxy_policy": "inherit",
+        }
         if bool(settings.get("import_new_sessions")) and session_paths:
             import_result = self._import_sessions(
                 session_paths,
                 batch_id=batch_id,
-                account_proxy=account_proxy,
             )
 
         imported_tokens = import_result.pop("_access_tokens", [])

@@ -16,6 +16,10 @@ from sqlalchemy.orm import sessionmaker
 
 from services.application_database import DatabaseBase
 from services.account_capabilities import UPLOAD_COOLDOWN_FIELDS, upload_blocked_until, record_upload_throttle
+from services.image_quota_cooldown import (
+    IMAGE_QUOTA_COOLDOWN_FIELDS, image_quota_cooling, image_quota_needs_verification,
+    merge_image_quota_cooldown, record_image_quota_exhaustion,
+)
 
 
 class CredentialGate(DatabaseBase):
@@ -54,16 +58,22 @@ class LeasedToken(str):
     def __deepcopy__(self, memo):
         return self
 
-    def release(self, *, upload_cooldown_seconds=0, upload_retry_after_missing=False):
+    def release(self, *, upload_cooldown_seconds=0, upload_retry_after_missing=False,
+                quota_exhausted=False, quota_retry_after=None):
         # The DB deletion is idempotent, including retries after a lost commit.
         # Retain a failed publication on this exact ticket if cleanup is retried.
         self.upload_cooldown_seconds = max(getattr(self, "upload_cooldown_seconds", 0), upload_cooldown_seconds)
         self.upload_retry_after_missing = getattr(self, "upload_retry_after_missing", False) or upload_retry_after_missing
+        self.quota_exhausted = getattr(self, "quota_exhausted", False) or quota_exhausted
+        if quota_exhausted:
+            self.quota_retry_after = quota_retry_after
         for attempt in range(3):
             try:
                 return self.coordinator.release(
                     self.key, self.owner, upload_cooldown_seconds=self.upload_cooldown_seconds,
                     upload_retry_after_missing=self.upload_retry_after_missing,
+                    quota_exhausted=self.quota_exhausted,
+                    quota_retry_after=getattr(self, "quota_retry_after", None),
                 )
             except CredentialBusy:
                 # A simultaneous finish briefly owns this credential gate.
@@ -121,13 +131,17 @@ class CredentialCoordinator:
         key, owner = resource(account), uuid4().hex
         with self.edit(key) as (session, data, now):
             current = self.current(session, account)
+            quota_state = {}
+            merge_image_quota_cooldown(quota_state, current, data)
             # The account result writer is asynchronous. Consult the same gate
             # that releases the previous lease before admitting another upload.
             until = max(upload_blocked_until(current), upload_blocked_until(data))
             if requires_upload and until > now:
                 raise CredentialBusy("file_upload_throttled", retry_after=math.ceil(until - now))
             if (credential_readiness(current, minimum_validity, now=now)["state"] != "ready"
-                    or current.get("status") == "限流"):
+                    or current.get("status") == "限流"
+                    or image_quota_needs_verification(current)
+                    or image_quota_cooling(quota_state, now)):
                 raise CredentialBusy("credential_not_ready")
             state = data.get("refresh_state")
             if state in {"sent", "uncertain"} or (
@@ -136,18 +150,24 @@ class CredentialCoordinator:
                 raise CredentialBusy("credential_refresh_pending")
             if len(data["leases"]) >= limit:
                 raise CredentialBusy()
+            # Carry a newer persisted recovery into the gate's backoff history.
+            merge_image_quota_cooldown(data, current, dict(data))
             data["leases"][owner] = now + duration
         return LeasedToken(account["access_token"], self, key, owner)
 
-    def release(self, key, owner, *, upload_cooldown_seconds=0, upload_retry_after_missing=False):
+    def release(self, key, owner, *, upload_cooldown_seconds=0, upload_retry_after_missing=False,
+                quota_exhausted=False, quota_retry_after=None):
         with self.edit(key) as (_, data, now):
             # Publish and free capacity atomically. An overlapping success or
             # duplicate cleanup must never erase/extend this cooldown. Only the
             # live lease owner can report a new upload failure.
             if owner in data["leases"] and upload_cooldown_seconds > 0:
                 record_upload_throttle(data, None if upload_retry_after_missing else upload_cooldown_seconds, now)
+            if owner in data["leases"] and quota_exhausted:
+                record_image_quota_exhaustion(data, quota_retry_after, now)
             data["leases"].pop(owner, None)
-            cooldown = {field: data[field] for field in UPLOAD_COOLDOWN_FIELDS if field in data}
+            cooldown = {field: data[field] for field in (*UPLOAD_COOLDOWN_FIELDS, *IMAGE_QUOTA_COOLDOWN_FIELDS)
+                        if field in data}
         return cooldown
 
     def begin_refresh(self, account, *, imported=False):

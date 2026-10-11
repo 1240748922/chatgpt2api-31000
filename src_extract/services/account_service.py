@@ -23,6 +23,14 @@ from services.account_maintenance_progress import current_maintenance_batch
 from services.account_capabilities import (
     upload_blocked, upload_blocked_until, upload_cooldown_seconds, record_upload_throttle, merge_upload_cooldown,
 )
+from services.image_quota_cooldown import (
+    clear_image_quota_cooldown,
+    image_quota_cooldown_until,
+    image_quota_cooling,
+    image_quota_needs_verification,
+    merge_image_quota_cooldown,
+    record_image_quota_exhaustion,
+)
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     access_token_expires_in_seconds,
@@ -801,6 +809,7 @@ class AccountService:
         # A later short response must not undo a longer wait or its backoff
         # history when both result writers started from an unblocked snapshot.
         merge_upload_cooldown(merged, remote)
+        merge_image_quota_cooldown(merged, local, remote)
         return merged
 
     @staticmethod
@@ -1166,6 +1175,12 @@ class AccountService:
 
     @classmethod
     def _is_image_account_available(cls, account: dict) -> bool:
+        # A confirmed exhaustion is a two-step recovery: wait out the local
+        # cooldown, then require a fresh positive remote check.  The marker is
+        # deliberately persistent so a restart cannot immediately reuse the
+        # account after its timer expires.
+        if not isinstance(account, dict) or image_quota_needs_verification(account):
+            return False
         if not cls._is_account_selectable(account, allow_limited=False):
             return False
         if bool(account.get("image_quota_unknown")):
@@ -1392,6 +1407,24 @@ class AccountService:
         normalized["last_remote_check_error"] = normalized.get("last_remote_check_error") or None
         normalized["last_remote_check_error_at"] = normalized.get("last_remote_check_error_at") or None
         normalized["last_remote_check_event"] = normalized.get("last_remote_check_event") or None
+        if normalized.get("image_quota_last_remote_remaining") is not None:
+            try:
+                normalized["image_quota_last_remote_remaining"] = max(
+                    0, int(normalized.get("image_quota_last_remote_remaining") or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                normalized["image_quota_last_remote_remaining"] = None
+        else:
+            normalized["image_quota_last_remote_remaining"] = None
+        cooldown_until = image_quota_cooldown_until(normalized)
+        normalized["image_quota_cooldown_until"] = cooldown_until or None
+        normalized["image_quota_exhausted_at"] = normalized.get("image_quota_exhausted_at") or None
+        try:
+            normalized["image_quota_exhausted_streak"] = max(
+                0, min(16, int(normalized.get("image_quota_exhausted_streak") or 0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            normalized["image_quota_exhausted_streak"] = 0
         remote_check_result = str(normalized.get("last_remote_check_result") or "").strip().lower()
         normalized["last_remote_check_result"] = (
             remote_check_result
@@ -2838,6 +2871,8 @@ class AccountService:
                 return access_token.release(
                     upload_cooldown_seconds=upload_cooldown_seconds(failure.retry_after) if throttled else 0,
                     upload_retry_after_missing=throttled and failure.retry_after is None,
+                    quota_exhausted=failure is not None and failure.code == "image_quota_exhausted",
+                    quota_retry_after=failure.retry_after if failure is not None else None,
                 )
             except Exception:
                 # Fail closed. A failed cleanup must not trigger regeneration or
@@ -3328,7 +3363,10 @@ class AccountService:
             return [
                 token
                 for item in self._accounts.values()
-                if item.get("status") == "限流"
+                if (item.get("status") == "限流" or (
+                    item.get("status") == "正常" and image_quota_needs_verification(item)
+                ))
+                   and not image_quota_cooling(item)
                    and item.get("last_remote_check_result") != "pending"
                    and (token := item.get("access_token") or "")
             ]
@@ -3653,10 +3691,13 @@ class AccountService:
         now: datetime,
         freshness_seconds: int,
     ) -> dict[str, Any]:
+        strict = cls._strict_admission()
+        validity = cls._image_token_validity_window() if strict else 0
         local_normal = [
             item
             for item in accounts
-            if cls._is_account_selectable(item, allow_limited=False)
+            if cls._is_image_account_available(item)
+            and (not strict or credential_readiness(item, validity, now=now.timestamp())["state"] == "ready")
         ]
         confirmed_normal = [
             item
@@ -3664,6 +3705,7 @@ class AccountService:
             if cls._remote_check_is_fresh(item, now, freshness_seconds)
         ]
         confirmed_ids = {id(item) for item in confirmed_normal}
+        confirmed_edits = [item for item in confirmed_normal if not upload_blocked(item, now.timestamp())]
         unconfirmed_normal = [item for item in local_normal if id(item) not in confirmed_ids]
         unconfirmed_never_checked = [
             item for item in unconfirmed_normal
@@ -3690,6 +3732,11 @@ class AccountService:
                 if not item.get("image_quota_unknown")
             ),
             "current_available": len(confirmed_normal),
+            "current_edit_available": len(confirmed_edits),
+            "current_edit_quota": sum(
+                max(0, int(item.get("quota") or 0)) for item in confirmed_edits
+                if not item.get("image_quota_unknown")
+            ),
             "estimated_quota": sum(
                 int(item.get("quota") or 0)
                 for item in local_normal
@@ -3701,7 +3748,7 @@ class AccountService:
             "pending_confirmation_never_checked": len(unconfirmed_never_checked),
             "pending_confirmation_stale": len(unconfirmed_stale),
             "pending_confirmation_errors": len(unconfirmed_errors),
-            "availability_basis": "recent_remote_sync",
+            "availability_basis": "ready_credentials_and_recent_remote_sync" if strict else "recent_remote_sync",
             "unknown_quota_count": sum(1 for item in confirmed_normal if item.get("image_quota_unknown")),
             "pool_freshness_seconds": freshness_seconds,
             "pool_last_checked_at": latest_checked_at,
@@ -4296,9 +4343,31 @@ class AccountService:
         ):
             merged["restore_at"] = None
 
+        # A positive quota response during the cooldown is useful evidence,
+        # but it must not turn the account into a dispatch candidate before
+        # the cooldown window has elapsed.  Once the window has elapsed, the
+        # next successful remote check is the explicit recovery point.
+        quota_check = (
+            str(updates.get("last_remote_check_result") or "").strip().lower() == "ok"
+            and ("quota" in updates or "limits_progress" in updates)
+        )
+        if quota_check and "quota" in updates:
+            try:
+                merged["image_quota_last_remote_remaining"] = max(
+                    0, int(updates.get("quota") or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                merged["image_quota_last_remote_remaining"] = None
         account = self._normalize_account(merged)
         if account is None:
             return None, None
+        if (quota_check and image_quota_needs_verification(current)
+                and not image_quota_cooling(current)
+                and account.get("status") == "正常"
+                and (self._is_unlimited_image_quota_account(account) or (
+                    not account.get("image_quota_unknown") and int(account.get("quota") or 0) > 0
+                ))):
+            clear_image_quota_cooldown(account)
         if account.get("status") == "异常" and config.auto_remove_invalid_accounts:
             return account, "自动移除异常账号"
         if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
@@ -5404,7 +5473,7 @@ class AccountService:
         expected_last_token_refresh_at: str | None = None,
         defer_persistence: bool = False,
     ) -> dict | None:
-        shared_upload_state = self._release_shared_image_slot(access_token, failure=failure if not success else None)
+        shared_cooldown_state = self._release_shared_image_slot(access_token, failure=failure if not success else None)
         if not access_token:
             return None
         now = datetime.now(timezone.utc)
@@ -5438,15 +5507,22 @@ class AccountService:
                     next_item["status"] = "限流"
                     next_item["quota"] = 0
                     next_item["image_quota_unknown"] = False
+                    record_image_quota_exhaustion(
+                        next_item,
+                        failure.retry_after,
+                        now.timestamp(),
+                    )
                 if failure is not None and failure.code == "file_upload_throttled":
                     record_upload_throttle(next_item, failure.retry_after, now.timestamp())
                     next_item["fail"] = int(next_item.get("fail") or 0) + 1
-                if shared_upload_state:
-                    merge_upload_cooldown(next_item, shared_upload_state)
+                if shared_cooldown_state:
+                    merge_upload_cooldown(next_item, shared_cooldown_state)
+                    merge_image_quota_cooldown(next_item, dict(next_item), shared_cooldown_state)
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1
                     next_item["last_image_success_at"] = now.isoformat()
+                    clear_image_quota_cooldown(next_item, success=True)
                 if consumed_quota:
                     if not image_quota_unknown:
                         current_quota = max(0, int(next_item.get("quota") or 0))

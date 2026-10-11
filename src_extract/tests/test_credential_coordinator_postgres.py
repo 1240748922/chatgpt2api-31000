@@ -210,3 +210,22 @@ def test_postgres_adaptive_cooldown_survives_coordinator_restart(pair, monkeypat
     with b.edit(first.key) as (_, data, now):
         assert 1790 < data["file_upload_blocked_until"] - now <= 1800
 
+
+@pytest.mark.parametrize("requires_upload", [False, True])
+def test_postgres_quota_fence_blocks_stale_row_until_persisted_recovery(pair, requires_upload):
+    from services.image_quota_cooldown import clear_image_quota_cooldown
+
+    a, b, account = pair
+    lease = a.acquire_image(account, minimum_validity=300, duration=400, limit=2)
+    cooldown = lease.release(quota_exhausted=True, quota_retry_after=300)
+    assert lease.release(quota_exhausted=True, quota_retry_after=3600) == cooldown
+    # Account writes are deliberately deferred; the gate must already deny both operations.
+    assert "image_quota_exhausted_at" not in a.storage.load_accounts()[0]
+    with pytest.raises(CredentialBusy, match="credential_not_ready"):
+        b.acquire_image(account, minimum_validity=300, duration=400, limit=2, requires_upload=requires_upload)
+    recovered = {**account, **cooldown}
+    clear_image_quota_cooldown(recovered, success=True)
+    a.storage.replace_accounts([recovered])
+    next_lease = b.acquire_image(recovered, minimum_validity=300, duration=400, limit=2, requires_upload=requires_upload)
+    next_lease.release()
+

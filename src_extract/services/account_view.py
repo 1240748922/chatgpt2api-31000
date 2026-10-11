@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from services.account_capabilities import upload_blocked
+from services.image_quota_cooldown import image_quota_cooling, image_quota_needs_verification
 
 from services.account_credentials import (
     CredentialAvailabilityStatus,
@@ -79,7 +80,10 @@ def _text(value: object) -> str:
 
 def _timestamp_seconds(value: object) -> int | None:
     if isinstance(value, (int, float)):
-        timestamp = int(value)
+        try:
+            timestamp = int(value)
+        except (ValueError, OverflowError):
+            return None
         return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
     raw = _text(value)
     if not raw:
@@ -94,6 +98,13 @@ def _timestamp_seconds(value: object) -> int | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return int(parsed.timestamp())
+
+
+def _optional_count(value: object) -> int | None:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _credential_availability(
@@ -169,6 +180,8 @@ def _source(account: dict[str, Any]) -> tuple[str, str]:
 
 
 def _backend_status_category(account: dict[str, Any]) -> AccountStatusCategory:
+    if account.get("status") == "正常" and image_quota_needs_verification(account):
+        return "limited"
     return _STATUS_CATEGORY.get(_text(account.get("status")), "normal")
 
 
@@ -205,6 +218,9 @@ def _status(
         reason_code, reason = "auth_invalid", "远程确认账号登录态已失效"
     elif category == "abnormal":
         reason_code, reason = "credentials_unavailable", "AT 已失效，且没有可用 RT，账号无法参与调度"
+    elif image_quota_needs_verification(account):
+        reason_code = "image_quota_cooldown" if image_quota_cooling(account) else "image_quota_verification_pending"
+        reason = "生图已触发额度限制，冷却中" if image_quota_cooling(account) else "额度冷却已结束，等待后台确认恢复"
     elif backend_category == "limited":
         reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
     elif upload_blocked(account):
@@ -335,6 +351,10 @@ def account_row(
         "quota_state": quota_state,
         "quota_label": quota_label,
         "quota_reset_at": _timestamp_seconds(account.get("restore_at")),
+        "image_quota_cooldown_until": _timestamp_seconds(account.get("image_quota_cooldown_until")),
+        "image_quota_exhausted_at": _timestamp_seconds(account.get("image_quota_exhausted_at")),
+        "image_quota_exhausted_streak": _optional_count(account.get("image_quota_exhausted_streak")) or 0,
+        "image_quota_last_remote_remaining": _optional_count(account.get("image_quota_last_remote_remaining")),
         "group_id": _text(account.get("group_id")),
         "group_name": group_name,
         "proxy": proxy,

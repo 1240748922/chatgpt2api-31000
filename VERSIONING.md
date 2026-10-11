@@ -1,6 +1,34 @@
 # 稳定版本、升级和回退
 
-## 2026-10-10 当前发布：3.2.49
+## 2026-10-11 当前发布：3.2.50
+
+- 修复上游 Instant 图片限额通知被归类为 `image_tool_error/502` 的问题。明确的图片限额通知进入现有 `image_quota_exhausted` 流程，保存“限流”、已知额度 0，并在既有请求预算内切换账号。
+- 用户输入、工具参数、尚未结束的助手文本和仅介绍 Mini 文本能力的文字不会触发新增识别规则。明确的鉴权、内容策略和上传限流错误保留各自分类；同时修复上传限流结构码被通用 429 覆盖的优先级问题。
+- 154 项本地回归通过，覆盖 HTTP/SSE/任务查询分类、账号状态持久化、排除限流账号，以及轮询限额后换号、保存并返回图片。无需数据库迁移，不改导号、预热、并发或用户配置。
+- 应用提交 `2af9bb0893da4640a6ba53dbe2dcfd0b809c72f3`，发布任务：[GitHub Actions 38130039190](https://github.com/1240748922/chatgpt2api-31000/actions/runs/38130039190)。本次只修复错误识别和标记入口，不新增永久封禁或额度冷却规则，不改写历史日志；后台复核仍按原有逻辑运行。
+- PostgreSQL 协调与网关路由回归通过，镜像已发布并匿名核对 linux/amd64 清单和 OCI revision；Compose 默认标签已锁定 `sha-2af9bb0`。部署锁定提交使用 `[skip ci]`，不重复构建应用镜像。
+
+**更新：** 镜像标签为 `sha-2af9bb0`。服务器 `.env` 如果固定了 `CHATGPT2API_IMAGE_TAG`，将该项改为新标签；如果固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。其余配置保留，服务器由用户更新。
+
+沿用现有更新窗口，等待在途请求和导入任务结束后执行：
+
+```sh
+git pull --ff-only &&
+docker compose --env-file .env config -q &&
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env stop -t 600 gateway &&
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer &&
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway &&
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `/version` 显示 `3.2.50 / sha-2af9bb0`。回退镜像为 `3.2.49 / sha-a8a2674`。本版不增加真实额度，也不保证消除上游持续限流、超时和生成失败。
+
+---
+
+## 2026-10-10 上一版：3.2.49
 
 - 自动补号导入不再把注册用的代理绑定到账号：删除固定代理和单条代理池的导入回填，并忽略旧 session 文件中的代理及代理组字段。新账号沿用原有默认出口规则；没有默认代理时直连，不强制覆盖全局代理或账号组设置。
 - 注册本身仍使用原有注册代理、预检及重试；导入后的额度同步、后台维护、生图和预热使用已有出口解析规则。无数据库迁移，不改 `.env`、用户配置、并发、导号加速和生图流程。

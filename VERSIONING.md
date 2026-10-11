@@ -6,7 +6,25 @@
 - 注册本身仍使用原有注册代理、预检及重试；导入后的额度同步、后台维护、生图和预热使用已有出口解析规则。无数据库迁移，不改 `.env`、用户配置、并发、导号加速和生图流程。
 - 已存在账号的手动代理不会被批量清空；重复补号导入也不覆盖已有绑定。常规手动导入仍可按输入显式设置代理。注册机日志区分新导入“不绑定注册代理”和历史批次的已绑定记录。
 - 同时修复账号编辑框把脱敏占位 `custom` 当作实际代理的显示问题：编辑、测试和保存使用详情里的完整值，列表继续脱敏，取消编辑不写入账号。
-- 测试与镜像核验完成后，在本节补充验证结果及固定镜像标签。服务器仍由用户更新，不在本地开发阶段部署。
+- 本地代理隔离、浏览器导入/账号编辑、可用性、仪表盘和运行时回归通过；GitHub Actions 的 PostgreSQL 协调、网关路由和镜像构建均成功。应用提交为 `a8a2674dd9affb3da7e710fad61ab65cfd137f4d`，镜像标签为 `ghcr.io/1240748922/chatgpt2api-31000:sha-a8a2674`（同时更新 `latest`）。Compose 默认标签已锁定到该镜像；服务器仍由用户更新，不在本地开发阶段部署。
+
+**更新：** 服务器 `.env` 若固定了 `CHATGPT2API_IMAGE_TAG`，改为 `sha-a8a2674`；若固定了 `CHATGPT2API_BUILD_VERSION`，一并同步。未固定则使用本次 Compose 默认标签，保留其余配置。应用镜像构建记录：[GitHub Actions 38118983166](https://github.com/1240748922/chatgpt2api-31000/actions/runs/38118983166)。
+
+沿用现有更新窗口，暂停新请求/导入并等待在途任务结束后执行：
+
+```bash
+git pull --ff-only
+docker compose --env-file .env config -q
+docker compose --env-file .env pull app0 app1 app2 app3 app4 app5 app6 app7 importer
+docker compose --env-file .env stop -t 600 gateway
+docker compose --env-file .env stop -t 600 app0 app1 app2 app3 app4 app5 app6 app7 importer
+docker compose --env-file .env up -d --no-deps --force-recreate app0 app1 app2 app3 app4 app5 app6 app7 importer gateway
+sh scripts/verify_gateway.sh
+docker compose --env-file .env ps
+curl -fsS http://127.0.0.1:31000/version
+```
+
+预期 `/version` 显示 `3.2.49 / sha-a8a2674`。本次没有数据库迁移，不删除 PostgreSQL 卷，也不需要重新导入账号；重建应用容器会造成访问切换窗口。部署锁定提交使用 `[skip ci]`，避免为 Compose 文档变更重复构建应用镜像。
 
 ---
 

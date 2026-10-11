@@ -504,7 +504,36 @@ _IMAGE_QUOTA_MESSAGE_MARKERS = (
 )
 
 
-def _looks_like_image_quota_message(value: Any, *, allow_deferred: bool = True) -> bool:
+_IMAGE_QUOTA_LIMIT_MARKERS = (
+    # The upstream has used several variants of this notice while keeping
+    # the same account-local meaning.  Do not match a bare "Instant limit":
+    # the surrounding image context is required below.
+    "instant limit has been reached",
+    "instant limit was reached",
+    "instant image generation limit",
+    "instant image creation limit",
+    "image-generation limit has been reached",
+    "image generation limit has been reached",
+    "image creation limit has been reached",
+)
+
+_IMAGE_CONTEXT_MARKERS = (
+    "image generation",
+    "image-generation",
+    "image creation",
+    "create the image",
+    "generate the image",
+    "图片生成",
+    "图像生成",
+)
+
+
+def _looks_like_image_quota_message(
+    value: Any,
+    *,
+    allow_deferred: bool = True,
+    image_context: bool | None = None,
+) -> bool:
     """Recognize quota exhaustion when upstream omits a structured error code."""
     if isinstance(value, str):
         text = value
@@ -521,6 +550,22 @@ def _looks_like_image_quota_message(value: Any, *, allow_deferred: bool = True) 
     normalized = str(text or "").strip().casefold()
     if any(marker.casefold() in normalized for marker in _IMAGE_QUOTA_MESSAGE_MARKERS):
         return True
+
+    # Recent upstream responses no longer use the old "Free plan limit"
+    # wording. They describe an Instant limit and a text-only Mini fallback.
+    # Only interpret that limit in an image context, not a generic text turn.
+    has_image_context = (
+        image_context
+        if image_context is not None
+        else any(marker.casefold() in normalized for marker in _IMAGE_CONTEXT_MARKERS)
+    )
+    # A text-only model description alone does not prove exhausted quota.
+    # Require an explicit limit notice before changing account state.
+    if has_image_context and any(
+        marker in normalized for marker in _IMAGE_QUOTA_LIMIT_MARKERS
+    ):
+        return True
+
     # The upstream now offers to schedule a free image after quota resets,
     # without using its previous "Free plan limit" wording. Require all three
     # signals; a generic upgrade suggestion or a quoted prompt is not a limit.
@@ -618,7 +663,11 @@ def _classify_structured_failure_codes(
         if code not in POLICY_CODES | AUTH_CODES | QUOTA_CODES
         and FAILURE_CODE_ALIASES.get(code, code) in FAILURE_POLICIES
     )
-    if any(is_rate_limit_failure_code(code) for code in normalized_codes):
+    if "file_upload_throttled" not in known_codes and any(
+        is_rate_limit_failure_code(code) for code in normalized_codes
+    ):
+        # Preserve a specific upload limit instead of tying it with a generic
+        # 429 and losing the capability distinction in the lexical tie-break.
         known_codes.add("upstream_rate_limited")
     if known_codes:
         selected_code = max(known_codes, key=lambda code: (_failure_priority(code), code))
@@ -863,7 +912,13 @@ def classify_upstream_message(value: Any) -> ImageFailure | None:
         response_error = response.get("error") or outer.get("error") or outer
         failure = (
             image_failure("image_quota_exhausted", raw_detail=response_error)
-            if _looks_like_image_quota_message(response_error)
+            if _looks_like_image_quota_message(response_error) and (
+                structured_failure is None
+                or structured_failure.code in {
+                    "image_tool_error", "upstream_error", "upstream_rate_limited",
+                    "upstream_image_generation_error",
+                }
+            )
             else structured_failure
             or image_failure("image_tool_error", raw_detail=outer)
         )
@@ -1216,16 +1271,45 @@ def classify_message_facts(
         (*structured_codes, normalized_status),
         raw_detail=raw_detail,
     )
-    if structured_failure is not None:
-        return structured_failure
-    if _looks_like_image_quota_message(
+    image_context = (
+        normalized_role in {"assistant", "tool"}
+        and normalized_content_type in {"text", "system_error"}
+        and (
+            normalized_role == "tool"
+            or end_turn or is_terminal_message_status(normalized_status)
+        )
+        and (
+            (normalized_role == "tool" and normalized_content_type == "system_error")
+            or any(
+                marker.casefold() in str(raw_detail or "").casefold()
+                for marker in _IMAGE_CONTEXT_MARKERS
+            )
+        )
+    )
+    quota_signal = _looks_like_image_quota_message(
         raw_detail,
         allow_deferred=(
             normalized_role in {"assistant", "tool"}
             and normalized_content_type in {"text", "system_error"}
         ),
+        image_context=image_context,
+    )
+    # Some tool messages carry a generic image_tool_error code even though
+    # their text is the authoritative account-local limit explanation. Let
+    # that narrow prose refine only generic upstream classifications; explicit
+    # auth, policy, upload, and quota codes keep their existing precedence.
+    if quota_signal and (
+        structured_failure is None
+        or structured_failure.code in {
+            "image_tool_error",
+            "upstream_error",
+            "upstream_image_generation_error",
+            "upstream_rate_limited",
+        }
     ):
         return image_failure("image_quota_exhausted", raw_detail=raw_detail)
+    if structured_failure is not None:
+        return structured_failure
 
     if normalized_role == "assistant" and normalized_content_type == "text" and (
         end_turn or is_terminal_message_status(normalized_status)

@@ -6,12 +6,31 @@ from copy import deepcopy
 
 import pytest
 
-from services.image_failure import ImageFailureError, ImagePollTimeoutError, classify_upstream_message
+from services.image_failure import (
+    ImageFailureError,
+    ImagePollTimeoutError,
+    classify_image_exception,
+    classify_task_failure,
+    classify_upstream_message,
+)
 from test_image_recovery import backend, document
 from test_image_account_retries import retry_flow
+from test_account_auth_quarantine import jwt, row, service_factory
+from utils.helper import UpstreamHTTPError
 
 
 DEFERRED_QUOTA = "免费安排稍后生成此图像。升级订阅即可立即创建，或在用量于 明天 17:53 重置后重试。"
+INSTANT_LIMIT_TOOL_ERROR = (
+    "Before doing anything else, explicitly explain that the tool is unavailable "
+    "because the user's Instant limit has been reached and the Mini model is text-only."
+    ' Make sure to begin your response with "It looks like image creation is temporarily '
+    'unavailable. Do you want to try something else?".'
+)
+INSTANT_LIMIT_ASSISTANT_ERROR = (
+    "It looks like image creation is temporarily unavailable. Do you want to try "
+    "something else? The image generation tool’s Instant limit has been reached, "
+    "and the current Mini model is text-only, so I can’t create the image in this request."
+)
 
 
 def message(role, kind, text="", **kw):
@@ -45,6 +64,84 @@ def test_deferred_free_image_is_account_quota_not_poll_timeout(role):
 def test_upgrade_or_quoted_prompt_alone_is_not_new_quota_signal(role, kind, text):
     failure = classify_upstream_message(message(role, kind, text))
     assert failure is None or failure.code != "image_quota_exhausted"
+
+
+@pytest.mark.parametrize("role,kind,text", [
+    ("tool", "system_error", INSTANT_LIMIT_TOOL_ERROR),
+    ("assistant", "text", INSTANT_LIMIT_ASSISTANT_ERROR),
+])
+def test_instant_limit_and_mini_text_only_are_marked_as_image_quota(role, kind, text):
+    failure = classify_upstream_message(message(role, kind, text, end_turn=role == "assistant"))
+    assert failure is not None
+    assert failure.code == "image_quota_exhausted"
+    assert failure.account_capacity_limited and failure.switch_account
+
+
+def test_task_probe_marks_the_real_tool_error_as_image_quota():
+    failure = classify_task_failure({
+        "image_gen_message": message("tool", "system_error", INSTANT_LIMIT_TOOL_ERROR),
+    })
+    assert failure is not None
+    assert failure.code == "image_quota_exhausted"
+
+
+@pytest.mark.parametrize("role,kind,text", [
+    ("assistant", "text", "The Mini model is text-only and the Instant limit has been reached."),
+    ("user", "text", INSTANT_LIMIT_ASSISTANT_ERROR),
+    ("assistant", "text", "The image generation tool is temporarily unavailable."),
+    ("assistant", "code", INSTANT_LIMIT_ASSISTANT_ERROR),
+    ("tool", "system_error", "The Mini model is text-only."),
+    ("assistant", "text", "The Mini model is text-only and cannot generate the image."),
+])
+def test_instant_limit_without_image_context_is_not_marked_as_quota(role, kind, text):
+    failure = classify_upstream_message(message(role, kind, text, end_turn=role == "assistant"))
+    assert failure is None or failure.code != "image_quota_exhausted"
+
+
+def test_in_progress_instant_notice_does_not_interrupt_generation():
+    failure = classify_upstream_message(message("assistant", "text", INSTANT_LIMIT_ASSISTANT_ERROR,
+                                               status="in_progress", end_turn=False))
+    assert failure is None
+
+
+@pytest.mark.parametrize("code", ["auth_invalid", "content_policy_violation", "file_upload_throttled"])
+@pytest.mark.parametrize("response_event", [False, True])
+def test_explicit_failures_keep_precedence_over_instant_prose(code, response_event):
+    error = {"code": code, "message": INSTANT_LIMIT_TOOL_ERROR}
+    payload = ({"type": "response.failed", "response": {"error": error}} if response_event else
+               message("tool", "system_error", INSTANT_LIMIT_TOOL_ERROR, metadata={"error": error}))
+    assert classify_upstream_message(payload).code == code
+
+
+@pytest.mark.parametrize("source", ["http", "response", "generic_code"])
+def test_instant_error_is_recognized_across_error_transports(source):
+    error = {"code": "image_tool_error", "message": INSTANT_LIMIT_TOOL_ERROR}
+    if source == "http":
+        failure = classify_image_exception(UpstreamHTTPError("/backend-api/conversation", 429,
+                                                             {"error": error}, retry_after=90))
+        assert failure.retry_after == 90
+    else:
+        payload = ({"type": "response.failed", "response": {"error": error}} if source == "response" else
+                   message("tool", "system_error", INSTANT_LIMIT_TOOL_ERROR, metadata={"error": error}))
+        failure = classify_upstream_message(payload)
+    assert failure.code == "image_quota_exhausted" and failure.switch_account
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_instant_notice_persists_account_limit_and_excludes_dispatch(service_factory, limited):
+    token = jwt(7200)
+    service = service_factory([row(token)])
+    text = INSTANT_LIMIT_TOOL_ERROR if limited else "Image tool temporarily unavailable."
+    failure = classify_upstream_message(message("tool", "system_error", text))
+    lease = service.get_available_access_token()
+    service.mark_image_result(lease, False, failure=failure)
+    account = service.storage.load_accounts()[0]
+    assert account["status"] == ("限流" if limited else "正常")
+    assert account["quota"] == (0 if limited else 8)
+    assert not account["image_quota_unknown"]
+    assert not service._image_inflight
+    if limited:
+        assert not service._is_image_account_available(account)
 
 
 def test_poll_stops_at_confirmed_quota_without_task_query(backend, monkeypatch):
@@ -142,7 +239,7 @@ def test_empty_grace_resets_on_state_change_or_uncertain_query(backend, monkeypa
         instance._poll_image_results("synthetic", timeout_secs=24)
 
 
-@pytest.mark.parametrize("kind", ["quota", "empty"])
+@pytest.mark.parametrize("kind", ["quota", "instant", "empty"])
 def test_terminal_poll_rotates_and_returns_saved_image(backend, retry_flow, monkeypatch, tmp_path, kind):
     import base64
     from io import BytesIO
@@ -153,7 +250,8 @@ def test_terminal_poll_rotates_and_returns_saved_image(backend, retry_flow, monk
     instance, _clock = backend
     retry_flow.service._accounts.update({str(i): _account(str(i), quota=8, unknown=False) for i in range(2)})
     doc = empty_completed() if kind == "empty" else {
-        "mapping": {"tool": {"message": message("tool", "text", DEFERRED_QUOTA)}}}
+        "mapping": {"tool": {"message": message("tool", "system_error" if kind == "instant" else "text",
+                                                 INSTANT_LIMIT_TOOL_ERROR if kind == "instant" else DEFERRED_QUOTA)}}}
     monkeypatch.setattr(instance, "_get_conversation", lambda *a, **kw: doc)
     monkeypatch.setattr(instance, "_query_backend_tasks", lambda **kw: [])
     png = BytesIO()
@@ -177,7 +275,7 @@ def test_terminal_poll_rotates_and_returns_saved_image(backend, retry_flow, monk
     assert saved.read_bytes() == base64.b64decode(result.data[0]["b64_json"]) == data
     assert result.conversation_id == "synthetic-success"
     first, second = result.image_attempts
-    assert first["failure_code"] == ("image_quota_exhausted" if kind == "quota" else "no_image_generated")
+    assert first["failure_code"] == ("no_image_generated" if kind == "empty" else "image_quota_exhausted")
     assert first["switched_account"] and second["status"] == "success"
     assert retry_flow.selected == retry_flow.closed == ["0", "1"]
     assert retry_flow.service._image_inflight == {}

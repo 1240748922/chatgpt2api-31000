@@ -1166,6 +1166,7 @@ class ImageTaskService:
                 base_url,
                 int(time.time()),
                 requested_size=size,
+                max_images=max(1, int(request_payload.get("n") or 1)),
             )
             data = formatted["data"]
             self._update_task(

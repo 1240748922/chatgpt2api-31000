@@ -532,7 +532,11 @@ def format_image_result(
     monitor_request: "ConversationRequest | None" = None,
     index: int = 0,
     total: int = 0,
+    *,
+    max_images: int | None = None,
 ) -> dict[str, Any]:
+    if max_images is not None and max_images < 1:
+        raise ValueError("max_images must be positive")
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
     processing_metrics = {
@@ -600,6 +604,11 @@ def format_image_result(
         if dimensions:
             asset["width"], asset["height"] = dimensions
         data.append(asset)
+        # A ChatGPT turn may produce several assets (or repeated final events).
+        # The pool schedules one turn per requested image; limit each slot
+        # before unnecessary upscaling/storage, not just the final HTTP body.
+        if max_images is not None and len(data) >= max_images:
+            break
     processing_metrics["postprocess_ms"] = _elapsed_ms(postprocess_started)
     if monitor_request is not None and monitor_request.trace_image_perf:
         _monitor_image_stage(
@@ -1761,6 +1770,7 @@ def _image_result_output_from_urls(
         monitor_request=request,
         index=index,
         total=total,
+        max_images=1,
     )
     data = formatted["data"]
     if not data:
@@ -2156,6 +2166,7 @@ def stream_codex_image_outputs(
         monitor_request=request,
         index=index,
         total=total,
+        max_images=1,
     )
     data = formatted["data"]
     if data:

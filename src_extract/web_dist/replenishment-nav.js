@@ -36,7 +36,7 @@
     const strategyCard=page.querySelector("[data-register-strategy]")?.closest(".register-card");if(strategyCard&&!strategyCard.dataset.strategySaveMounted){strategyCard.dataset.strategySaveMounted="true";const strategyHeader=strategyCard.querySelector(".register-card-header"),toggle=strategyCard.querySelector(".register-toggle"),actions=document.createElement("div");actions.className="register-strategy-actions";if(toggle)actions.appendChild(toggle);const strategyButton=document.createElement("button");strategyButton.type="button";strategyButton.className="register-button primary";strategyButton.dataset.registerAction="save-strategy";strategyButton.textContent="保存补号策略";actions.appendChild(strategyButton);if(strategyHeader)strategyHeader.appendChild(actions);const strategyRow=document.createElement("div");strategyRow.className="register-save-row";strategyRow.innerHTML=`<span class="register-save-state" data-register-strategy-save-state>修改策略或开关后，请点击此按钮保存</span>`;strategyCard.appendChild(strategyRow);const strategyState=strategyRow.querySelector("[data-register-strategy-save-state]");strategyButton.addEventListener("click",async()=>{strategyButton.disabled=true;strategyState.className="register-save-state";strategyState.textContent="保存中...";try{const settings=await request("/api/settings"),next={...(settings.settings?.account_replenishment||{})};["minimum_available","target_available","interval_seconds","cooldown_seconds","max_batch_size"].forEach(key=>{const field=page.querySelector(`[data-register-key="${key}"]`);next[key]=Number(field?.value||0)});next.enabled=!!page.querySelector("[data-register-enabled]")?.checked;const result=await request("/api/settings",{method:"PATCH",body:JSON.stringify({revision:settings.revision,account_replenishment:next})});config={...config,...next};page.dataset.registerRevision=result.revision||settings.revision||"";strategyState.textContent=next.enabled?"自动补充已启用并保存":"自动补充已停用并保存";statusError="";renderStatus()}catch(error){strategyState.className="register-save-state error";strategyState.textContent=error.message||"补号策略保存失败"}finally{strategyButton.disabled=false}});page.querySelector("[data-register-enabled]")?.addEventListener("change",()=>{strategyState.className="register-save-state";strategyState.textContent="开关已修改，请点击保存补号策略"})}const runtimeButton=page.querySelector('[data-register-action="save"]');if(runtimeButton){runtimeButton.textContent="保存注册机运行参数";const runtimeHelp=runtimeButton.closest(".register-card")?.querySelector(".register-card-help");if(runtimeHelp)runtimeHelp.textContent="只保存注册机目录、入口脚本、Python 和运行参数；补号阈值请使用上方按钮保存。"}
     function renderStatus(){const metrics=status.current_metrics||{},available=metrics.current_available??metrics.estimated_available??0,pending=metrics.pending_confirmation_count??metrics.unconfirmed_available??0,target=config.target_available||0,quota=metrics.current_quota??metrics.estimated_quota??0,running=!!status.running;setMetric(page,"available",available,target>0&&available<(config.minimum_available||0)?"warning":"success");setMetric(page,"pending",pending,pending>0?"warning":"success");setMetric(page,"target",target);setMetric(page,"quota",quota);setMetric(page,"state",running?"执行中":statusError?"异常":"待命",running?"warning":statusError?"danger":"success");logStatus.textContent=running?"注册机执行中":statusError?"状态异常":"已连接";logDot.className=`register-log-dot ${running?"running":statusError?"error":"success"}`;const followBottom=log.scrollHeight-log.scrollTop-log.clientHeight<48;log.textContent=formatLog(status,statusError);if(followBottom)log.scrollTop=log.scrollHeight;if(statusError){alert.hidden=false;alert.textContent=statusError}else alert.hidden=true}
     async function load(){try{const settings=await request("/api/settings");page.dataset.registerRevision=settings.revision||"";config={...(settings.settings?.account_replenishment||{})};page.querySelector("[data-register-enabled]").checked=!!config.enabled;setFields(page,config);saveState.textContent="配置已加载";statusError=""}catch(error){statusError=error.message;saveState.textContent=error.message||"配置加载失败"}try{status=await request("/api/accounts/replenishment")}catch(error){status={};statusError=error.message}renderStatus()}
-    async function save(){const button=page.querySelector('[data-register-action="save"]');button.disabled=true;saveState.className="register-save-state";saveState.textContent="保存中...";try{config=readConfig(page,config);const result=await request("/api/settings",{method:"PATCH",body:JSON.stringify({revision:page.dataset.registerRevision||"",account_replenishment:config})});page.dataset.registerRevision=result.revision||page.dataset.registerRevision||"";saveState.textContent="已保存";statusError="";renderStatus()}catch(error){saveState.className="register-save-state error";saveState.textContent=error.message||"保存失败"}finally{button.disabled=false}}
+    async function save(){const button=page.querySelector('[data-register-action="save"]');button.disabled=true;saveState.className="register-save-state";saveState.textContent="保存中...";try{config=readConfig(page,config);const result=await request("/api/settings",{method:"PATCH",body:JSON.stringify({revision:page.dataset.registerRevision||"",account_replenishment:config})});page.dataset.registerRevision=result.revision||page.dataset.registerRevision||"";page.dispatchEvent(new CustomEvent("register-settings-saved",{detail:config}));saveState.textContent="已保存";statusError="";renderStatus()}catch(error){saveState.className="register-save-state error";saveState.textContent=error.message||"保存失败"}finally{button.disabled=false}}
     async function run(force){const button=page.querySelector(`[data-register-action="${force?"force":"run"}"]`);button.disabled=true;logStatus.textContent=force?"强制执行中":"检查中";logDot.className="register-log-dot running";try{status=await request(`/api/accounts/replenishment/run${force?"?force=true":""}`,{method:"POST",body:"{}"});statusError=""}catch(error){statusError=error.message}finally{button.disabled=false;await load()}}
     page.querySelector('[data-register-action="refresh"]').addEventListener("click",load);page.querySelector('[data-register-action="save"]').addEventListener("click",save);page.querySelector('[data-register-action="run"]').addEventListener("click",()=>run(false));page.querySelector('[data-register-action="force"]').addEventListener("click",()=>run(true));await load()}
   function unmountPage(){const page=document.querySelector(`[${PAGE_MARKER}]`);if(page)page.remove();const shellTitle=document.querySelector("main header h2[data-register-original-title]");if(shellTitle){shellTitle.textContent=shellTitle.dataset.registerOriginalTitle;delete shellTitle.dataset.registerOriginalTitle}const routeView=document.querySelector('.route-view-content[data-register-hidden="true"]');if(routeView){routeView.style.display="";delete routeView.dataset.registerHidden}}
@@ -331,14 +331,31 @@
     const mailbox = page.querySelector('[data-register-key="mailbox_file"]');
     if (mailbox) mailbox.required = source === "mailbox_file";
   }
+  const sourceFields = {
+    configured: [],
+    remail_target: ["remail_service_mode", "remail_supply", "remail_email_suffix", "remail_project_id"],
+    mailbox_file: ["mailbox_file"], cfworker: ["cfworker_domain"],
+    smailr: ["smailr_domain"], phone: [],
+  };
+  function sourceSelection(page, config) {
+    const source = config ? (config.registration_source || "configured") : value(page, "registration_source", "configured");
+    const selected = { registration_source: source };
+    (sourceFields[source] || []).forEach((key) => {
+      const item = config ? config[key] : value(page, key);
+      selected[key] = key === "remail_project_id" ? Number(item || 2) : String(item ?? "").trim();
+    });
+    return selected;
+  }
   async function hydrate(page) {
     if (page.dataset.registerProviderHydrated === "true") return;
     page.dataset.registerProviderHydrated = "loading";
     try {
       const response = await fetch("/api/settings", { headers: authHeaders() });
       const body = await response.json();
+      if (!response.ok) throw new Error("读取注册来源失败");
       const config = body?.settings?.account_replenishment || {};
       Object.entries(config).forEach(([key, item]) => setValue(page, key, item));
+      page.dataset.registerSourceSaved = JSON.stringify(sourceSelection(page));
     } catch (_) {
       // The main registration page renders its own API error state.
     } finally {
@@ -386,6 +403,60 @@
       const fieldNode = card.querySelector(`[data-register-key="${key}"]`)?.closest(".register-field");
       if (fieldNode) fieldNode.setAttribute("data-register-provider-only", provider);
     });
+    const sourceRow = document.createElement("div");
+    sourceRow.className = "register-save-row";
+    sourceRow.innerHTML = '<span class="register-save-state" data-register-source-save-state>修改来源后请保存，新任务才会使用新来源。</span><button type="button" class="register-button primary" data-register-source-save>保存注册来源</button>';
+    card.appendChild(sourceRow);
+    const sourceState = sourceRow.querySelector("[data-register-source-save-state]");
+    const sourceButton = sourceRow.querySelector("[data-register-source-save]");
+    let savingSource = false;
+    async function saveSource() {
+      if (savingSource) throw new Error("注册来源正在保存，请稍后重试");
+      if (!page.dataset.registerSourceSaved) throw new Error("注册来源尚未加载，请刷新页面后重试");
+      const selected = sourceSelection(page);
+      savingSource = true;
+      sourceButton.disabled = true;
+      sourceState.className = "register-save-state";
+      sourceState.textContent = "保存中...";
+      try {
+        const settings = await providerRequest("/api/settings");
+        const config = { ...(settings.settings?.account_replenishment || {}), ...selected };
+        const result = await providerRequest("/api/settings", {
+          method: "PATCH", body: JSON.stringify({ revision: settings.revision, account_replenishment: config }),
+        });
+        page.dataset.registerRevision = result.revision || settings.revision || "";
+        page.dataset.registerSourceSaved = JSON.stringify(selected);
+        sourceState.textContent = JSON.stringify(sourceSelection(page)) === page.dataset.registerSourceSaved
+          ? "注册来源已保存；后续新任务生效，已运行任务不变。" : "保存期间来源有修改，请再次保存。";
+      } catch (error) {
+        sourceState.className = "register-save-state error";
+        sourceState.textContent = error.message || "注册来源保存失败";
+        throw error;
+      } finally {
+        savingSource = false;
+        sourceButton.disabled = false;
+      }
+    }
+    sourceButton.addEventListener("click", () => saveSource().catch(() => {}));
+    card.addEventListener("change", () => {
+      sourceState.className = "register-save-state";
+      sourceState.textContent = "注册来源有修改，请点击保存注册来源。";
+    });
+    page.addEventListener("register-settings-saved", (event) => {
+      page.dataset.registerSourceSaved = JSON.stringify(sourceSelection(page, event.detail));
+      sourceState.className = "register-save-state";
+      sourceState.textContent = "注册来源已随运行参数保存。";
+    });
+    // Never start an old provider while the form shows an unsaved new one.
+    page.addEventListener("click", (event) => {
+      const action = event.target.closest('[data-register-action="manual"], [data-register-action="run"], [data-register-action="force"]');
+      if (!action || (!savingSource && page.dataset.registerSourceSaved === JSON.stringify(sourceSelection(page)))) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      sourceState.className = "register-save-state error";
+      sourceState.textContent = "请先保存注册来源，再启动注册；本次未启动任务。";
+      sourceRow.scrollIntoView({ block: "nearest" });
+    }, true);
     const credentials = document.createElement("div");
     credentials.className = "register-card";
     credentials.setAttribute("data-register-provider-credentials", "true");
@@ -402,7 +473,7 @@
       smsbower_country: "phone",
     };
     credentials.querySelector('[data-provider-action="save"]').textContent = "保存邮箱与代理配置";
-    credentials.querySelector(".register-card-help").textContent = "只保存邮箱/短信服务地址、密钥、国家代码和注册代理。补号策略与运行参数请使用上方按钮保存。密钥只显示掩码。";
+    credentials.querySelector(".register-card-help").textContent = "保存邮箱/短信服务地址、密钥、注册代理，并同步保存当前选择的注册来源与域名。补号策略与运行参数仍单独保存。";
     credentials.querySelectorAll("[data-provider-key]").forEach((field) => {
       if (secretProviderKeys.has(field.dataset.providerKey)) bindSecretField(field);
     });
@@ -454,7 +525,8 @@
       providerSaveState.textContent = "保存中...";
       try {
         const values = await providerRequest("/api/accounts/replenishment/provider-config", { method: "PATCH", body: JSON.stringify(payload) });
-        providerSaveState.textContent = "服务配置已保存";
+        await saveSource();
+        providerSaveState.textContent = "邮箱、代理配置及注册来源已保存";
         Object.entries({
           remail_api_key: [values.remail_has_api_key, values.remail_api_key_masked],
           smailr_api_key: [values.smailr_has_api_key, values.smailr_api_key_masked],

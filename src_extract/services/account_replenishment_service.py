@@ -699,7 +699,32 @@ class AccountReplenishmentService:
             command.append("--no-2fa")
         if source != "phone" and _text(settings.get("no_phone_reuse"), "true").lower() in {"1", "true", "yes", "on"}:
             command.append("--no-phone-reuse")
-        command.extend(_split_args(settings.get("extra_args") or ""))
+        extra_args = _split_args(settings.get("extra_args") or "")
+        # An explicitly selected UI source must not silently lose to another
+        # provider flag in legacy extra_args (the CLI tries ReMail first).
+        provider_flags = {
+            "--buy-remail-mailbox": "remail_target",
+            "--remail-service-mode": "remail_target",
+            "--target-at200": "remail_target",
+            "--buy-cfworker-mailbox": "cfworker",
+            "--buy-smailr-mailbox": "smailr",
+            "--mailbox-file": "mailbox_file",
+            "--chatai-mailbox-file": "mailbox_file",
+            "--phone-register": "phone",
+            "--remail-token": "remail_target",
+        }
+        if source != "configured":
+            conflicts = sorted({
+                arg.split("=", 1)[0] for arg in extra_args
+                if arg.split("=", 1)[0] in provider_flags
+                and provider_flags[arg.split("=", 1)[0]] != source
+            })
+            if conflicts:
+                raise ValueError(
+                    "extra_args 与所选注册来源 " + source + " 冲突："
+                    + ", ".join(conflicts) + "；请移除旧来源参数后重试。"
+                )
+        command.extend(extra_args)
         return command
 
     @staticmethod

@@ -50,6 +50,8 @@ INTERNAL_RESPONSE_KEYS = {
     "_image_attempts",
     "_image_metadata",
     "_image_processing_metrics",
+    "_image_extras",
+    "_image_result_counts",
 }
 LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/image-thumbnails/)[^\s)\"']+)\)")
 PERF_WAIT_WARN_MS = 1000
@@ -97,6 +99,8 @@ def _collect_urls(value: object) -> list[str]:
     urls: list[str] = []
     if isinstance(value, dict):
         for key, item in value.items():
+            if key in {"_image_extras", "_image_result_counts"}:
+                continue
             if key == "url" and isinstance(item, str):
                 urls.append(item)
             elif key in {"urls", "_image_urls"} and isinstance(item, list):
@@ -363,9 +367,22 @@ def image_result_metrics(value: object) -> dict[str, object]:
         "result_b64_chars": 0,
     }
     images: list[dict[str, int]] = []
+    extras: dict[str, dict[str, Any]] = {}
+    count_keys = {
+        "image_candidate_count", "image_unique_count", "image_returned_count",
+        "image_saved_count", "image_extra_saved_count", "image_extra_failed_count",
+    }
 
     def visit(item: object) -> None:
         if isinstance(item, dict):
+            counts = item.get("_image_result_counts")
+            if isinstance(counts, dict):
+                for key in count_keys:
+                    if key in counts:
+                        metrics[key] = max(int(metrics.get(key, 0)), max(0, int(counts[key] or 0)))
+            for extra in item.get("_image_extras") or []:
+                if isinstance(extra, dict) and extra.get("url"):
+                    extras[str(extra["url"])] = {key: extra[key] for key in ("url", "width", "height", "slot") if key in extra}
             internal_images = item.get("_image_metadata")
             if isinstance(internal_images, list):
                 images.extend(internal_images)
@@ -384,7 +401,7 @@ def image_result_metrics(value: object) -> dict[str, object]:
                 metrics["result_b64_count"] = int(metrics["result_b64_count"]) + 1
                 metrics["result_b64_chars"] = int(metrics["result_b64_chars"]) + len(b64_json)
             for key, nested in item.items():
-                if key == "_image_metadata":
+                if key in {"_image_metadata", "_image_extras", "_image_result_counts"}:
                     continue
                 if isinstance(nested, (dict, list)):
                     visit(nested)
@@ -396,10 +413,12 @@ def image_result_metrics(value: object) -> dict[str, object]:
     if images:
         metrics["result_images"] = images
         metrics["result_data_count"] = max(metrics["result_data_count"], len(images))
+    if extras:
+        metrics["extra_images"] = list(extras.values())
     return {
         key: value
         for key, value in metrics.items()
-        if value
+        if value or key in count_keys
     }
 
 
@@ -718,7 +737,7 @@ class LoggedCall:
             for item in items:
                 if image_request:
                     for key, value in image_result_metrics(item).items():
-                        if key == "result_images":
+                        if key in {"result_images", "extra_images"}:
                             result_metrics.setdefault(key, []).extend(value)
                         else:
                             result_metrics[key] = result_metrics.get(key, 0) + value

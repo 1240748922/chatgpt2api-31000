@@ -783,6 +783,11 @@ def build_call_detail(item: Mapping[str, Any]) -> dict[str, Any]:
     attempts = [build_attempt_summary(value) for value in _restore_last_postprocess_metrics(item)]
     timings = call_timings_ms(item)
     image_urls = call_image_urls(item)
+    # Extra images are downloadable from the existing admin detail gallery,
+    # but never increase requested/succeeded counts in the call summary.
+    for url in _urls_from(detail.get("extra_images")):
+        if url not in image_urls:
+            image_urls.append(url)
     return {
         **summary,
         "request_text": _clean(detail.get("request_text")),

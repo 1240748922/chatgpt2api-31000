@@ -46,7 +46,7 @@ def test_one_upstream_turn_with_three_assets_returns_one(multi_asset, response_f
     )
     assert len(output.data) == 1
     assert len(output.image_urls) == 1
-    assert multi_asset.saved == [multi_asset.images[0]]
+    assert multi_asset.saved == multi_asset.images
     assert output.data[0]["url"] == output.image_urls[0]
     if response_format == "b64_json":
         assert base64.b64decode(output.data[0]["b64_json"]) == multi_asset.images[0]
@@ -72,7 +72,9 @@ def test_pool_limits_each_slot_without_losing_requested_slots(monkeypatch, multi
     result = protocol.collect_image_outputs(outputs, result_callback=callbacks.append)
     assert len(result["data"]) == n
     assert len(result["_image_urls"]) == n
-    assert len(multi_asset.saved) == n
+    assert len(result["_image_extras"]) == 2 * n
+    assert result["_image_result_counts"]["image_returned_count"] == n
+    assert len(multi_asset.saved) == 3 * n
     assert sorted(output.index for output in outputs) == list(range(1, n + 1))
     assert all(output.total == n and len(output.data) == 1 for output in outputs)
     assert [len(items) for items in callbacks] == list(range(1, n + 1))
@@ -104,10 +106,10 @@ def test_generate_and_edit_handlers_return_one_image(monkeypatch, multi_asset, e
         assert events[0]["type"] == ("image_edit.completed" if edit else "image_generation.completed")
     else:
         assert len(result["data"]) == 1
-    assert multi_asset.saved == [multi_asset.images[0]]
+    assert multi_asset.saved == multi_asset.images
 
 
-def test_codex_repeated_and_multiple_image_events_only_store_one(multi_asset):
+def test_codex_repeated_events_deduplicate_and_archive_distinct_extras(multi_asset):
     encoded = [base64.b64encode(data).decode("ascii") for data in multi_asset.images]
     first = {"type": "image_generation_call", "result": encoded[0]}
     backend = SimpleNamespace(iter_codex_image_response_events=lambda **kw: iter([
@@ -121,7 +123,8 @@ def test_codex_repeated_and_multiple_image_events_only_store_one(multi_asset):
     ))
     result = protocol.collect_image_outputs(outputs)
     assert len(result["data"]) == 1
-    assert multi_asset.saved == [multi_asset.images[0]]
+    assert multi_asset.saved == multi_asset.images[:2]
+    assert len(result["_image_extras"]) == 1
 
 
 def test_formatter_default_preserves_existing_multi_image_callers(multi_asset):
@@ -140,7 +143,7 @@ def test_limit_counts_results_not_empty_candidates(multi_asset):
         ], "fixture", "b64_json", max_images=1,
     )
     assert len(result["data"]) == 1
-    assert multi_asset.saved == [multi_asset.images[0]]
+    assert multi_asset.saved == multi_asset.images
 
 
 @pytest.mark.parametrize("limit", [0, -1])
@@ -171,7 +174,7 @@ def test_partial_slot_failure_keeps_success_without_returning_extras(monkeypatch
     assert len(result["data"]) == 1
     assert len(result["_image_urls"]) == 1
     assert outputs[0].index == 1 and outputs[0].total == 2
-    assert multi_asset.saved == [multi_asset.images[0]]
+    assert multi_asset.saved == multi_asset.images
 
 
 @pytest.mark.parametrize("n", [1, 2])
@@ -199,5 +202,8 @@ def test_resumed_task_never_exceeds_original_count(monkeypatch, multi_asset, n):
     assert len(updates[-1]["data"]) == n
     assert len(logs[-1]["result"]["data"]) == n
     assert len(gallery[-1]) == n
-    assert len(multi_asset.saved) == n
+    assert len(multi_asset.saved) == 3
+    assert len(updates[-1]["extra_images"]) == 3 - n
+    assert logs[-1]["call_id"] == updates[0]["call_id"]
+    assert logs[-1]["conversation_id"] == "fixture-conversation"
     assert closed == [True]

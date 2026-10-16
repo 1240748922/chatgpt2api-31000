@@ -2914,11 +2914,47 @@ class OpenAIBackendAPI:
             return any(cls._has_image_asset_pointer(item) for item in payload)
         return False
 
+    @classmethod
+    def _extract_image_output_ids(cls, message: Dict[str, Any]) -> tuple[list[str], list[str]]:
+        """Extract outputs, never comparison sources or input attachments."""
+        role = str((message.get("author") or {}).get("role") or "").lower()
+        if role not in {"tool", "assistant"}:
+            return [], []
+
+        def output_only(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: output_only(item) for key, item in value.items()
+                        if not (key in {"attachments", "comparison_source_asset_pointer",
+                                        "referenced_image_ids"}
+                                or key.startswith(("input_image", "reference_image", "comparison_source")))}
+            if isinstance(value, list):
+                return [output_only(item) for item in value]
+            return value
+
+        content = output_only(message.get("content") or {})
+        metadata = output_only(message.get("metadata") or {})
+        if role == "tool":
+            files, sediments = cls._extract_image_reference_ids(content)
+        else:
+            files, sediments = cls._extract_image_asset_pointer_ids(content)
+        # Metadata prose/IDs are not output evidence. Accept explicit output
+        # asset_pointer objects only, after removing reference-only fields.
+        meta_files, meta_sediments = cls._extract_image_asset_pointer_ids(metadata)
+        cls._add_unique(files, meta_files)
+        cls._add_unique(sediments, meta_sediments)
+        return files, sediments
+
     def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
         """从 conversation 明细里提取图片工具输出记录。"""
         mapping_value = data.get("mapping") or {}
         mapping = mapping_value if isinstance(mapping_value, dict) else {}
         records = []
+        input_ids: set[str] = set()
+        for node in mapping.values():
+            message = (node or {}).get("message") or {}
+            if (message.get("author") or {}).get("role") == "user":
+                files, sediments = self._extract_image_reference_ids(message)
+                input_ids.update(files + sediments)
         for message_id, node in mapping.items():
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
@@ -2929,16 +2965,9 @@ class OpenAIBackendAPI:
                 continue
             is_image_gen = metadata.get("async_task_type") == "image_gen"
             has_asset_pointer = self._has_image_asset_pointer(content) or self._has_image_asset_pointer(metadata)
-            if role == "assistant":
-                if not has_asset_pointer:
-                    continue
-                file_ids, sediment_ids = self._extract_image_asset_pointer_ids(
-                    {"content": content, "metadata": metadata}
-                )
-            else:
-                file_ids, sediment_ids = self._extract_image_reference_ids(
-                    {"content": content, "metadata": metadata}
-                )
+            file_ids, sediment_ids = self._extract_image_output_ids(message)
+            file_ids = [item for item in file_ids if item not in input_ids]
+            sediment_ids = [item for item in sediment_ids if item not in input_ids]
             if not is_image_gen and not has_asset_pointer and not file_ids and not sediment_ids:
                 continue
             records.append(

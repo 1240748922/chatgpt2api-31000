@@ -56,6 +56,10 @@ from utils.log import logger
 from utils.diagnostics import diagnostic_excerpt
 
 
+# Pure parsing must not depend on the replaceable network-backend factory.
+_extract_image_output_ids = OpenAIBackendAPI._extract_image_output_ids
+
+
 def _monitor_image_stage(request: "ConversationRequest", event: str, **data: Any) -> None:
     if request.trace_image_perf and request.call_id:
         if request.monitor_attempt > 0 and "attempt" not in data:
@@ -539,6 +543,13 @@ def format_image_result(
         raise ValueError("max_images must be positive")
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
+    extra_images: list[dict[str, Any]] = []
+    seen_images: set[bytes] = set()
+    result_counts = {
+        "image_candidate_count": 0, "image_unique_count": 0,
+        "image_returned_count": 0, "image_saved_count": 0,
+        "image_extra_saved_count": 0, "image_extra_failed_count": 0,
+    }
     processing_metrics = {
         "upscale_ms": 0,
         "upscale_queue_ms": 0,
@@ -551,8 +562,58 @@ def format_image_result(
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
+        result_counts["image_candidate_count"] += 1
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        image_bytes = base64.b64decode(b64_json)
+        try:
+            image_bytes = base64.b64decode(b64_json)
+        except ValueError as exc:
+            if max_images is None or len(data) < max_images:
+                raise
+            result_counts["image_extra_failed_count"] += 1
+            logger.warning({
+                "event": "image_extra_decode_failed",
+                "call_id": getattr(monitor_request, "call_id", ""),
+                "index": index, "error_type": type(exc).__name__,
+            })
+            continue
+        digest = hashlib.sha256(image_bytes).digest()
+        if digest in seen_images:
+            continue
+        seen_images.add(digest)
+        result_counts["image_unique_count"] += 1
+        if max_images is not None and len(data) >= max_images:
+            # Keep genuine alternative results without changing the public n
+            # contract. Archive originals: no extra upscaling or base64 output.
+            extra_started = time.perf_counter()
+            extra_timings: dict[str, int] = {}
+            try:
+                extra_url = save_image_bytes(
+                    image_bytes, base_url, deadline_monotonic=deadline_monotonic,
+                    timings=extra_timings,
+                )
+                if not extra_url:
+                    raise RuntimeError("extra image storage returned no URL")
+                extra: dict[str, Any] = {"url": extra_url, "slot": index}
+                dimensions = image_size_from_bytes(image_bytes)
+                if dimensions:
+                    extra["width"], extra["height"] = dimensions
+                extra_images.append(extra)
+                result_counts["image_extra_saved_count"] += 1
+                result_counts["image_saved_count"] += 1
+            except Exception as exc:
+                # Archival failure must not turn an already successful image
+                # into a retry that generates/charges for another turn.
+                result_counts["image_extra_failed_count"] += 1
+                logger.warning({
+                    "event": "image_extra_storage_failed",
+                    "call_id": getattr(monitor_request, "call_id", ""),
+                    "index": index, "error_type": type(exc).__name__,
+                })
+            finally:
+                processing_metrics["storage_ms"] += _elapsed_ms(extra_started)
+                for key, value in extra_timings.items():
+                    processing_metrics[key] = processing_metrics.get(key, 0) + value
+            continue
         upscale_started = time.perf_counter()
         upscale_timings: dict[str, int] = {}
         image_bytes = upscale_image_if_needed(image_bytes, requested_size, timings=upscale_timings)
@@ -604,11 +665,9 @@ def format_image_result(
         if dimensions:
             asset["width"], asset["height"] = dimensions
         data.append(asset)
-        # A ChatGPT turn may produce several assets (or repeated final events).
-        # The pool schedules one turn per requested image; limit each slot
-        # before unnecessary upscaling/storage, not just the final HTTP body.
-        if max_images is not None and len(data) >= max_images:
-            break
+        result_counts["image_returned_count"] += 1
+        if stored_url:
+            result_counts["image_saved_count"] += 1
     processing_metrics["postprocess_ms"] = _elapsed_ms(postprocess_started)
     if monitor_request is not None and monitor_request.trace_image_perf:
         _monitor_image_stage(
@@ -621,6 +680,9 @@ def format_image_result(
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if image_urls:
         result["_image_urls"] = image_urls
+    if extra_images:
+        result["_image_extras"] = extra_images
+    result["_image_result_counts"] = result_counts
     if message and not data:
         result["message"] = message
     if data or any(processing_metrics.values()):
@@ -655,6 +717,7 @@ class ConversationState:
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
+    input_image_ids: set[str] = field(default_factory=set)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
@@ -678,6 +741,8 @@ class ImageOutput:
     image_urls: list[str] = field(default_factory=list)
     image_attempts: list[dict[str, Any]] = field(default_factory=list)
     processing_metrics: dict[str, int] = field(default_factory=dict)
+    extra_images: list[dict[str, Any]] = field(default_factory=list)
+    result_counts: dict[str, int] = field(default_factory=dict)
     account_email: str = ""
     conversation_id: str = ""
     failure: ImageFailure | None = field(default=None, repr=False)
@@ -699,6 +764,10 @@ class ImageOutput:
             chunk["_conversation_id"] = self.conversation_id
         if self.image_urls:
             chunk["_image_urls"] = list(self.image_urls)
+        if self.extra_images:
+            chunk["_image_extras"] = [dict(item) for item in self.extra_images]
+        if self.result_counts:
+            chunk["_image_result_counts"] = dict(self.result_counts)
         if self.image_attempts:
             chunk["_image_attempts"] = [dict(item) for item in self.image_attempts]
         if self.kind == "message":
@@ -965,6 +1034,10 @@ def update_conversation_state(
     # output boundary by itself.
     is_patch_event = isinstance(event, dict) and event.get("o") == "patch"
     is_user_msg = isinstance(event, dict) and _is_user_message_event(event)
+    if is_user_msg:
+        state.input_image_ids.update(file_ids + sediment_ids)
+        state.file_ids[:] = [item for item in state.file_ids if item not in state.input_image_ids]
+        state.sediment_ids[:] = [item for item in state.sediment_ids if item not in state.input_image_ids]
     event_facts = extract_message_facts(event) if isinstance(event, dict) else {}
     event_role = str(event_facts.get("role") or state.message_facts.get("role") or "").strip().lower()
     has_asset_pointer = (
@@ -977,8 +1050,40 @@ def update_conversation_state(
         or (is_patch_event and not is_user_msg and event_role == "tool" and has_asset_pointer)
     )
     if image_context:
-        add_unique(state.file_ids, file_ids)
-        add_unique(state.sediment_ids, sediment_ids)
+        output_files: list[str] = []
+        output_sediments: list[str] = []
+
+        def collect_output(item: Any, parent_path: str = "") -> None:
+            if not isinstance(item, dict) or item.get("o") == "remove":
+                return
+            value = item.get("v")
+            message = item.get("message") or (value.get("message") if isinstance(value, dict) else None)
+            if isinstance(message, dict):
+                files, sediments = _extract_image_output_ids(message)
+            else:
+                path = str(item.get("p") or parent_path)
+                if item.get("o") == "patch" and isinstance(value, list):
+                    for patch in value:
+                        collect_output(patch, path)
+                    return
+                if path == "/message" and isinstance(value, dict):
+                    files, sediments = _extract_image_output_ids(value)
+                elif path == "/message/content" or path.startswith("/message/content/"):
+                    if any(part in {"attachments", "referenced_image_ids"}
+                           or part.startswith(("comparison_source", "input_image", "reference_image"))
+                           for part in path.split("/")):
+                        return
+                    files, sediments = _extract_image_output_ids({
+                        "author": {"role": "tool"}, "content": value,
+                    })
+                else:
+                    return
+            add_unique(output_files, files)
+            add_unique(output_sediments, sediments)
+
+        collect_output(event)
+        add_unique(state.file_ids, [item for item in output_files if item not in state.input_image_ids])
+        add_unique(state.sediment_ids, [item for item in output_sediments if item not in state.input_image_ids])
     if not isinstance(event, dict):
         return
     state.conversation_id = str(event.get("conversation_id") or state.conversation_id)
@@ -1712,11 +1817,18 @@ def _recover_after_image_stream_timeout(
 def _cleanup_image_conversations_after_success(backend: OpenAIBackendAPI, outputs: Iterable[ImageOutput]) -> None:
     if not config.image_remove_conversation_after_result:
         return
+    outputs = list(outputs)
+    # Preserve the source for manual recovery when an extra could not be saved.
+    archive_incomplete = {
+        output.conversation_id for output in outputs
+        if output.result_counts.get("image_extra_failed_count", 0) > 0
+    }
     conversation_ids: list[str] = []
     seen: set[str] = set()
     for output in outputs:
         conversation_id = str(getattr(output, "conversation_id", "") or "").strip()
-        if output.kind != "result" or not conversation_id or conversation_id in seen:
+        if (output.kind != "result" or not conversation_id or conversation_id in seen
+                or conversation_id in archive_incomplete):
             continue
         seen.add(conversation_id)
         conversation_ids.append(conversation_id)
@@ -1783,6 +1895,8 @@ def _image_result_output_from_urls(
         data=data,
         image_urls=list(formatted.get("_image_urls") or []),
         processing_metrics=dict(formatted.get("_image_processing_metrics") or {}),
+        extra_images=list(formatted.get("_image_extras") or []),
+        result_counts=dict(formatted.get("_image_result_counts") or {}),
         conversation_id=conversation_id,
     )
 
@@ -2082,21 +2196,28 @@ def stream_image_outputs(
     )
 
 def _codex_response_images(value: Any) -> list[str]:
-    if isinstance(value, dict):
-        if value.get("type") == "image_generation_call" and isinstance(value.get("result"), str):
-            result = value["result"].strip()
-            if result:
-                return [result.split(",", 1)[1] if result.startswith("data:image/") else result]
-        images: list[str] = []
-        for item in value.values():
-            images.extend(_codex_response_images(item))
-        return images
-    if isinstance(value, list):
-        images: list[str] = []
-        for item in value:
-            images.extend(_codex_response_images(item))
-        return images
-    return []
+    images: list[str] = []
+    seen: set[str] = set()
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            if item.get("type") == "image_generation_call" and isinstance(item.get("result"), str):
+                result = item["result"].strip()
+                if result.startswith("data:image/"):
+                    result = result.split(",", 1)[1]
+                result = "".join(result.split())
+                if result and result not in seen:
+                    seen.add(result)
+                    images.append(result)
+                return
+            for nested in item.values():
+                walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(value)
+    return images
 
 
 def stream_codex_image_outputs(
@@ -2178,6 +2299,8 @@ def stream_codex_image_outputs(
             data=data,
             image_urls=list(formatted.get("_image_urls") or []),
             processing_metrics=dict(formatted.get("_image_processing_metrics") or {}),
+            extra_images=list(formatted.get("_image_extras") or []),
+            result_counts=dict(formatted.get("_image_result_counts") or {}),
         )
         return
     raise ImageGenerationError(
@@ -3198,6 +3321,11 @@ def stream_image_chunks(
                         completed["usage"] = usage
                 completed_payload = _image_stream_payload(output, f"{prefix}.completed", completed)
                 completed_payload["_image_metadata"] = image_output_metadata([item])
+                if item_index == 0:
+                    if output.extra_images:
+                        completed_payload["_image_extras"] = [dict(extra) for extra in output.extra_images]
+                    if output.result_counts:
+                        completed_payload["_image_result_counts"] = dict(output.result_counts)
                 if output.image_urls:
                     completed_payload["_image_urls"] = list(output.image_urls)
                 yield completed_payload
@@ -3222,6 +3350,8 @@ def collect_image_outputs(
     image_urls: list[str] = []
     image_attempts: list[dict[str, Any]] = []
     processing_metrics: dict[str, int] = {}
+    extra_images: list[dict[str, Any]] = []
+    result_counts: dict[str, int] = {}
     failed_output: ImageOutput | None = None
     for output in outputs:
         created = created or output.created
@@ -3247,6 +3377,9 @@ def collect_image_outputs(
         elif output.kind == "result":
             data.extend(output.data)
             image_urls.extend(output.image_urls)
+            extra_images.extend(dict(item) for item in output.extra_images)
+            for key, value in output.result_counts.items():
+                result_counts[key] = result_counts.get(key, 0) + value
             if callable(result_callback) and output.data:
                 result_callback([dict(item) for item in data])
 
@@ -3278,4 +3411,8 @@ def collect_image_outputs(
         result["_image_attempts"] = image_attempts
     if processing_metrics:
         result["_image_processing_metrics"] = processing_metrics
+    if extra_images:
+        result["_image_extras"] = extra_images
+    if result_counts:
+        result["_image_result_counts"] = result_counts
     return result

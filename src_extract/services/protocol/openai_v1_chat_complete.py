@@ -105,6 +105,8 @@ def _with_log_metadata(
     image_urls: Iterable[str] | None = None,
     image_attempts: Iterable[dict[str, Any]] | None = None,
     image_data: list[dict[str, Any]] | None = None,
+    extra_images: list[dict[str, Any]] | None = None,
+    result_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if account_email:
         payload["_account_email"] = account_email
@@ -118,6 +120,10 @@ def _with_log_metadata(
         payload["_image_attempts"] = attempts
     if image_data:
         payload["_image_metadata"] = image_output_metadata(image_data)
+    if extra_images:
+        payload["_image_extras"] = extra_images
+    if result_counts:
+        payload["_image_result_counts"] = result_counts
     return payload
 
 
@@ -273,6 +279,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         result.get("_image_urls") if isinstance(result.get("_image_urls"), list) else None,
         result.get("_image_attempts") if isinstance(result.get("_image_attempts"), list) else None,
         result.get("data"),
+        result.get("_image_extras"),
+        result.get("_image_result_counts"),
     )
     return response
 
@@ -318,6 +326,8 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
                 output.image_urls,
                 output.image_attempts,
                 output.data if output.kind == "result" else None,
+                output.extra_images if output.kind == "result" else None,
+                output.result_counts if output.kind == "result" else None,
             )
         else:
             yield _with_log_metadata(
@@ -327,6 +337,8 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
                 output.image_urls,
                 output.image_attempts,
                 output.data if output.kind == "result" else None,
+                output.extra_images if output.kind == "result" else None,
+                output.result_counts if output.kind == "result" else None,
             )
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)

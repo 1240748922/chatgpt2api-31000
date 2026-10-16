@@ -436,6 +436,10 @@ def stream_image_response(
             _with_log_metadata(completed, output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
             _with_log_metadata(completed["response"], output.account_email, output.conversation_id, output.image_urls, output.image_attempts)
             completed["response"]["_image_metadata"] = image_output_metadata(output.data)
+            if output.extra_images:
+                completed["response"]["_image_extras"] = output.extra_images
+            if output.result_counts:
+                completed["response"]["_image_result_counts"] = output.result_counts
             yield completed
             return
     raise RuntimeError("image generation failed")

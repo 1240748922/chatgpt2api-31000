@@ -494,6 +494,11 @@ def build_request_detail_core(
         request_detail_field("返回格式", request_meta.get("response_format")),
         request_detail_field("请求张数", request_meta.get("n")),
         request_detail_field("出图张数", len(resolutions) if resolutions else None),
+        request_detail_field("去重后图片", detail.get("image_unique_count")),
+        request_detail_field("接口返回张数", detail.get("image_returned_count")),
+        request_detail_field("已保存张数", detail.get("image_saved_count")),
+        request_detail_field("额外保存张数", detail.get("image_extra_saved_count")),
+        request_detail_field("额外保存失败", detail.get("image_extra_failed_count")),
         None if hide_account_identity else request_detail_field("账号", summary.get("account_email"), copyable=True),
         request_detail_field(
             "密钥",

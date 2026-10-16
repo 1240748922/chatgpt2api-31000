@@ -736,7 +736,7 @@ class ImageTaskService:
             role=str(identity.get("role") or ""),
             key_name=str(identity.get("name") or ""),
         )
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        self._update_task(key, status=TASK_STATUS_RUNNING, error="", call_id=call_id)
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             updates: dict[str, Any] = {"progress": step}
@@ -797,6 +797,9 @@ class ImageTaskService:
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=usage,
+                extra_images=list(result.get("_image_extras") or []),
+                image_result_counts=dict(result.get("_image_result_counts") or {}),
+                call_id=call_id,
                 error="",
                 duration_ms=duration_ms,
                 **_clear_task_details(),
@@ -989,6 +992,12 @@ class ImageTaskService:
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
+            if isinstance(item.get("extra_images"), list):
+                task["extra_images"] = item["extra_images"]
+            if isinstance(item.get("image_result_counts"), dict):
+                task["image_result_counts"] = item["image_result_counts"]
+            if item.get("call_id"):
+                task["call_id"] = _clean(item["call_id"])
             usage = item.get("usage")
             if isinstance(usage, dict):
                 task["usage"] = usage
@@ -1126,7 +1135,8 @@ class ImageTaskService:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = submitted_wall
         handler_queue_ms = max(0, int((time.perf_counter() - submitted_perf) * 1000))
-        self._update_task(key, status=TASK_STATUS_RUNNING)
+        call_id = uuid4().hex[:16]
+        self._update_task(key, status=TASK_STATUS_RUNNING, call_id=call_id)
         backend = None
         with self._lock:
             request_payload = dict(self._tasks.get(key) or {})
@@ -1175,6 +1185,8 @@ class ImageTaskService:
                 data=data,
                 error="",
                 duration_ms=int((time.time() - started) * 1000),
+                extra_images=list(formatted.get("_image_extras") or []),
+                image_result_counts=dict(formatted.get("_image_result_counts") or {}),
                 **_clear_task_details(),
             )
             auto_push_gallery_urls(
@@ -1189,6 +1201,8 @@ class ImageTaskService:
                 started,
                 "调用完成（续轮询）",
                 status="success",
+                call_id=call_id,
+                conversation_id=conversation_id,
                 urls=_collect_image_urls(formatted),
                 perf={"handler_queue_ms": handler_queue_ms},
                 request_payload=request_payload,
@@ -1214,6 +1228,8 @@ class ImageTaskService:
                 started,
                 "调用失败（续轮询）",
                 status="failed",
+                call_id=call_id,
+                conversation_id=conversation_id,
                 error=public_error,
                 perf={"handler_queue_ms": handler_queue_ms},
                 request_payload=request_payload,

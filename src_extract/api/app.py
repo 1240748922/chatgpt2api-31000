@@ -26,6 +26,7 @@ from services.genbox_push_service import (
     start_genbox_push_service,
 )
 from services.image_task_service import image_task_service
+from services.image_archive_service import image_archive_service
 from services.log_service import log_service
 from services.realtime_monitor_service import realtime_monitor_service
 from services.retention_cleanup_service import retention_cleanup_coordinator, start_retention_cleanup_scheduler
@@ -57,6 +58,7 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         _configure_threadpool()
         credential_log_runner.start()
+        image_archive_service.start()
         from services.page_prewarm_pool import page_prewarm_pool
         page_prewarm_pool.start(account_service)
         singleton_background = account_shard_settings()[1] == 0
@@ -150,6 +152,7 @@ def create_app() -> FastAPI:
                         "error": str(exc),
                     })
                 backup_service.stop()
+            await run_in_threadpool(image_archive_service.shutdown)
             await run_in_threadpool(credential_log_runner.shutdown, wait=True)
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

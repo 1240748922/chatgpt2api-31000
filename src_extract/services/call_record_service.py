@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import timedelta
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -223,6 +224,9 @@ class CallRecordService:
 
     def get_detail(self, log_id: str) -> dict[str, Any] | None:
         item = self.repository.get(self._clean(log_id))
+        if item is not None and isinstance(item.get("detail"), dict):
+            from services.image_archive_service import enrich_archive_detail
+            item["detail"] = enrich_archive_detail(item["detail"], self.repository.engine)
         return build_call_detail(item) if item is not None else None
 
     def delete(self, ids: list[str]) -> dict[str, int]:
@@ -260,6 +264,10 @@ class CallRecordService:
             dry_run=dry_run,
             preserve_cursor=preserve_cursor,
         )
+        if not dry_run:
+            from services.storage.image_archive_repository import cleanup_receipts
+            # Keep a margin past call retention so a late receipt remains visible.
+            cleanup_receipts(self.repository.engine, time.time() - (hours + 24) * 3600)
         return {**result, "dry_run": dry_run}
 
     def preview_cleanup_old(self, retention_hours: int) -> dict[str, int | bool]:

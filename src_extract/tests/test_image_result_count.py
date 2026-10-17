@@ -26,6 +26,21 @@ def multi_asset(monkeypatch):
             saved.append(data)
             return f"http://localhost/images/result-{len(saved)}.png"
 
+    # Legacy protocol tests keep archival deterministic; dedicated worker tests
+    # exercise the real queue, deadlines, receipts, and shutdown separately.
+    def archive(data, base_url, *, slot, call_id, save):
+        try:
+            url = save(data, base_url)
+            if not url:
+                raise RuntimeError("empty archive URL")
+            dimensions = protocol.image_size_from_bytes(data)
+            result = {"url": url, "slot": slot}
+            if dimensions:
+                result["width"], result["height"] = dimensions
+            return result
+        except Exception:
+            return {"status": "failed", "slot": slot}
+    monkeypatch.setattr(protocol, "image_archive_service", SimpleNamespace(submit=archive))
     monkeypatch.setattr(protocol, "save_image_bytes", save)
     monkeypatch.setattr(protocol, "upscale_image_if_needed", lambda data, *a, **kw: data)
     monkeypatch.setattr(protocol, "count_text_tokens", lambda *a: 1)

@@ -124,3 +124,67 @@ def test_source_save_failure_does_not_enable_old_provider_launch(provider_ui):
     ui.page.locator('[data-register-action="manual"]').click()
     ui.page.wait_for_timeout(200)
     assert not ui.launch_sources
+
+
+class TransientSettingsUI(ProviderUI):
+    def __init__(self, page, origin):
+        self.settings_reads = 0
+        self.fail_get = False
+        super().__init__(page, origin)
+
+    def route(self, route):
+        request = route.request
+        if request.url.startswith(self.origin + '/') and request.method == 'GET' and urlsplit(request.url).path == '/api/settings':
+            self.settings_reads += 1
+            if self.settings_reads == 2 or self.fail_get:
+                route.fulfill(status=503, json={'detail': 'synthetic temporary settings error'})
+                return
+        super().route(route)
+
+
+@pytest.mark.parametrize('refresh_first', [False, True])
+def test_source_save_recovers_from_initial_settings_failure(browser, origin, refresh_first):
+    context = browser.new_context(viewport={'width': 1440, 'height': 1000})
+    try:
+        ui = TransientSettingsUI(context.new_page(), origin)
+        ui.page.goto(origin + '/#/settings?tab=replenishment')
+        pw.expect(ui.page.locator('[data-register-key=workdir]')).to_have_value('/tmp/register')
+        pw.expect(ui.page.locator('[data-provider-save-state]')).to_contain_text('已加载')
+        if refresh_first:
+            ui.page.locator('[data-register-action=refresh]').click()
+            pw.expect(ui.page.locator('[data-register-source-save-state]')).to_contain_text('已加载')
+        select_cf(ui)
+        ui.page.locator('[data-register-source-save]').click()
+        pw.expect(ui.page.locator('[data-register-source-save-state]')).to_contain_text('已保存')
+        assert ui.config['account_replenishment']['registration_source'] == 'cfworker'
+        assert ui.config['account_replenishment']['cfworker_domain'] == 'example.invalid'
+        assert ui.config['account_replenishment']['enabled'] is False
+        assert ui.config['account_replenishment']['workdir'] == '/tmp/register'
+        ui.page.locator('[data-register-action=manual]').click()
+        ui.page.wait_for_timeout(200)
+        assert ui.launch_sources == ['cfworker']
+    finally:
+        context.close()
+
+
+def test_repeated_settings_failure_is_visible_then_save_can_retry(browser, origin):
+    context = browser.new_context(viewport={'width': 1440, 'height': 1000})
+    try:
+        ui = TransientSettingsUI(context.new_page(), origin)
+        ui.page.goto(origin + '/#/settings?tab=replenishment')
+        pw.expect(ui.page.locator('[data-register-key=workdir]')).to_have_value('/tmp/register')
+        pw.expect(ui.page.locator('[data-provider-save-state]')).to_contain_text('已加载')
+        select_cf(ui)
+        ui.fail_get = True
+        ui.page.locator('[data-register-source-save]').click()
+        pw.expect(ui.page.locator('[data-register-source-save-state]')).to_have_class('register-save-state error')
+        assert not ui.settings_payloads
+        ui.page.locator('[data-register-action=manual]').click()
+        ui.page.wait_for_timeout(100)
+        assert not ui.launch_sources
+        ui.fail_get = False
+        ui.page.locator('[data-register-source-save]').click()
+        pw.expect(ui.page.locator('[data-register-source-save-state]')).to_contain_text('已保存')
+        assert ui.config['account_replenishment']['registration_source'] == 'cfworker'
+    finally:
+        context.close()

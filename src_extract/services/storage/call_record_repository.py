@@ -19,6 +19,10 @@ from services.application_database import (
 )
 
 
+# Register additive archive metadata before the shared schema initializes.
+from services.storage.image_archive_repository import ImageArchiveResult
+
+
 class CallRecordModel(DatabaseBase):
     __tablename__ = "call_records"
 

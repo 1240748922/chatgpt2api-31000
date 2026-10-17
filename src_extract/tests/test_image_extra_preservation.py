@@ -69,7 +69,8 @@ def test_extra_archive_failure_preserves_primary_and_continues(monkeypatch, mult
     monkeypatch.setattr(protocol, "save_image_bytes", save)
     result = format_fixture(multi_asset)
     assert attempts == multi_asset.images
-    assert len(result["data"]) == len(result["_image_extras"]) == 1
+    assert len(result["data"]) == 1
+    assert sum(bool(item.get("url")) for item in result["_image_extras"]) == 1
     counts = result["_image_result_counts"]
     assert counts["image_extra_failed_count"] == 1
     assert counts["image_saved_count"] == 2

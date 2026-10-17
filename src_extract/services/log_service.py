@@ -370,7 +370,7 @@ def image_result_metrics(value: object) -> dict[str, object]:
     extras: dict[str, dict[str, Any]] = {}
     count_keys = {
         "image_candidate_count", "image_unique_count", "image_returned_count",
-        "image_saved_count", "image_extra_saved_count", "image_extra_failed_count",
+        "image_saved_count", "image_extra_saved_count", "image_extra_failed_count", "image_extra_pending_count",
     }
 
     def visit(item: object) -> None:
@@ -381,8 +381,8 @@ def image_result_metrics(value: object) -> dict[str, object]:
                     if key in counts:
                         metrics[key] = max(int(metrics.get(key, 0)), max(0, int(counts[key] or 0)))
             for extra in item.get("_image_extras") or []:
-                if isinstance(extra, dict) and extra.get("url"):
-                    extras[str(extra["url"])] = {key: extra[key] for key in ("url", "width", "height", "slot") if key in extra}
+                if isinstance(extra, dict) and (extra.get("url") or extra.get("archive_id")):
+                    extras[str(extra.get("archive_id") or extra["url"])] = {key: extra[key] for key in ("url", "width", "height", "slot", "archive_id", "status", "reason", "expires_at") if key in extra}
             internal_images = item.get("_image_metadata")
             if isinstance(internal_images, list):
                 images.extend(internal_images)

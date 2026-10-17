@@ -499,6 +499,8 @@ def build_request_detail_core(
         request_detail_field("已保存张数", detail.get("image_saved_count")),
         request_detail_field("额外保存张数", detail.get("image_extra_saved_count")),
         request_detail_field("额外保存失败", detail.get("image_extra_failed_count")),
+        request_detail_field("额外图片归档中", detail.get("image_extra_pending_count")),
+        request_detail_field("归档状态", detail.get("image_archive_status_error")),
         None if hide_account_identity else request_detail_field("账号", summary.get("account_email"), copyable=True),
         request_detail_field(
             "密钥",

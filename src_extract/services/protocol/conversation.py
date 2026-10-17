@@ -19,6 +19,7 @@ from curl_cffi.requests import exceptions as curl_exceptions
 
 from services.account_service import ImageAccountSelectionError, account_service
 from services.config import config
+from services.image_archive_service import image_archive_service
 from services.image_failure import (
     ImageDownloadError,
     ImageFailure,
@@ -582,37 +583,27 @@ def format_image_result(
         seen_images.add(digest)
         result_counts["image_unique_count"] += 1
         if max_images is not None and len(data) >= max_images:
-            # Keep genuine alternative results without changing the public n
-            # contract. Archive originals: no extra upscaling or base64 output.
-            extra_started = time.perf_counter()
-            extra_timings: dict[str, int] = {}
+            # Never wait for optional archival before returning a paid result.
             try:
-                extra_url = save_image_bytes(
-                    image_bytes, base_url, deadline_monotonic=deadline_monotonic,
-                    timings=extra_timings,
+                extra = image_archive_service.submit(
+                    image_bytes, base_url, slot=index,
+                    call_id=getattr(monitor_request, "call_id", ""), save=save_image_bytes,
                 )
-                if not extra_url:
-                    raise RuntimeError("extra image storage returned no URL")
-                extra: dict[str, Any] = {"url": extra_url, "slot": index}
-                dimensions = image_size_from_bytes(image_bytes)
-                if dimensions:
-                    extra["width"], extra["height"] = dimensions
                 extra_images.append(extra)
-                result_counts["image_extra_saved_count"] += 1
-                result_counts["image_saved_count"] += 1
+                if extra.get("status") == "pending":
+                    result_counts["image_extra_pending_count"] = result_counts.get("image_extra_pending_count", 0) + 1
+                elif extra.get("url"):
+                    result_counts["image_extra_saved_count"] += 1
+                    result_counts["image_saved_count"] += 1
+                else:
+                    result_counts["image_extra_failed_count"] += 1
             except Exception as exc:
-                # Archival failure must not turn an already successful image
-                # into a retry that generates/charges for another turn.
                 result_counts["image_extra_failed_count"] += 1
                 logger.warning({
-                    "event": "image_extra_storage_failed",
+                    "event": "image_extra_enqueue_failed",
                     "call_id": getattr(monitor_request, "call_id", ""),
                     "index": index, "error_type": type(exc).__name__,
                 })
-            finally:
-                processing_metrics["storage_ms"] += _elapsed_ms(extra_started)
-                for key, value in extra_timings.items():
-                    processing_metrics[key] = processing_metrics.get(key, 0) + value
             continue
         upscale_started = time.perf_counter()
         upscale_timings: dict[str, int] = {}
@@ -1821,7 +1812,8 @@ def _cleanup_image_conversations_after_success(backend: OpenAIBackendAPI, output
     # Preserve the source for manual recovery when an extra could not be saved.
     archive_incomplete = {
         output.conversation_id for output in outputs
-        if output.result_counts.get("image_extra_failed_count", 0) > 0
+        if (output.result_counts.get("image_extra_failed_count", 0) > 0
+            or output.result_counts.get("image_extra_pending_count", 0) > 0)
     }
     conversation_ids: list[str] = []
     seen: set[str] = set()

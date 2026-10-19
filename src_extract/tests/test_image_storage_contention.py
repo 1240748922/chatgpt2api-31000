@@ -54,6 +54,15 @@ def test_save_does_not_wait_for_a_busy_gallery_catalog(store):
     assert not failures
 
 
+def test_local_image_reads_never_scan_full_catalog(store,monkeypatch):
+    data=png()
+    saved=store.save(data)
+    monkeypatch.setattr(store,"_load_clean_index",lambda: pytest.fail("single image scanned entire catalog"))
+    assert store.has_local(saved.rel)
+    assert store.get_bytes(saved.rel)==data
+    assert not store.has_local("2026/10/19/missing.png")
+
+
 def test_unrelated_images_no_longer_share_a_lock_stripe(store):
     buckets = {}
     for i in range(1000):

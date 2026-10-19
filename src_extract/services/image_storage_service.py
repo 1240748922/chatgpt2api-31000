@@ -513,9 +513,13 @@ class ImageStorageService:
         safe_rel = normalize_image_relative_path(rel)
         if not _is_image_rel(safe_rel):
             raise HTTPException(status_code=404, detail="image not found")
+        path = image_local_path(safe_rel)
+        # The gateway already serves existing local files directly. Do the
+        # same for app fallback, never scan every journal entry for one PNG.
+        if path.is_file():
+            return path.read_bytes()
         with self._index_guard():
             item = self._load_clean_index().get(safe_rel)
-        path = image_local_path(safe_rel)
         # A successful generation writes the file before committing the index.
         # If a replica reads the URL during that small window, serve the
         # validated local image directly instead of returning a false 404.
@@ -592,11 +596,11 @@ class ImageStorageService:
 
     def has_local(self, rel: str) -> bool:
         safe_rel = normalize_image_relative_path(rel)
-        with self._index_guard():
-            item = self._load_clean_index().get(safe_rel)
-        return image_local_path(safe_rel).is_file() and (
-            not isinstance(item, dict) or bool(item.get("local"))
-        )
+        if not _is_image_rel(safe_rel):
+            return False
+        # Local existence is authoritative (same as nginx try_files). Deletion
+        # removes the file; WebDAV-only reads still verify the shared catalog.
+        return image_local_path(safe_rel).is_file()
 
     @staticmethod
     def _catalog_size_matches_local(item: dict[str, object], local_size: int) -> bool:

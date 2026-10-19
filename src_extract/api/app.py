@@ -32,6 +32,8 @@ from services.realtime_monitor_service import realtime_monitor_service
 from services.retention_cleanup_service import retention_cleanup_coordinator, start_retention_cleanup_scheduler
 from services.runtime_configuration import DEFAULT_THREAD_TOKENS, account_shard_settings, env_int
 from utils.log import logger
+from services.runtime_health import EventLoopWatchdog
+from api.admission import GenerationAdmissionMiddleware
 
 
 RETENTION_SHUTDOWN_TIMEOUT_SECS = 1.0
@@ -57,6 +59,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _configure_threadpool()
+        loop_watchdog = EventLoopWatchdog()
         credential_log_runner.start()
         image_archive_service.start()
         from services.page_prewarm_pool import page_prewarm_pool
@@ -120,11 +123,13 @@ def create_app() -> FastAPI:
         dashboard_metrics_thread = dashboard_metrics_service.start_refresh_scheduler(log_service, stop_event) if singleton_background else None
         if singleton_background:
             backup_service.start()
+        loop_watchdog.start()
         try:
             yield
         finally:
+            await loop_watchdog.stop()
             stop_event.set()
-            await run_in_threadpool(page_prewarm_pool.stop())
+            await run_in_threadpool(page_prewarm_pool.stop)
             if startup_maintenance_thread is not None:
                 startup_maintenance_thread.join(timeout=1)
             if import_service is not None:
@@ -156,6 +161,7 @@ def create_app() -> FastAPI:
             await run_in_threadpool(credential_log_runner.shutdown, wait=True)
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+    app.add_middleware(GenerationAdmissionMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

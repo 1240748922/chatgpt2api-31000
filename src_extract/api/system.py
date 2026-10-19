@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -40,6 +41,7 @@ from contracts.settings import (
 from contracts.updates import UpdateStatusView, UpdateTaskView
 from api.support import require_admin, require_identity, resolve_image_base_url
 from services.account_service import account_service
+from services.async_execution import BoundedExecution, ExecutionBusy, ExecutionTimeout
 from services.auth_view import build_auth_view
 from services.backup_service import BackupError, backup_service
 from services.config import config
@@ -88,6 +90,18 @@ from services.settings_management_service import (
 )
 from services.update_status_service import update_status_service
 from services.update_service import UpdateInstallError, update_service
+
+
+_dashboard_execution = BoundedExecution("dashboard-http", workers=2, queue=4, queue_timeout=2)
+_media_execution = BoundedExecution("media-http", workers=4, queue=16, queue_timeout=2)
+
+
+async def _media_call(callback, *args, **kwargs):
+    try:
+        return await _media_execution.run(callback, *args, deadline=time.monotonic() + 30, **kwargs)
+    except (ExecutionBusy, ExecutionTimeout) as exc:
+        raise HTTPException(status_code=503, detail="Image storage busy; retry shortly.",
+                            headers={"Retry-After": "2"}) from exc
 
 
 class ProxyTestRequest(BaseModel):
@@ -193,13 +207,13 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/auth/login", response_model=AuthView)
     async def login(authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         return build_auth_view(app_version, identity)
 
     @router.get("/auth/status", response_model=AuthView)
     async def auth_status(authorization: str | None = Header(default=None)):
         try:
-            identity = require_identity(authorization)
+            identity = await run_in_threadpool(require_identity, authorization)
         except HTTPException:
             return build_auth_view(app_version)
         return build_auth_view(app_version, identity)
@@ -218,17 +232,17 @@ def create_router(app_version: str) -> APIRouter:
         force: bool = Query(default=False),
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(update_status_service.view, app_version, force=force)
 
     @router.get("/api/system/update-task", response_model=UpdateTaskView)
     async def get_update_task(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return update_service.view(app_version)
 
     @router.post("/api/system/update", response_model=UpdateTaskView, status_code=202)
     async def start_update(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return update_service.start(app_version)
         except UpdateInstallError as exc:
@@ -236,17 +250,17 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/settings", response_model=SettingsView)
     async def get_settings(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(settings_management_service.view)
 
     @router.get("/api/third-party-apps", response_model=PublicThirdPartyAppsView)
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        await run_in_threadpool(require_identity, authorization)
         return await run_in_threadpool(settings_management_service.public_third_party_apps_view)
 
     @router.patch("/api/settings", response_model=SettingsMutationResult)
     async def save_settings(body: SettingsPatch, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             result = await run_in_threadpool(settings_management_service.update, body)
             _notify_retention_cleanup_if_changed(result.changed_fields)
@@ -260,27 +274,27 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/settings/retention-cleanup/preview")
     async def preview_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=True)
 
     @router.post("/api/settings/retention-cleanup/run")
     async def run_retention_cleanup(body: RetentionCleanupRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(_retention_cleanup_payload, body, dry_run=False)
 
     @router.post("/api/settings/account-cleanup/preview")
     async def preview_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(_account_cleanup_payload, body, dry_run=True)
 
     @router.post("/api/settings/account-cleanup/run")
     async def run_account_cleanup(body: AccountCleanupRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(_account_cleanup_payload, body, dry_run=False)
 
     @router.get("/api/model-catalog", response_model=ModelCatalogView)
     async def model_catalog(authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        await run_in_threadpool(require_identity, authorization)
         return await run_in_threadpool(get_model_catalog)
 
     @router.get("/api/images", response_model=GalleryPage)
@@ -295,7 +309,7 @@ def create_router(app_version: str) -> APIRouter:
         search: str = Query(default=""),
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(
             list_images,
             resolve_image_base_url(request),
@@ -310,27 +324,27 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/images/retention-cleanup", response_model=GalleryCleanupResult)
     async def cleanup_expired_images_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         result = await run_in_threadpool(cleanup_expired_images)
         return gallery_cleanup_result(result)
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        return await _media_call(get_image_response, image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        return await _media_call(get_thumbnail_response, image_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        await run_in_threadpool(require_admin, authorization)
+        return await _media_call(delete_images, body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        buf = download_images_zip(body.paths)
+        await run_in_threadpool(require_admin, authorization)
+        buf = await _media_call(download_images_zip, body.paths)
         return StreamingResponse(
             buf,
             media_type="application/zip",
@@ -339,15 +353,15 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/images/download/{image_path:path}")
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return get_image_download_response(image_path)
+        await run_in_threadpool(require_admin, authorization)
+        return await _media_call(get_image_download_response, image_path)
 
     @router.post("/api/images/genbox-push", response_model=GalleryGenBoxPushResult)
     async def push_image_to_genbox(
         body: GalleryGenBoxPushRequest,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return await run_in_threadpool(push_gallery_image, body.path)
         except GenBoxPushError as exc:
@@ -371,7 +385,7 @@ def create_router(app_version: str) -> APIRouter:
         offset: int = Query(default=0, ge=0),
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(
             log_service.list_page,
             type=type.strip(),
@@ -389,7 +403,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/logs/{log_id}", response_model=CallDetail)
     async def get_log_detail(log_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         detail = await run_in_threadpool(log_service.get_detail, log_id)
         if detail is None:
             raise HTTPException(status_code=404, detail={"error": "log not found"})
@@ -397,14 +411,14 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(log_service.delete, body.ids)
 
     @router.get("/internal/monitor/account-maintenance")
     async def get_internal_maintenance(x_cluster_monitor_secret: str | None = Header(default=None)):
         from services.account_maintenance_status import local_internal_maintenance_view
         try:
-            return local_internal_maintenance_view(x_cluster_monitor_secret or "")
+            return await run_in_threadpool(local_internal_maintenance_view, x_cluster_monitor_secret or "")
         except (PermissionError, RuntimeError) as exc:
             raise HTTPException(status_code=403, detail={"error": "forbidden"}) from exc
 
@@ -449,7 +463,7 @@ def create_router(app_version: str) -> APIRouter:
         response_model_exclude_none=True,
     )
     async def get_realtime_monitor(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(lambda: build_monitor_view(cluster_monitor_snapshot()))
 
     @router.get(
@@ -461,7 +475,7 @@ def create_router(app_version: str) -> APIRouter:
         call_id: str,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         record = await run_in_threadpool(cluster_monitor_call_detail, call_id)
         if record is None:
             raise HTTPException(status_code=404, detail={"error": "monitor call not found"})
@@ -469,7 +483,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         explicit_url = (body.url or "").strip()
         if explicit_url:
             try:
@@ -484,7 +498,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/proxy/view", response_model=ProxyView)
     async def get_proxy_view(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return await run_in_threadpool(proxy_management_service.view)
 
     @router.post("/api/proxy/defaults", response_model=ProxyDefaultsMutation)
@@ -492,7 +506,7 @@ def create_router(app_version: str) -> APIRouter:
         body: ProxyDefaultsRequest,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return await run_in_threadpool(
                 proxy_management_service.save_defaults,
@@ -506,7 +520,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/proxy/groups", response_model=ProxyGroupMutation)
     async def save_proxy_group(body: ProxyGroupPatch, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return await run_in_threadpool(proxy_management_service.save_group, body)
         except ValueError as exc:
@@ -519,7 +533,7 @@ def create_router(app_version: str) -> APIRouter:
         body: ProxyNodeImportRequest,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return await run_in_threadpool(
                 proxy_management_service.import_nodes,
@@ -531,7 +545,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.delete("/api/proxy/groups/{group_id}", response_model=ProxyGroupDeleteMutation)
     async def delete_proxy_group(group_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return await run_in_threadpool(proxy_management_service.delete_group, group_id)
         except KeyError as exc:
@@ -545,7 +559,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/proxy/groups/test", response_model=ProxyGroupTestResponse)
     async def test_proxy_group_endpoint(body: ProxyGroupTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         explicit_url = (body.url or "").strip()
         if explicit_url:
             try:
@@ -579,7 +593,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/proxy/runtime")
     async def get_proxy_runtime_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
             "status": proxy_settings.get_runtime_status(),
@@ -587,22 +601,26 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/proxy/clearance/test")
     async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return {"result": await run_in_threadpool(test_clearance, body.target_url)}
 
     @router.get("/api/dashboard", response_model=DashboardResponseView)
     async def get_dashboard(
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
-        return await run_in_threadpool(
-            build_dashboard_view,
-            app_version=app_version,
-        )
+        await run_in_threadpool(require_admin, authorization)
+        try:
+            return await _dashboard_execution.run(
+                build_dashboard_view, app_version=app_version,
+                deadline=time.monotonic() + 15,
+            )
+        except (ExecutionBusy, ExecutionTimeout) as exc:
+            raise HTTPException(status_code=503, detail={
+                "error": "Dashboard is busy; retry shortly."}, headers={"Retry-After": "2"}) from exc
 
     @router.post("/api/backup/test")
     async def test_backup_connection(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return {"result": await run_in_threadpool(backup_service.test_connection)}
         except BackupError as exc:
@@ -610,12 +628,12 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/image-storage/test")
     async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return {"result": await run_in_threadpool(image_storage_service.test_webdav)}
 
     @router.post("/api/image-storage/sync")
     async def sync_image_storage_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return {"result": await run_in_threadpool(image_storage_service.sync_all)}
         except ImageStorageError as exc:
@@ -623,7 +641,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/backups")
     async def get_backups(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return {
                 "items": await run_in_threadpool(backup_service.list_backups),
@@ -634,7 +652,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/backups/run")
     async def run_backup_endpoint(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             return {"result": await run_in_threadpool(backup_service.run_backup)}
         except BackupError as exc:
@@ -642,7 +660,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/backups/delete")
     async def delete_backup_endpoint(body: BackupDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         try:
             await run_in_threadpool(backup_service.delete_backup, body.key)
             return {"ok": True}
@@ -651,7 +669,7 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/images/tags")
     async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         rel = body.path.strip().lstrip("/")
         if not rel:
             raise HTTPException(status_code=400, detail={"error": "path is required"})
@@ -660,12 +678,12 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         return storage_stats()
 
     @router.post("/api/images/storage/compress", response_model=GalleryCompressResult)
     async def compress_all_images(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         result = await run_in_threadpool(compress_images)
         return gallery_compress_result(result)
 
@@ -678,7 +696,7 @@ def create_router(app_version: str) -> APIRouter:
         dry_run: bool = False,
         authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await run_in_threadpool(require_admin, authorization)
         result = await run_in_threadpool(
             retention_cleanup_coordinator.cleanup_images_to_target,
             target_free_mb,

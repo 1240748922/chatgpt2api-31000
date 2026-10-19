@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -106,8 +109,35 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
     except HTTPException as exc:
-        call.log("调用失败", status="failed", error=str(exc.detail))
+        await call.log_async("调用失败", status="failed", error=str(exc.detail))
         raise
+
+
+async def run_connected(request: Request, call: LoggedCall, handler, payload):
+    """After the body is consumed, abort pending execution on client departure.
+
+StreamingResponse owns disconnect monitoring once call.run returns. The image
+executor retains the capacity of any still-running synchronous handler.
+"""
+    job = asyncio.create_task(call.run(handler, payload))
+    async def disconnected():
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.25)
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait({job, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        if job in done:
+            return await job
+        job.cancel()
+        with suppress(asyncio.CancelledError):
+            await job
+        raise HTTPException(status_code=499, detail="client disconnected")
+    finally:
+        watcher.cancel()
+        if not job.done():
+            job.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
 
 
 def create_router() -> APIRouter:
@@ -136,21 +166,21 @@ def create_router() -> APIRouter:
             request: Request,
             authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        return await run_connected(request, call, openai_v1_image_generations.handle, payload)
 
     @router.post("/v1/images/edits")
     async def edit_images(
             request: Request,
             authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
@@ -162,11 +192,11 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        return await run_connected(request, call, openai_v1_image_edit.handle, payload)
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
         model = str(payload.get("model") or "auto")
@@ -184,11 +214,11 @@ def create_router() -> APIRouter:
         attach_trace_headers(call, request)
         call.attach_trace_metadata(payload)
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_chat_complete.handle, payload)
+        return await run_connected(request, call, openai_v1_chat_complete.handle, payload)
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+    async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
+        identity = await run_in_threadpool(require_identity, authorization)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
@@ -204,7 +234,7 @@ def create_router() -> APIRouter:
         )
         call.attach_trace_metadata(payload)
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload)
+        return await run_connected(request, call, openai_v1_response.handle, payload)
 
     @router.post("/v1/messages")
     async def create_message(
@@ -223,7 +253,7 @@ def create_router() -> APIRouter:
 
     @router.post("/v1/search")
     async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
@@ -234,13 +264,13 @@ def create_router() -> APIRouter:
             limit: int = Query(default=0, ge=0, le=100),
             authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         task_ids = [item.strip() for item in ids.split(",") if item.strip()]
         return await run_in_threadpool(editable_file_task_service.list_tasks, identity, task_ids, limit=limit)
 
     @router.post("/v1/editable-file-tasks")
     async def create_editable_file_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         kind = (body.kind or "ppt").strip().lower()
         if kind not in {"ppt", "psd"}:
             raise HTTPException(status_code=400, detail={"error": "kind must be ppt or psd"})
@@ -264,7 +294,7 @@ def create_router() -> APIRouter:
             task_id: str,
             authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         try:
             return await run_in_threadpool(
                 editable_file_task_service.delete_task,
@@ -300,7 +330,7 @@ def create_router() -> APIRouter:
 
     @router.post("/v1/ppt/generations")
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
         return await submit_editable_file_task(
             editable_file_task_service.submit_ppt,
@@ -313,7 +343,7 @@ def create_router() -> APIRouter:
 
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
         return await submit_editable_file_task(
             editable_file_task_service.submit_psd,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import itertools
 import re
 import threading
 import time
@@ -9,8 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from anyio import CapacityLimiter
-from anyio.to_thread import run_sync
+import asyncio
+from services.async_execution import BoundedExecution, ExecutionBusy, ExecutionTimeout
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -58,21 +57,19 @@ PERF_WAIT_WARN_MS = 1000
 REQUEST_TEXT_EXCERPT_LIMIT = 1000
 REQUEST_TEXT_FULL_LIMIT = 50000
 IMAGE_THREAD_TOKENS = env_int("CHATGPT2API_IMAGE_THREAD_TOKENS", 100, 1, 2000)
-_IMAGE_THREAD_LIMITER = CapacityLimiter(IMAGE_THREAD_TOKENS)
+_IMAGE_POOL = BoundedExecution(
+    "image-http", IMAGE_THREAD_TOKENS,
+    env_int("CHATGPT2API_IMAGE_QUEUE_LIMIT", 40, 0, 10000),
+    env_int("CHATGPT2API_IMAGE_QUEUE_WAIT_SECONDS", 10, 1, 300),
+)
+_LOG_POOL = BoundedExecution("call-log", 4, 128, 5)
 
 LogService = CallRecordService
 LogCursorMismatch = CallRecordCursorMismatch
 log_service = LogService()
 
 def image_threadpool_snapshot() -> dict[str, int]:
-    try:
-        statistics = _IMAGE_THREAD_LIMITER.statistics()
-        active = int(getattr(statistics, "borrowed_tokens", 0) or 0)
-        waiting = int(getattr(statistics, "tasks_waiting", 0) or 0)
-    except Exception:
-        active = int(getattr(_IMAGE_THREAD_LIMITER, "borrowed_tokens", 0) or 0)
-        waiting = 0
-    return {"limit": IMAGE_THREAD_TOKENS, "active": max(0, active), "waiting": max(0, waiting)}
+    return _IMAGE_POOL.snapshot()
 
 
 
@@ -523,17 +520,44 @@ def _next_item(items):
         return False, None
 
 
-async def _iterate_image_stream(items):
+def _close_iterator(value):
+    close = getattr(value, "close", None)
+    if close is not None:
+        close()
+
+
+def _prepend_and_close(first, iterator):
+    try:
+        yield first
+        yield from iterator
+    finally:
+        _close_iterator(iterator)
+
+
+def _closing_sender(sender, items):
+    try:
+        yield from sender(items)
+    finally:
+        _close_iterator(items)
+
+
+async def _iterate_image_stream(items, *, deadline=None):
     iterator = iter(items)
-    while True:
-        has_item, item = await run_sync(
-            _next_item,
-            iterator,
-            limiter=_IMAGE_THREAD_LIMITER,
-        )
-        if not has_item:
-            return
-        yield item
+    try:
+        while True:
+            has_item, item = await _IMAGE_POOL.run(
+                _next_item, iterator, deadline=deadline,
+                discard=lambda _result: _close_iterator(iterator),
+            )
+            if not has_item:
+                return
+            yield item
+    finally:
+        # In-flight next() is closed by its discard callback after completion.
+        try:
+            await _LOG_POOL.run(_close_iterator, iterator, deadline=time.monotonic() + 5)
+        except (Exception, asyncio.CancelledError):
+            pass
 
 
 @dataclass
@@ -550,13 +574,29 @@ class LoggedCall:
     perf_timings: dict[str, int] = field(default_factory=dict)
     trace_metadata: dict[str, object] = field(default_factory=dict)
 
+    async def log_async(self, *args, **kwargs):
+        try:
+            await _LOG_POOL.run(self.log, *args, deadline=time.monotonic() + 10, **kwargs)
+        except Exception as exc:
+            # A failed audit write must not turn a completed image into a retry.
+            # The blocking writer retains its capacity until it actually exits.
+            import logging
+            logging.getLogger(__name__).error("call_log_deferred_or_failed call_id=%s type=%s",
+                                              self.call_id, type(exc).__name__)
+
     async def run(self, handler, *args, sse: str = "openai"):
+        from services.config import config
+        deadline = None
+        if self._is_image_request():
+            timeout = await run_in_threadpool(lambda: config.image_request_timeout_secs)
+            deadline = time.monotonic() + timeout
+
         if args and isinstance(args[0], dict):
             self.attach_trace_metadata(args[0])
         image_request = self._is_image_request()
         trace_perf = self._trace_image_perf()
         if trace_perf:
-            realtime_monitor_service.start(
+            await run_in_threadpool(realtime_monitor_service.start,
                 self.call_id,
                 endpoint=self.endpoint,
                 model=self.model,
@@ -594,22 +634,28 @@ class LoggedCall:
 
         try:
             if image_request:
-                result = await run_sync(
-                    _call_handler,
-                    limiter=_IMAGE_THREAD_LIMITER,
-                )
+                result = await _IMAGE_POOL.run(_call_handler, deadline=deadline, discard=_close_iterator)
             else:
                 result = await run_in_threadpool(_call_handler)
+        except (ExecutionBusy, ExecutionTimeout) as exc:
+            status = 503 if isinstance(exc, ExecutionBusy) else 504
+            await self.log_async("调用失败", status="failed", error=str(exc))
+            return openai_error_response({"error": {"message": str(exc), "type": "server_error",
+                "code": "image_execution_busy" if status == 503 else "image_execution_timeout"}},
+                status, headers={"Retry-After": "2"})
+        except asyncio.CancelledError:
+            await self.log_async("调用取消", status="failed", error="client_disconnected")
+            raise
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
+            await self.log_async("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
                      extra=_exception_log_fields(exc, image=image_request))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            await self.log_async("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=(
+            await self.log_async("调用失败", status="failed", error=(
                 _public_image_exception_message(exc) if image_request else str(exc)
             ), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc, image=image_request))
@@ -625,7 +671,7 @@ class LoggedCall:
             projected_extra: dict[str, object] = {}
             if projected_status != "success" and result.get("error_code"):
                 projected_extra["error_code"] = result["error_code"]
-            self.log(
+            await self.log_async(
                 "调用失败" if projected_status == "failed" else "调用完成",
                 result,
                 status=projected_status,
@@ -675,22 +721,28 @@ class LoggedCall:
 
         try:
             if image_request:
-                has_first, first = await run_sync(
-                    _next_item_with_timing,
-                    limiter=_IMAGE_THREAD_LIMITER,
-                )
+                has_first, first = await _IMAGE_POOL.run(_next_item_with_timing, deadline=deadline, discard=lambda _value: _close_iterator(result))
             else:
                 has_first, first = await run_in_threadpool(_next_item_with_timing)
+        except (ExecutionBusy, ExecutionTimeout) as exc:
+            status = 503 if isinstance(exc, ExecutionBusy) else 504
+            await self.log_async("调用失败", status="failed", error=str(exc))
+            return openai_error_response({"error": {"message": str(exc), "type": "server_error",
+                "code": "image_execution_busy" if status == 503 else "image_execution_timeout"}},
+                status, headers={"Retry-After": "2"})
+        except asyncio.CancelledError:
+            await self.log_async("调用取消", status="failed", error="client_disconnected")
+            raise
         except ImageGenerationError as exc:
-            self.log("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
+            await self.log_async("调用失败", status="failed", error=_public_image_exception_message(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
                      extra=_exception_log_fields(exc, image=image_request))
             return _image_error_response(exc)
         except HTTPException as exc:
-            self.log("调用失败", status="failed", error=str(exc.detail))
+            await self.log_async("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=(
+            await self.log_async("调用失败", status="failed", error=(
                 _public_image_exception_message(exc) if image_request else str(exc)
             ), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc, image=image_request))
@@ -698,11 +750,11 @@ class LoggedCall:
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
-            self.log("流式调用结束")
+            await self.log_async("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
-        stream = sender(self.stream(itertools.chain([first], result)))
+        stream = _closing_sender(sender, self.stream(_prepend_and_close(first, result)))
         if image_request:
-            stream = _iterate_image_stream(stream)
+            stream = _iterate_image_stream(stream, deadline=deadline)
         return StreamingResponse(stream, media_type="text/event-stream")
 
     def _is_image_request(self) -> bool:
@@ -746,6 +798,12 @@ class LoggedCall:
                 conversation_ids.extend(_collect_conversation_ids(item))
                 image_attempts = collect_image_attempts([image_attempts, item])
                 yield _strip_internal_response_fields(item)
+        except GeneratorExit:
+            failed = True
+            self.log("流式调用取消", status="failed", error="stream_closed_before_completion",
+                     urls=urls, account_email=account_emails[0] if account_emails else "",
+                     conversation_id=conversation_ids[0] if conversation_ids else "")
+            raise
         except Exception as exc:
             failed = True
             extra = _exception_log_fields(exc, image=image_request)
@@ -776,6 +834,7 @@ class LoggedCall:
                 ) from exc
             raise
         finally:
+            _close_iterator(items)
             if not failed:
                 extra = dict(result_metrics)
                 if image_attempts:

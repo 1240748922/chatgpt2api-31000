@@ -49,6 +49,10 @@ x-app: &app
     CHATGPT2API_PAGE_PREWARM_RATE: ${CHATGPT2API_PAGE_PREWARM_RATE:-8}
     CHATGPT2API_MAINTENANCE_IMPORTER_URL: http://importer:80
     CHATGPT2API_IMAGE_QUEUE_LIMIT: 40
+    # Reject queued HTTP work before it becomes minutes of abandoned requests.
+    CHATGPT2API_IMAGE_QUEUE_WAIT_SECONDS: 10
+    # Continuous event-loop stall only, not periodic restart or image timeout.
+    CHATGPT2API_EVENT_LOOP_STALL_EXIT_SECONDS: 180
     CHATGPT2API_IMAGE_RETRY_AFTER_SECS: 2
     # Only extend a busy ready pool; empty/expired pools keep the short probe.
     CHATGPT2API_IMAGE_BUSY_WAIT_SECONDS: ${CHATGPT2API_IMAGE_BUSY_WAIT_SECONDS:-30}

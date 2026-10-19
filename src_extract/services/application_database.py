@@ -140,6 +140,13 @@ def _build_database_engine(database_url: str) -> Engine:
         kwargs["poolclass"] = NullPool
     else:
         kwargs.update({
+            "connect_args": {
+                "connect_timeout": _nonnegative_int("DATABASE_CONNECT_TIMEOUT_SECONDS", 10, minimum=1),
+                "options": "-c statement_timeout={} -c lock_timeout={}".format(
+                    _nonnegative_int("DATABASE_STATEMENT_TIMEOUT_MS", 60000),
+                    _nonnegative_int("DATABASE_LOCK_TIMEOUT_MS", 10000),
+                ),
+            },
             "pool_size": _nonnegative_int("DATABASE_POOL_SIZE", 10, minimum=1),
             "max_overflow": _nonnegative_int("DATABASE_MAX_OVERFLOW", 20),
             "pool_timeout": _nonnegative_int(

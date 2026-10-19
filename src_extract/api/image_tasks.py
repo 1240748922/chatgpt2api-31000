@@ -40,7 +40,7 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
     except HTTPException as exc:
-        call.log("调用失败", status="failed", error=str(exc.detail))
+        await call.log_async("调用失败", status="failed", error=str(exc.detail))
         raise
 
 
@@ -52,7 +52,7 @@ def create_router() -> APIRouter:
         ids: str = Query(default=""),
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
     @router.post("/api/image-tasks/generations", response_model=ImageTaskRow)
@@ -61,7 +61,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
             return await run_in_threadpool(
@@ -85,7 +85,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
@@ -127,7 +127,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await run_in_threadpool(require_identity, authorization)
         try:
             return await run_in_threadpool(
                 image_task_service.resume_poll,

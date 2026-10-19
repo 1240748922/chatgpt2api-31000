@@ -155,9 +155,10 @@ class RetentionCleanupCoordinator:
             except (TypeError, ValueError):
                 return 0
 
-    def _schedule_after_cleanup(self, expected_wake_revision: int) -> float:
+    def _schedule_after_cleanup(self, expected_wake_revision: int, *, delay_seconds: float | None = None) -> float:
+        delay = self.interval_seconds if delay_seconds is None else max(0.0, delay_seconds)
         if self._repository is None:
-            next_epoch = time.time() + self.interval_seconds
+            next_epoch = time.time() + delay
             self._set_next_run(next_epoch)
             return next_epoch
         with self._shared_state() as state:
@@ -166,7 +167,7 @@ class RetentionCleanupCoordinator:
             except (TypeError, ValueError):
                 wake_revision = 0
             if wake_revision == expected_wake_revision:
-                next_epoch = time.time() + self.interval_seconds
+                next_epoch = time.time() + delay
                 state["next_run_epoch"] = next_epoch
                 state["next_run_at"] = self._timestamp(next_epoch)
                 return next_epoch
@@ -462,7 +463,14 @@ class RetentionCleanupCoordinator:
                         "image_waiting": load.get("image_waiting"),
                         "retry_seconds": retry_seconds,
                     })
-                    deadline = time.monotonic() + retry_seconds
+                    # _wait_for_cleanup also consults the persisted deadline.
+                    # Advancing only the local deadline leaves a past-due shared
+                    # value that immediately wakes us again, hammering DB/locks.
+                    # Keep the revision guard so a concurrent settings wake wins.
+                    next_epoch = self._schedule_after_cleanup(
+                        wake_revision, delay_seconds=retry_seconds,
+                    )
+                    deadline = time.monotonic() + max(0.0, next_epoch - time.time())
                     continue
                 logs = result.get("logs") or {}
                 if int(logs.get("removed") or 0) > 0:

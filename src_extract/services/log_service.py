@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import asyncio
+from anyio import CancelScope
 from services.async_execution import BoundedExecution, ExecutionBusy, ExecutionTimeout
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -513,6 +514,62 @@ def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSON
     return openai_error_response(message, status_code)
 
 
+def _execution_failure_details(exc: Exception):
+    busy = isinstance(exc, ExecutionBusy)
+    failure = ImageFailure(
+        code="image_execution_busy" if busy else "image_execution_timeout",
+        scope="transient", capability=None, retryable=busy,
+        retry_after=2 if busy else None, status_code=503 if busy else 504,
+        error_type="server_error",
+    )
+    message = str(exc)
+    payload = {"error": {"message": message, "type": failure.error_type,
+                         "param": None, "code": failure.code}}
+    fields = {**failure.diagnostic_fields(), "error_code": failure.code,
+              "public_error": message, "raw_error": message,
+              "local_reason": "execution_pool"}
+    return failure.status_code, payload, fields
+
+
+@dataclass
+class _StreamLogState:
+    """Carry worker-side results to one async terminal log, without DB IO."""
+    lock: Any = field(default_factory=threading.Lock)
+    context: dict[str, Any] = field(default_factory=dict)
+    terminal: tuple | None = None
+    finished: bool = False
+
+    def update(self, context):
+        with self.lock:
+            if not self.finished:
+                self.context = context
+
+    def record(self, *args, **kwargs):
+        with self.lock:
+            if not self.finished and self.terminal is None:
+                self.terminal = (args, kwargs)
+
+    async def finish(self, call, error, exhausted):
+        with self.lock:
+            if self.finished:
+                return
+            self.finished = True
+            context = dict(self.context)
+            terminal = self.terminal
+        if isinstance(error, (ExecutionBusy, ExecutionTimeout)):
+            _, _, fields = _execution_failure_details(error)
+            context["extra"] = {**context.get("extra", {}), **fields}
+            await call.log_async("流式调用失败", status="failed", error=str(error), **context)
+        elif not exhausted:
+            await call.log_async("流式调用取消", status="failed",
+                                 error="stream_closed_before_completion", **context)
+        elif terminal is not None:
+            args, kwargs = terminal
+            await call.log_async(*args, **kwargs)
+        else:
+            await call.log_async("流式调用结束", **context)
+
+
 def _next_item(items):
     try:
         return True, next(items)
@@ -541,8 +598,10 @@ def _closing_sender(sender, items):
         _close_iterator(items)
 
 
-async def _iterate_image_stream(items, *, deadline=None):
+async def _iterate_image_stream(items, *, deadline=None, call=None, log_state=None):
     iterator = iter(items)
+    exhausted = False
+    error = None
     try:
         while True:
             has_item, item = await _IMAGE_POOL.run(
@@ -550,14 +609,28 @@ async def _iterate_image_stream(items, *, deadline=None):
                 discard=lambda _result: _close_iterator(iterator),
             )
             if not has_item:
+                exhausted = True
                 return
             yield item
+    except (ExecutionBusy, ExecutionTimeout) as exc:
+        error = exc
+        _, payload, _ = _execution_failure_details(exc)
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if call is None or call.endpoint.startswith("/v1/images"):
+            yield f"event: error\ndata: {encoded}\n\n"
+        else:
+            yield f"data: {encoded}\n\ndata: [DONE]\n\n"
     finally:
         # In-flight next() is closed by its discard callback after completion.
-        try:
-            await _LOG_POOL.run(_close_iterator, iterator, deadline=time.monotonic() + 5)
-        except (Exception, asyncio.CancelledError):
-            pass
+        # Starlette cancels an AnyIO scope on disconnect; cleanup must survive
+        # that scope while retaining its own executor deadline.
+        with CancelScope(shield=True):
+            try:
+                await _LOG_POOL.run(_close_iterator, iterator, deadline=time.monotonic() + 5)
+            except (Exception, asyncio.CancelledError):
+                pass
+            if log_state is not None:
+                await log_state.finish(call, error, exhausted)
 
 
 @dataclass
@@ -575,14 +648,40 @@ class LoggedCall:
     trace_metadata: dict[str, object] = field(default_factory=dict)
 
     async def log_async(self, *args, **kwargs):
-        try:
-            await _LOG_POOL.run(self.log, *args, deadline=time.monotonic() + 10, **kwargs)
-        except Exception as exc:
-            # A failed audit write must not turn a completed image into a retry.
-            # The blocking writer retains its capacity until it actually exits.
-            import logging
-            logging.getLogger(__name__).error("call_log_deferred_or_failed call_id=%s type=%s",
-                                              self.call_id, type(exc).__name__)
+        # Monitor completion is in-memory work, separate from bounded DB IO.
+        # Keep it off-loop, but never drop it when the audit queue is full.
+        with CancelScope(shield=True):
+            try:
+                suffix, detail = await run_in_threadpool(self._prepare_log, *args, **kwargs)
+            except Exception as exc:
+                self._warn_log_failure("prepare", exc)
+                # A malformed diagnostic must not retain a completed request
+                # or change a successful generation into a client retry.
+                try:
+                    await run_in_threadpool(realtime_monitor_service.finish, {
+                        "call_id": self.call_id, "endpoint": self.endpoint,
+                        "model": self.model,
+                        "status": kwargs.get("status", args[2] if len(args) > 2 else "success"),
+                        "error": kwargs.get("error", args[3] if len(args) > 3 else ""),
+                        "duration_ms": max(0, int((time.time() - self.started) * 1000)),
+                    })
+                except Exception as finish_error:
+                    self._warn_log_failure("finish", finish_error)
+                return
+            try:
+                await _LOG_POOL.run(log_service.add, LOG_TYPE_CALL, f"{self.summary}{suffix}",
+                                    detail, deadline=time.monotonic() + 10)
+            except Exception as exc:
+                # A failed audit write must not turn a completed image into a
+                # retry. Running writers retain capacity until they exit.
+                self._warn_log_failure("write", exc)
+
+    def _warn_log_failure(self, phase, exc):
+        import logging
+        logging.getLogger(__name__).error(
+            "call_log_failed call_id=%s phase=%s type=%s",
+            self.call_id, phase, type(exc).__name__,
+        )
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.config import config
@@ -638,11 +737,9 @@ class LoggedCall:
             else:
                 result = await run_in_threadpool(_call_handler)
         except (ExecutionBusy, ExecutionTimeout) as exc:
-            status = 503 if isinstance(exc, ExecutionBusy) else 504
-            await self.log_async("调用失败", status="failed", error=str(exc))
-            return openai_error_response({"error": {"message": str(exc), "type": "server_error",
-                "code": "image_execution_busy" if status == 503 else "image_execution_timeout"}},
-                status, headers={"Retry-After": "2"})
+            status, payload, fields = _execution_failure_details(exc)
+            await self.log_async("调用失败", status="failed", error=str(exc), extra=fields)
+            return openai_error_response(payload, status, headers={"Retry-After": "2"})
         except asyncio.CancelledError:
             await self.log_async("调用取消", status="failed", error="client_disconnected")
             raise
@@ -725,11 +822,9 @@ class LoggedCall:
             else:
                 has_first, first = await run_in_threadpool(_next_item_with_timing)
         except (ExecutionBusy, ExecutionTimeout) as exc:
-            status = 503 if isinstance(exc, ExecutionBusy) else 504
-            await self.log_async("调用失败", status="failed", error=str(exc))
-            return openai_error_response({"error": {"message": str(exc), "type": "server_error",
-                "code": "image_execution_busy" if status == 503 else "image_execution_timeout"}},
-                status, headers={"Retry-After": "2"})
+            status, payload, fields = _execution_failure_details(exc)
+            await self.log_async("调用失败", status="failed", error=str(exc), extra=fields)
+            return openai_error_response(payload, status, headers={"Retry-After": "2"})
         except asyncio.CancelledError:
             await self.log_async("调用取消", status="failed", error="client_disconnected")
             raise
@@ -752,9 +847,10 @@ class LoggedCall:
         if not has_first:
             await self.log_async("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
-        stream = _closing_sender(sender, self.stream(_prepend_and_close(first, result)))
+        log_state = _StreamLogState() if image_request else None
+        stream = _closing_sender(sender, self.stream(_prepend_and_close(first, result), log_state=log_state))
         if image_request:
-            stream = _iterate_image_stream(stream, deadline=deadline)
+            stream = _iterate_image_stream(stream, deadline=deadline, call=self, log_state=log_state)
         return StreamingResponse(stream, media_type="text/event-stream")
 
     def _is_image_request(self) -> bool:
@@ -777,7 +873,7 @@ class LoggedCall:
         body["_trace_image_perf"] = True
         self.trace_metadata.update(image_request_metadata(body))
 
-    def stream(self, items):
+    def stream(self, items, *, log_state=None):
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
@@ -785,6 +881,7 @@ class LoggedCall:
         result_metrics: dict[str, Any] = {}
         failed = False
         image_request = self._is_image_request()
+        terminal_log = self.log if log_state is None else log_state.record
         try:
             for item in items:
                 if image_request:
@@ -797,10 +894,19 @@ class LoggedCall:
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
                 image_attempts = collect_image_attempts([image_attempts, item])
+                if log_state is not None:
+                    extra = {key: list(value) if isinstance(value, list) else value
+                             for key, value in result_metrics.items()}
+                    if image_attempts:
+                        extra["image_attempts"] = list(image_attempts)
+                    log_state.update({"urls": list(urls),
+                                      "account_email": account_emails[0] if account_emails else "",
+                                      "conversation_id": conversation_ids[0] if conversation_ids else "",
+                                      "extra": extra})
                 yield _strip_internal_response_fields(item)
         except GeneratorExit:
             failed = True
-            self.log("流式调用取消", status="failed", error="stream_closed_before_completion",
+            terminal_log("流式调用取消", status="failed", error="stream_closed_before_completion",
                      urls=urls, account_email=account_emails[0] if account_emails else "",
                      conversation_id=conversation_ids[0] if conversation_ids else "")
             raise
@@ -811,7 +917,7 @@ class LoggedCall:
             combined_attempts = collect_image_attempts([image_attempts, exc])
             if combined_attempts:
                 extra["image_attempts"] = combined_attempts
-            self.log(
+            terminal_log(
                 "流式调用失败",
                 status="failed",
                 error=(
@@ -839,12 +945,19 @@ class LoggedCall:
                 extra = dict(result_metrics)
                 if image_attempts:
                     extra["image_attempts"] = image_attempts
-                self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
+                terminal_log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "", extra=extra)
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
             extra: dict[str, object] | None = None) -> None:
+        suffix, detail = self._prepare_log(suffix, result, status, error, urls,
+                                           account_email, conversation_id, extra)
+        log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
+
+    def _prepare_log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
+                     urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+                     extra: dict[str, object] | None = None):
         failure_code = (extra or {}).get("error_code") or (extra or {}).get("failure_code")
         if is_text_review_failure_code(failure_code):
             status = "text_review"
@@ -912,4 +1025,4 @@ class LoggedCall:
                 })
         if self._trace_image_perf():
             realtime_monitor_service.finish(detail)
-        log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)
+        return suffix, detail

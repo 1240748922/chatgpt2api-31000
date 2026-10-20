@@ -75,7 +75,7 @@ def test_cancelled_running_iterator_is_closed_after_worker_finishes():
 
 
 def test_slow_image_log_does_not_block_health_event_loop(monkeypatch):
-    from services.log_service import LoggedCall
+    from services.log_service import LoggedCall, log_service
     from fastapi import FastAPI
     import httpx
     call = LoggedCall({}, "/v1/images/generations", "gpt-image-2", "fixture")
@@ -84,7 +84,7 @@ def test_slow_image_log_does_not_block_health_event_loop(monkeypatch):
     def slow_log(*args, **kwargs):
         entered.set()
         release.wait(2)
-    monkeypatch.setattr(call, "log", slow_log)
+    monkeypatch.setattr(log_service, "add", slow_log)
     app = FastAPI()
     @app.get("/version")
     async def version():
@@ -161,7 +161,7 @@ def test_continuous_synthetic_image_load_keeps_real_version_route_responsive(mon
     pool=BoundedExecution("synthetic-image",4,4,0.1)
     monkeypatch.setattr(logs,"_IMAGE_POOL",pool)
     monkeypatch.setattr(config.__class__,"image_request_timeout_secs",property(lambda _: 0.25))
-    monkeypatch.setattr(logs.LoggedCall,"log",lambda *a,**kw: None)
+    monkeypatch.setattr(logs.log_service,"add",lambda *a,**kw: None)
     app=FastAPI()
     app.include_router(system.create_router("fixture"))
     samples=[]
